@@ -37,6 +37,8 @@ LAMA_PT = os.path.join(BASE_DIR, 'backend', 'models', 'big-lama', 'big-lama.pt')
 
 MASK_PAD = 10            # OCR 框外扩像素(create_mask 同款经验值)
 GLYPH_DILATE = 21        # 字形 mask 膨胀核(约 10px,盖住笔画边缘)
+GLYPH_NEIGHBORHOOD = 60  # 字形自检的邻域:仅限 OCR 框向外扩该像素的范围
+                         # (漏擦的字总是紧挨着被检出的字行;远处白色物体不进 mask,防误伤)
 WHITE_ORIG_TH = 228      # 原帧白字判据:三通道下限(经 f165 残留/f180 干净校准)
 WHITE_FIXED_TH = 210     # 修复帧"仍白"判据:放宽以抗重编码灰度漂移
 WHITE_RB_MAX = 25        # |R-B| 上限:排除蓝裤腿等彩色亮物
@@ -185,9 +187,14 @@ class Pipeline:
                 mask = self.boxes_to_mask(boxes, h, w)
                 fixed = self.inpainter.inpaint(img, mask)
                 n_fixed += 1
-                # 白字自检:OCR 框外/框内的漏擦字,当帧补擦
+                # 白字自检:仅在 OCR 框邻域内找漏擦字(远离框的白色物体不误伤)
                 if white_glyph_check:
+                    hood = np.zeros((h, w), dtype='uint8')
+                    for gy1, gy2, gx1, gx2 in boxes:
+                        hood[max(0, gy1 - GLYPH_NEIGHBORHOOD):min(h, gy2 + GLYPH_NEIGHBORHOOD),
+                             max(0, gx1 - GLYPH_NEIGHBORHOOD):min(w, gx2 + GLYPH_NEIGHBORHOOD)] = 255
                     glyph = self.white_glyph(img, region)
+                    glyph = cv2.bitwise_and(glyph, hood)
                     resid = self.residual_white(fixed, glyph)
                     if resid > RESID_MIN_PX:
                         kernel = np.ones((GLYPH_DILATE, GLYPH_DILATE), 'uint8')
