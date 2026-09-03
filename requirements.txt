@@ -2,7 +2,6 @@ filesplit==3.0.2
 opencv-python==4.11.0.86
 scikit-image==0.25.2
 tqdm==4.67.1
-pyside6-fluent-widgets==1.7.7
 numpy==2.2.5
 av==17.0.0
 einops==0.8.1
@@ -11,8 +10,6 @@ matplotlib
 Pillow
 scipy
 requests
-darkdetect
-je-showinfilemanager==1.1.6a4
 # torch and torchvision are installed separately (see Dockerfile for platform-specific versions)
 
 # Training only

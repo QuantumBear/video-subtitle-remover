@@ -2,9 +2,7 @@ FROM python:3.12
 
 RUN --mount=type=cache,target=/root/.cache,sharing=private \
     apt update && \
-    apt install -y libgl1-mesa-glx \
-        # pyside6
-        libegl1 libxkbcommon0 libdbus-1-3 && \
+    apt install -y libgl1-mesa-glx && \
     true
 
 ADD . /vsr
