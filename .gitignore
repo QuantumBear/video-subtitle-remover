@@ -375,3 +375,8 @@ test*_no_sub*.mp4
 /backend/tools/train/release_model/
 inference.onnx
 /config/config.json
+
+# 本地测试素材与工具(视频一律不进版本控制)
+*.mp4
+.serena/
+test_openai_client.sh
