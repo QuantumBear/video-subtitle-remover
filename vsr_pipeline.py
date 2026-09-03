@@ -19,6 +19,7 @@
 """
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -43,7 +44,8 @@ WHITE_ORIG_TH = 228      # 原帧白字判据:三通道下限(经 f165 残留/f1
 WHITE_FIXED_TH = 210     # 修复帧"仍白"判据:放宽以抗重编码灰度漂移
 WHITE_RB_MAX = 25        # |R-B| 上限:排除蓝裤腿等彩色亮物
 RESID_MIN_PX = 50        # 帧内残留像素超过该值才触发补擦(抗压缩噪声)
-FFMPEG = os.path.join(BASE_DIR, 'backend', 'ffmpeg', 'macos', 'ffmpeg')
+# ffmpeg:优先用系统 PATH 里的(服务器/Linux 场景),否则回退仓库自带的平台二进制
+FFMPEG = shutil.which('ffmpeg') or os.path.join(BASE_DIR, 'backend', 'ffmpeg', 'macos', 'ffmpeg')
 
 
 # ---------- LAMA 引擎(自包含,不依赖 backend 包/任何 GUI 栈) ----------
@@ -55,6 +57,16 @@ class LamaEngine:
     """
 
     def __init__(self, model_path=LAMA_PT):
+        if not os.path.exists(model_path):
+            # git clone 后只有分片文件(完整 .pt 不入库),首次运行自动合并
+            shard_dir = os.path.dirname(model_path)
+            manifest = os.path.join(shard_dir, 'fs_manifest.csv')
+            if os.path.exists(manifest):
+                print(f'[init] 合并模型分片: {shard_dir}')
+                from fsplit.filesplit import Filesplit
+                Filesplit().merge(input_dir=shard_dir)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f'LAMA 模型缺失: {model_path}')
         self.model = torch.jit.load(model_path, map_location='cpu')
         self.model.eval()
 
