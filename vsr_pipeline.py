@@ -61,6 +61,11 @@ class LamaEngine:
         if device == 'auto':
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = torch.device(device)
+        if self.device.type == 'cuda':
+            # cudnn 卷积默认开 TF32(10 位尾数),对生成像素任务会累积误差
+            # 表现为修复区发雾/涂抹;关掉强制 FP32,与 CPU 输出对齐
+            torch.backends.cudnn.allow_tf32 = False
+            torch.backends.cuda.matmul.allow_tf32 = False
         if not os.path.exists(model_path):
             # git clone 后只有分片文件(完整 .pt 不入库),首次运行自动合并
             shard_dir = os.path.dirname(model_path)
