@@ -56,7 +56,11 @@ class LamaEngine:
     输入 RGB uint8 (H,W,3) + mask uint8 (H,W),输出修复后的 RGB uint8 (H,W,3)。
     """
 
-    def __init__(self, model_path=LAMA_PT):
+    def __init__(self, model_path=LAMA_PT, device='auto'):
+        """device: 'auto'(有 CUDA 用 GPU,否则 CPU)/ 'cuda' / 'cpu'。"""
+        if device == 'auto':
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = torch.device(device)
         if not os.path.exists(model_path):
             # git clone 后只有分片文件(完整 .pt 不入库),首次运行自动合并
             shard_dir = os.path.dirname(model_path)
@@ -67,7 +71,7 @@ class LamaEngine:
                 Filesplit().merge(input_dir=shard_dir)
         if not os.path.exists(model_path):
             raise FileNotFoundError(f'LAMA 模型缺失: {model_path}')
-        self.model = torch.jit.load(model_path, map_location='cpu')
+        self.model = torch.jit.load(model_path, map_location=self.device)
         self.model.eval()
 
     @staticmethod
@@ -90,11 +94,12 @@ class LamaEngine:
     def inpaint(self, image_rgb, mask):
         h, w = mask.shape[:2]
         img = image_rgb.transpose(2, 0, 1)                      # HWC→CHW
-        img_t = self._to_tensor(img).unsqueeze(0)               # (1,3,H,W) 0~1
+        img_t = self._to_tensor(img).unsqueeze(0).to(self.device)            # (1,3,H,W) 0~1
         mask_t = self._to_tensor((mask > 0).astype('float32')).unsqueeze(0)  # (1,1,H,W)
         mask_t = (mask_t > 0) * 1
+        mask_t = mask_t.to(self.device)
         out = self.model(img_t, mask_t)                          # (1,3,H,W) 0~1
-        out = out[0].permute(1, 2, 0).cpu().numpy()
+        out = out[0].permute(1, 2, 0).float().cpu().numpy()
         out = np.clip(out * 255, 0, 255).astype('uint8')[:h, :w]
         return out
 
@@ -105,11 +110,12 @@ class Pipeline:
 
     def __init__(self, det_model_dir=DEFAULT_DET_MODEL_DIR,
                  det_model_name=DEFAULT_DET_MODEL_NAME,
-                 lama_pt=LAMA_PT, threads=None):
+                 lama_pt=LAMA_PT, threads=None, device='auto'):
         if threads:
             torch.set_num_threads(threads)
         print(f'[init] 加载 OCR 检测模型: {det_model_dir}')
         from paddleocr import TextDetection
+        # OCR 固定 CPU:占比小(~13%),不值得为它装 paddle-gpu
         self.ocr = TextDetection(
             model_name=det_model_name,
             model_dir=det_model_dir,
@@ -117,8 +123,8 @@ class Pipeline:
             enable_hpi=False,
         )
         print(f'[init] 加载 LAMA: {lama_pt}')
-        self.inpainter = LamaEngine(lama_pt)
-        print('[init] 模型就绪')
+        self.inpainter = LamaEngine(lama_pt, device=device)
+        print(f'[init] 模型就绪(LAMA device: {self.inpainter.device})')
 
     # ---- OCR 检测:返回该帧在 region 内的文字框列表 [(ymin,ymax,xmin,xmax), ...] ----
     def detect(self, frame_rgb, region):
@@ -253,9 +259,11 @@ def main():
     ap.add_argument('--no-white-glyph-check', action='store_true',
                     help='关闭白字自检(彩色字幕场景)')
     ap.add_argument('--threads', type=int, default=None, help='torch CPU 线程数(多 worker 并发时调小)')
+    ap.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'],
+                    help="LAMA 推理设备:auto=有 CUDA 用 GPU(默认)")
     args = ap.parse_args()
 
-    pipe = Pipeline(threads=args.threads)
+    pipe = Pipeline(threads=args.threads, device=args.device)
     stat = pipe.process_video(
         args.input, args.output,
         region=tuple(args.region) if args.region else None,
