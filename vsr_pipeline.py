@@ -134,8 +134,10 @@ class Pipeline:
     # ---- OCR 检测:返回该帧在 region 内的文字框列表 [(ymin,ymax,xmin,xmax), ...] ----
     def detect(self, frame_rgb, region):
         ymin, ymax, xmin, xmax = region
-        # PaddleX 惯例吃 BGR
-        results = self.ocr.predict(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+        # region 裁剪送检:局部图不触发 det 的整帧缩放,框更贴合字形(实测 y 范围约紧一半);
+        # 全屏时等价于原行为。PaddleX 惯例吃 BGR
+        crop = frame_rgb[ymin:ymax, xmin:xmax]
+        results = self.ocr.predict(cv2.cvtColor(crop, cv2.COLOR_RGB2BGR))
         boxes = []
         for res in results:
             polys = res.get('dt_polys')
@@ -144,11 +146,9 @@ class Pipeline:
             for poly in polys:
                 x1, y1 = poly[:, 0].min(), poly[:, 1].min()
                 x2, y2 = poly[:, 0].max(), poly[:, 1].max()
-                # 框与字幕区域相交才算(和项目 create_mask 的过滤语义一致)
-                if x2 < xmin or x1 > xmax or y2 < ymin or y1 > ymax:
-                    continue
-                boxes.append((max(0, int(y1) - MASK_PAD), int(y2) + MASK_PAD,
-                              max(0, int(x1) - MASK_PAD), int(x2) + MASK_PAD))
+                # 坐标平移回全帧,外扩后输出
+                boxes.append((max(0, int(y1) + ymin - MASK_PAD), int(y2) + ymin + MASK_PAD,
+                              max(0, int(x1) + xmin - MASK_PAD), int(x2) + xmin + MASK_PAD))
         return boxes
 
     @staticmethod
