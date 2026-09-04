@@ -191,15 +191,95 @@ class Pipeline:
                  & (f[:, :, 2] > WHITE_FIXED_TH) & (np.abs(f[:, :, 0] - f[:, :, 2]) < WHITE_RB_MAX))
         return int(((glyph > 0) & still).sum())
 
+    def auto_region(self, input_path, samples=24):
+        """自动探测字幕区域:均匀采样帧做全屏 OCR,取检出框并集外扩。
+
+        全屏检测会漏检低对比度字幕,但检出的框足以定位字幕活动带
+        (漏检字总是紧挨检出字行),外扩后即可覆盖。无检出时回退 None(全屏)。
+        """
+        c = av.open(input_path)
+        vstream = next(s for s in c.streams if s.type == 'video')
+        total = vstream.duration and int(float(vstream.duration * vstream.time_base * float(vstream.average_rate))) or 0
+        h = vstream.codec_context.height
+        w = vstream.codec_context.width
+        full = (0, h, 0, w)
+        step = max(1, total // samples) if total else 1
+        boxes_all = []
+        n = 0
+        for frame in c.decode(video=0):
+            if n % step == 0:
+                boxes_all += self.detect(np.asarray(frame.to_image()), full)
+            n += 1
+        c.close()
+        if not boxes_all:
+            print('[auto-region] 采样未检出任何字幕框,回退全屏')
+            return None
+        # 聚类过滤:按框 y 中心分簇(间隔 120px),只保留框数≥2 的簇——
+        # 真实字幕在多帧持续出现形成密集带,孤立的单框多为画面误检(高光/接缝)
+        centers = sorted((b[0] + b[1]) / 2 for b in boxes_all)
+        clusters = [[centers[0]]]
+        for cy in centers[1:]:
+            if cy - clusters[-1][-1] <= 120:
+                clusters[-1].append(cy)
+            else:
+                clusters.append([cy])
+        keep_ranges = [(c[0], c[-1]) for c in clusters if len(c) >= 2]
+        if not keep_ranges:
+            print('[auto-region] 检出框过于孤立,回退全屏')
+            return None
+        boxes_all = [b for b in boxes_all
+                     if any(lo <= (b[0] + b[1]) / 2 <= hi for lo, hi in keep_ranges)]
+        print(f'[auto-region] 聚类过滤后保留 {len(boxes_all)}/{len(centers)} 框')
+        ymin = max(0, min(b[0] for b in boxes_all) - 80)
+        ymax = min(h, max(b[1] for b in boxes_all) + 80)
+        xmin = max(0, min(b[2] for b in boxes_all) - 40)
+        xmax = min(w, max(b[3] for b in boxes_all) + 40)
+        print(f'[auto-region] 采样检出 {len(boxes_all)} 框 → region: {(ymin, ymax, xmin, xmax)}')
+        return (ymin, ymax, xmin, xmax)
+
+    @staticmethod
+    def expand_timeline(all_boxes, merge_gap=10):
+        """字幕时间线区间化:帧号间隔 ≤merge_gap 的检出帧合并为同一区间,
+        区间内所有帧统一使用该区间全部检出框的并集 mask。
+
+        这是防字幕闪现的关键:逐帧独立检测时,字幕'忽检出忽漏检'会造成
+        擦与不擦交替闪现;区间并集让 mask 帧间稳定(上游 main.py 同机制)。
+        并集还顺带覆盖区间内漏检帧。
+        """
+        n = len(all_boxes)
+        hits = [i for i, b in enumerate(all_boxes) if b]
+        if not hits:
+            return [[] for _ in range(n)]
+        # 按帧号聚类成区间
+        ranges = [[hits[0], hits[0]]]
+        for i in hits[1:]:
+            if i - ranges[-1][1] <= merge_gap:
+                ranges[-1][1] = i
+            else:
+                ranges.append([i, i])
+        expanded = [[] for _ in range(n)]
+        for lo, hi in ranges:
+            union = []
+            for i in range(lo, hi + 1):
+                for b in all_boxes[i]:
+                    if b not in union:
+                        union.append(b)
+            for i in range(lo, hi + 1):
+                expanded[i] = union
+        return expanded
+
     def process_video(self, input_path, output_path, region=None,
                       white_glyph_check=True, progress=None):
-        """处理单条视频。
+        """处理单条视频(两遍:先全片检测+时间线区间化,再逐帧修复)。
 
-        :param region: (ymin, ymax, xmin, xmax) 字幕区域;None = 全屏
+        :param region: (ymin, ymax, xmin, xmax) 字幕区域;None = 自动探测
+                       (采样帧 OCR 定位字幕活动带,失败回退全屏)
         :param white_glyph_check: 白字自检开关(白字幕场景必开;彩色字幕场景关闭,
                                   避免把画面中的白色物体误当残留)
         :param progress: 回调 fn(done_frames, total_frames, stage)
         """
+        if region is None:
+            region = self.auto_region(input_path)
         src = av.open(input_path)
         vstream = next(s for s in src.streams if s.type == 'video')
         fps = float(vstream.average_rate)
@@ -215,11 +295,24 @@ class Pipeline:
         ov.options = {'crf': '18'}
 
         t0 = time.time()
+        # 第一遍:全片逐帧 OCR 检测(只记录框,不修复)
+        print('[pass1] 全片字幕检测...')
+        all_boxes = []
+        for frame in src.decode(video=0):
+            all_boxes.append(self.detect(np.asarray(frame.to_image()), region))
+            if progress and (len(all_boxes) % 30 == 0 or len(all_boxes) == total):
+                progress(len(all_boxes), total, '检测中')
+        src.close()
+        # 时间线区间化:区间内所有帧统一使用检出框并集(防字幕闪现)
+        all_boxes = self.expand_timeline(all_boxes)
+
+        # 第二遍:按区间 mask 逐帧修复
+        src = av.open(input_path)
         n_fixed = n_repair = n = 0
         for frame in src.decode(video=0):
             n += 1
             img = np.asarray(frame.to_image())  # RGB
-            boxes = self.detect(img, region)
+            boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
             if boxes:
                 mask = self.boxes_to_mask(boxes, h, w)
                 fixed = self.inpainter.inpaint(img, mask)
