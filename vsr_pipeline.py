@@ -173,6 +173,17 @@ class Pipeline:
         return glyph
 
     @staticmethod
+    def filter_glyph_by_height(glyph, max_h=90):
+        """按连通域高度过滤白字形:字幕单行高 ≤60px;白色衣物/大块白色物体
+        是几百 px 的大连通块,必须剔除,否则 LAMA 会把人/物当字幕抹掉(实测灾难)。"""
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(glyph, connectivity=8)
+        out = np.zeros_like(glyph)
+        for i in range(1, num):
+            if stats[i, cv2.CC_STAT_HEIGHT] <= max_h:
+                out[labels == i] = 255
+        return out
+
+    @staticmethod
     def residual_white(fixed_rgb, glyph):
         """修复帧在原白字形位置上仍是白的像素数(=漏擦残留)。"""
         f = fixed_rgb.astype(np.int16)
@@ -221,6 +232,7 @@ class Pipeline:
                              max(0, gx1 - GLYPH_NEIGHBORHOOD):min(w, gx2 + GLYPH_NEIGHBORHOOD)] = 255
                     glyph = self.white_glyph(img, region)
                     glyph = cv2.bitwise_and(glyph, hood)
+                    glyph = self.filter_glyph_by_height(glyph)
                     resid = self.residual_white(fixed, glyph)
                     if resid > RESID_MIN_PX:
                         kernel = np.ones((GLYPH_DILATE, GLYPH_DILATE), 'uint8')
@@ -228,7 +240,11 @@ class Pipeline:
                         fixed = self.inpainter.inpaint(fixed, glyph_mask)
                         n_repair += 1
                         print(f'  [补擦] 帧 {n}: 残留 {resid}px 已二次修复')
-                frame = av.VideoFrame.from_ndarray(fixed, format='rgb24')
+                # 帧间防闪:mask 外严格保留原帧像素(模型对 mask 外的输出有逐帧
+                # 随机细微差,整帧替换会造成全画面轻微闪烁)
+                m3 = cv2.dilate(mask, np.ones((7, 7), 'uint8')).astype(np.float32)[:, :, None] / 255
+                blended = (img.astype(np.float32) * (1 - m3) + fixed.astype(np.float32) * m3)
+                frame = av.VideoFrame.from_ndarray(blended.astype('uint8'), format='rgb24')
             for pkt in ov.encode(frame):
                 dst.mux(pkt)
             if progress and (n % 30 == 0 or n == total):
