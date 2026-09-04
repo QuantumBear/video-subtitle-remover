@@ -39,6 +39,8 @@ DEFAULT_DET_MODEL_DIR = os.path.join(BASE_DIR, 'backend', 'models', 'V5', 'ch_de
 DEFAULT_DET_MODEL_NAME = 'PP-OCRv5_mobile_det'
 LAMA_PT = os.path.join(BASE_DIR, 'backend', 'models', 'big-lama', 'big-lama.pt')
 
+from fractions import Fraction
+
 MASK_PAD = 10            # OCR 框外扩像素(create_mask 同款经验值)
 MASK_EXPAND_DOWN = 55    # mask 向下扩展像素:字幕常配 emoji/贴纸在文字行正下方,
                          # OCR 不检测图形贴纸,靠此扩展一并罩住重绘
@@ -242,12 +244,16 @@ class Pipeline:
 
     @staticmethod
     def expand_timeline(all_boxes, merge_gap=10):
-        """字幕时间线区间化:帧号间隔 ≤merge_gap 的检出帧合并为同一区间,
-        区间内所有帧统一使用该区间全部检出框的并集 mask。
+        """字幕时间线区间化 + 最近邻传播。
 
-        这是防字幕闪现的关键:逐帧独立检测时,字幕'忽检出忽漏检'会造成
-        擦与不擦交替闪现;区间并集让 mask 帧间稳定(上游 main.py 同机制)。
-        并集还顺带覆盖区间内漏检帧。
+        目标是防字幕闪现(逐帧独立检测时字幕'忽检出忽漏检',擦与不擦交替):
+        帧号间隔 ≤merge_gap 的检出帧合并为同一区间,区间内无检出框的帧
+        继承时间上最近的检出帧的框。
+
+        注意不能用区间内全部检出框的并集:动态字幕(位置随镜头移动)的
+        并集会横跨整条移动带,把人物/背景大面积罩进 mask,LAMA 会把
+        画面重绘成模糊涂抹(实测灾难)。最近邻帧的框最贴近该帧字幕的
+        真实位置。
         """
         n = len(all_boxes)
         hits = [i for i, b in enumerate(all_boxes) if b]
@@ -260,15 +266,20 @@ class Pipeline:
                 ranges[-1][1] = i
             else:
                 ranges.append([i, i])
-        expanded = [[] for _ in range(n)]
+        expanded = [list(b) for b in all_boxes]
         for lo, hi in ranges:
-            union = []
+            frames_with = [i for i in range(lo, hi + 1) if all_boxes[i]]
             for i in range(lo, hi + 1):
-                for b in all_boxes[i]:
-                    if b not in union:
-                        union.append(b)
-            for i in range(lo, hi + 1):
-                expanded[i] = union
+                if all_boxes[i]:
+                    continue
+                prev = max((j for j in frames_with if j < i), default=None)
+                nxt = min((j for j in frames_with if j > i), default=None)
+                if prev is None:
+                    expanded[i] = all_boxes[nxt]
+                elif nxt is None:
+                    expanded[i] = all_boxes[prev]
+                else:
+                    expanded[i] = all_boxes[prev if i - prev <= nxt - i else nxt]
         return expanded
 
     def process_video(self, input_path, output_path, region=None,
@@ -291,11 +302,15 @@ class Pipeline:
         if region is None:
             region = (0, h, 0, w)
 
+        global _FRAME_TB
+        _FRAME_TB = Fraction(1, int(round(fps)))
         tmp_out = output_path + '.tmp.mp4'
         dst = av.open(tmp_out, 'w')
         ov = dst.add_stream('libx264', rate=int(round(fps)))
         ov.width = w; ov.height = h; ov.pix_fmt = 'yuv420p'
-        ov.options = {'crf': '18'}
+        # bf=0 禁用 B 帧:B 帧延迟队列导致 encode() flush 时吐出无效 packet
+        # (本机 mux EINVAL 崩溃、服务器上被静默丢帧,输出少 2~4 帧)
+        ov.options = {'crf': '18', 'bf': '0'}
 
         t0 = time.time()
         # 第一遍:全片逐帧 OCR 检测(只记录框,不修复)
@@ -341,6 +356,11 @@ class Pipeline:
                 m3 = cv2.dilate(mask, np.ones((7, 7), 'uint8')).astype(np.float32)[:, :, None] / 255
                 blended = (img.astype(np.float32) * (1 - m3) + fixed.astype(np.float32) * m3)
                 frame = av.VideoFrame.from_ndarray(blended.astype('uint8'), format='rgb24')
+            # 显式 pts:PyAV 对 VideoStream.encode 的自动 pts 分配在长序列上会
+            # 产生乱序包(实测 flush 时 pts 跳回 3 导致 mux EINVAL/服务器丢帧),
+            # 按帧号单调递增是标准做法,时间戳完全可控
+            frame.pts = n - 1
+            frame.time_base = _FRAME_TB
             for pkt in ov.encode(frame):
                 dst.mux(pkt)
             if progress and (n % 30 == 0 or n == total):
