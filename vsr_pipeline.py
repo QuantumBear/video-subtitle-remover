@@ -30,6 +30,9 @@ import numpy as np
 import torch
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 默认禁止 PaddleOCR 启动时联网检查模型源(服务器离线场景/加快启动);
+# 需要联网检查时显式设 PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=False
+os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
 
 # ---------- 可调参数(均有实测依据,见 docs/02-use/04) ----------
 DEFAULT_DET_MODEL_DIR = os.path.join(BASE_DIR, 'backend', 'models', 'V5', 'ch_det_fast')

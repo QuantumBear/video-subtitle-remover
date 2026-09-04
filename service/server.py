@@ -34,6 +34,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 默认禁止 Paddle 联网检查(子进程跑 vsr_pipeline.py 时继承此环境变量)
+os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
 PIPELINE_CLI = os.path.join(BASE_DIR, 'vsr_pipeline.py')
 FFMPEG = os.path.join(BASE_DIR, 'backend', 'ffmpeg', 'macos', 'ffmpeg')
 
