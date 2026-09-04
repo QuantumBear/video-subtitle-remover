@@ -37,6 +37,8 @@ DEFAULT_DET_MODEL_NAME = 'PP-OCRv5_mobile_det'
 LAMA_PT = os.path.join(BASE_DIR, 'backend', 'models', 'big-lama', 'big-lama.pt')
 
 MASK_PAD = 10            # OCR 框外扩像素(create_mask 同款经验值)
+MASK_EXPAND_DOWN = 55    # mask 向下扩展像素:字幕常配 emoji/贴纸在文字行正下方,
+                         # OCR 不检测图形贴纸,靠此扩展一并罩住重绘
 GLYPH_DILATE = 21        # 字形 mask 膨胀核(约 10px,盖住笔画边缘)
 GLYPH_NEIGHBORHOOD = 60  # 字形自检的邻域:仅限 OCR 框向外扩该像素的范围
                          # (漏擦的字总是紧挨着被检出的字行;远处白色物体不进 mask,防误伤)
@@ -155,7 +157,8 @@ class Pipeline:
     def boxes_to_mask(boxes, h, w):
         mask = np.zeros((h, w), dtype='uint8')
         for ymin, ymax, xmin, xmax in boxes:
-            mask[max(0, ymin):min(h, ymax), max(0, xmin):min(w, xmax)] = 255
+            mask[max(0, ymin):min(h, ymax + MASK_EXPAND_DOWN),
+                 max(0, xmin):min(w, xmax)] = 255
         return mask
 
     @staticmethod
