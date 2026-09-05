@@ -42,8 +42,9 @@ LAMA_PT = os.path.join(BASE_DIR, 'backend', 'models', 'big-lama', 'big-lama.pt')
 from fractions import Fraction
 
 MASK_PAD = 10            # OCR 框外扩像素(create_mask 同款经验值)
-MASK_EXPAND_DOWN = 55    # mask 向下扩展像素:字幕常配 emoji/贴纸在文字行正下方,
-                         # OCR 不检测图形贴纸,靠此扩展一并罩住重绘
+MASK_EXPAND_DOWN = 0     # mask 向下扩展:实测下扩 55px 会把字幕正下方的画面
+                         # (鞋子等)罩进 mask 擦掉,且逐帧开关造成内容闪现。
+                         # emoji/贴纸的擦除改由检测扩展或后处理承担,不走盲下扩
 GLYPH_DILATE = 21        # 字形 mask 膨胀核(约 10px,盖住笔画边缘)
 GLYPH_NEIGHBORHOOD = 60  # 字形自检的邻域:仅限 OCR 框向外扩该像素的范围
                          # (漏擦的字总是紧挨着被检出的字行;远处白色物体不进 mask,防误伤)
@@ -410,13 +411,11 @@ class Pipeline:
                 nonlocal seg_frames, seg_masks, n_fixed
                 if not seg_frames:
                     return
-                # 段并集 mask(kaipai 式):大 mask + 强时序修复=补得稳定自然。
-                # 关键教训:观感稳定性 >> mask 精确性——逐帧精确 mask 帧间变化
-                # 反而是闪烁根源(kaipai 连跑进画面的狗都擦,补得自然就没人抱怨)
-                mask_union = np.zeros((h, w), dtype='uint8')
-                for m in seg_masks:
-                    mask_union |= m
-                comps = self.inpainter.inpaint(seg_frames, mask_union)  # BGR 输出
+                # 逐帧精确 mask 是 ProPainter 的正确用法:字幕移动时,某帧被遮
+                # 的位置在相邻帧是未遮的真实背景,传播来的才是真实像素。若用
+                # 段并集 mask,整条移动带在所有帧都被标记为遮蔽——无真值可抄,
+                # 模型只能生成白色雾块(实测楼梯/裤腿上的白雾残影)
+                comps = self.inpainter.inpaint(seg_frames, seg_masks)  # BGR 输出
                 for comp in comps:
                     frame = av.VideoFrame.from_ndarray(
                         cv2.cvtColor(comp, cv2.COLOR_BGR2RGB), format='rgb24')
