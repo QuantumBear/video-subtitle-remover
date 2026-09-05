@@ -50,6 +50,9 @@ GLYPH_NEIGHBORHOOD = 60  # 字形自检的邻域:仅限 OCR 框向外扩该像�
 WHITE_ORIG_TH = 228      # 原帧白字判据:三通道下限(经 f165 残留/f180 干净校准)
 WHITE_FIXED_TH = 210     # 修复帧"仍白"判据:放宽以抗重编码灰度漂移
 WHITE_RB_MAX = 25        # |R-B| 上限:排除蓝裤腿等彩色亮物
+MIN_BOX_ASPECT = 1.8     # 检出框最小宽高比(w/h):字幕行是水平长条(实测≥2.7),
+                         # 近方形框是动物/物体误检(实测狗被检出 1.1:1 的框),
+                         # 这类框交给修复模型会造成大面积雾块;emoji 框靠下扩覆盖
 RESID_MIN_PX = 50        # 帧内残留像素超过该值才触发补擦(抗压缩噪声)
 # ffmpeg:优先用系统 PATH 里的(服务器/Linux 场景),否则回退仓库自带的平台二进制
 FFMPEG = shutil.which('ffmpeg') or os.path.join(BASE_DIR, 'backend', 'ffmpeg', 'macos', 'ffmpeg')
@@ -177,6 +180,10 @@ class Pipeline:
             for poly in polys:
                 x1, y1 = poly[:, 0].min(), poly[:, 1].min()
                 x2, y2 = poly[:, 0].max(), poly[:, 1].max()
+                bw, bh = x2 - x1, y2 - y1
+                # 宽高比过滤:字幕行是水平长条;近方形框是动物/物体误检
+                if bw < MIN_BOX_ASPECT * bh:
+                    continue
                 # 坐标平移回全帧,外扩后输出
                 boxes.append((max(0, int(y1) + ymin - MASK_PAD), int(y2) + ymin + MASK_PAD,
                               max(0, int(x1) + xmin - MASK_PAD), int(x2) + xmin + MASK_PAD))
