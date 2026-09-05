@@ -434,8 +434,9 @@ class Pipeline:
                     seg_masks.append(self.boxes_to_mask(boxes, h, w))
                     seg_frames.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
                     seg_pts.append(n - 1)
-                    if len(seg_frames) >= 100:   # 控制单段内存与显存
-                        flush_segment()
+                    if len(seg_frames) >= 400:   # 段长 100→400:段边界是实测最大的
+                        flush_segment()          # 闪烁源(边界跳变 4.96x);ProPainter
+                                                 # 内部自带 sub_video_length 分块,显存可控
                 else:
                     flush_segment()
                     frame.pts = n - 1
