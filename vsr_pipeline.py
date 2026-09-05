@@ -122,9 +122,10 @@ class Pipeline:
 
     def __init__(self, det_model_dir=DEFAULT_DET_MODEL_DIR,
                  det_model_name=DEFAULT_DET_MODEL_NAME,
-                 lama_pt=LAMA_PT, threads=None, device='auto'):
+                 lama_pt=LAMA_PT, threads=None, device='auto', inpaint_mode='lama'):
         if threads:
             torch.set_num_threads(threads)
+        self.inpaint_mode = inpaint_mode
         print(f'[init] 加载 OCR 检测模型: {det_model_dir}')
         from paddleocr import TextDetection
         # OCR 固定 CPU:占比小(~13%),不值得为它装 paddle-gpu
@@ -134,9 +135,32 @@ class Pipeline:
             device='cpu',
             enable_hpi=False,
         )
-        print(f'[init] 加载 LAMA: {lama_pt}')
-        self.inpainter = LamaEngine(lama_pt, device=device)
-        print(f'[init] 模型就绪(LAMA device: {self.inpainter.device})')
+        if inpaint_mode == 'lama':
+            print(f'[init] 加载 LAMA: {lama_pt}')
+            self.inpainter = LamaEngine(lama_pt, device=device)
+            print(f'[init] 模型就绪(LAMA device: {self.inpainter.device})')
+        elif inpaint_mode == 'propainter':
+            # ProPainter 时序修复:被字幕遮挡的真实像素可从相邻帧沿光流传播
+            # 回来,重建质量远超单帧 LAMA(对照 kaipai 目标效果);显存大,
+            # 必须 GPU,首次用到时才加载
+            self._pp_device = torch.device('cuda' if (device == 'auto' and torch.cuda.is_available()) or device == 'cuda' else 'cpu')
+            self.inpainter = None
+            print(f'[init] ProPainter 模式(引擎将在首次修复时加载,device: {self._pp_device})')
+        else:
+            raise ValueError(f'未知 inpaint_mode: {inpaint_mode}')
+
+    def _ensure_propainter(self):
+        """ProPainter 惰性加载(首次修复时)。"""
+        if self.inpainter is None:
+            from backend.inpaint.propainter_inpaint import PropainterInpaint
+            from backend.tools.model_config import ModelConfig
+            self.inpainter = PropainterInpaint(
+                device=self._pp_device,
+                model_dir=ModelConfig().PROPAINTER_MODEL_DIR,
+                sub_video_length=80,
+                use_fp16=self._pp_device.type == 'cuda',
+            )
+            print('[init] ProPainter 已加载')
 
     # ---- OCR 检测:返回该帧在 region 内的文字框列表 [(ymin,ymax,xmin,xmax), ...] ----
     def detect(self, frame_rgb, region):
@@ -321,53 +345,103 @@ class Pipeline:
             if progress and (len(all_boxes) % 30 == 0 or len(all_boxes) == total):
                 progress(len(all_boxes), total, '检测中')
         src.close()
-        # 时间线区间化:区间内所有帧统一使用检出框并集(防字幕闪现)
+        # 时间线区间化:无检出帧继承最近检出帧的框(防字幕闪现,详见方法注释)
         all_boxes = self.expand_timeline(all_boxes)
 
-        # 第二遍:按区间 mask 逐帧修复
+        # 第二遍:修复 + 写出
         src = av.open(input_path)
         n_fixed = n_repair = n = 0
-        for frame in src.decode(video=0):
-            n += 1
-            img = np.asarray(frame.to_image())  # RGB
-            boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
-            if boxes:
-                mask = self.boxes_to_mask(boxes, h, w)
-                fixed = self.inpainter.inpaint(img, mask)
-                n_fixed += 1
-                # 白字自检:仅在 OCR 框邻域内找漏擦字(远离框的白色物体不误伤)
-                if white_glyph_check:
-                    hood = np.zeros((h, w), dtype='uint8')
-                    for gy1, gy2, gx1, gx2 in boxes:
-                        hood[max(0, gy1 - GLYPH_NEIGHBORHOOD):min(h, gy2 + GLYPH_NEIGHBORHOOD),
-                             max(0, gx1 - GLYPH_NEIGHBORHOOD):min(w, gx2 + GLYPH_NEIGHBORHOOD)] = 255
-                    glyph = self.white_glyph(img, region)
-                    glyph = cv2.bitwise_and(glyph, hood)
-                    glyph = self.filter_glyph_by_height(glyph)
-                    resid = self.residual_white(fixed, glyph)
-                    if resid > RESID_MIN_PX:
-                        kernel = np.ones((GLYPH_DILATE, GLYPH_DILATE), 'uint8')
-                        glyph_mask = cv2.dilate(glyph, kernel)
-                        fixed = self.inpainter.inpaint(fixed, glyph_mask)
-                        n_repair += 1
-                        print(f'  [补擦] 帧 {n}: 残留 {resid}px 已二次修复')
-                # 帧间防闪:mask 外严格保留原帧像素(模型对 mask 外的输出有逐帧
-                # 随机细微差,整帧替换会造成全画面轻微闪烁)
-                m3 = cv2.dilate(mask, np.ones((7, 7), 'uint8')).astype(np.float32)[:, :, None] / 255
-                blended = (img.astype(np.float32) * (1 - m3) + fixed.astype(np.float32) * m3)
-                frame = av.VideoFrame.from_ndarray(blended.astype('uint8'), format='rgb24')
-            # 显式 pts:PyAV 对 VideoStream.encode 的自动 pts 分配在长序列上会
-            # 产生乱序包(实测 flush 时 pts 跳回 3 导致 mux EINVAL/服务器丢帧),
-            # 按帧号单调递增是标准做法,时间戳完全可控
-            frame.pts = n - 1
-            frame.time_base = _FRAME_TB
-            for pkt in ov.encode(frame):
+
+        if self.inpaint_mode == 'propainter':
+            # ---- ProPainter 分支:按连续字幕段批处理(时序模型,不可逐帧) ----
+            self._ensure_propainter()
+            seg_frames, seg_masks = [], []   # BGR 帧 + 每帧 mask
+
+            def flush_segment():
+                nonlocal seg_frames, seg_masks, n_fixed
+                if not seg_frames:
+                    return
+                mask_union = np.zeros((h, w), dtype='uint8')
+                for m in seg_masks:
+                    mask_union |= m
+                comps = self.inpainter.inpaint(seg_frames, mask_union)  # BGR 输出
+                for comp in comps:
+                    frame = av.VideoFrame.from_ndarray(
+                        cv2.cvtColor(comp, cv2.COLOR_BGR2RGB), format='rgb24')
+                    frame.pts = seg_pts[0]
+                    frame.time_base = _FRAME_TB
+                    for pkt in ov.encode(frame):
+                        dst.mux(pkt)
+                    seg_pts.pop(0)
+                n_fixed += len(seg_frames)
+                seg_frames, seg_masks = [], []
+
+            seg_pts = []
+            for frame in src.decode(video=0):
+                n += 1
+                img = np.asarray(frame.to_image())  # RGB
+                boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
+                if boxes:
+                    seg_masks.append(self.boxes_to_mask(boxes, h, w))
+                    seg_frames.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                    seg_pts.append(n - 1)
+                    if len(seg_frames) >= 100:   # 控制单段内存与显存
+                        flush_segment()
+                else:
+                    flush_segment()
+                    frame.pts = n - 1
+                    frame.time_base = _FRAME_TB
+                    for pkt in ov.encode(frame):
+                        dst.mux(pkt)
+                if progress and (n % 30 == 0 or n == total):
+                    progress(n, total, f'ProPainter 修复 {n_fixed}')
+            flush_segment()
+            for pkt in ov.encode():
                 dst.mux(pkt)
-            if progress and (n % 30 == 0 or n == total):
-                progress(n, total, f'修复 {n_fixed} / 补擦 {n_repair}')
-        for pkt in ov.encode():
-            dst.mux(pkt)
-        dst.close()
+            dst.close()
+        else:
+            # ---- LAMA 分支:逐帧修复 + 白字自检 + 补擦 + 防闪混合 ----
+            for frame in src.decode(video=0):
+                n += 1
+                img = np.asarray(frame.to_image())  # RGB
+                boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
+                if boxes:
+                    mask = self.boxes_to_mask(boxes, h, w)
+                    fixed = self.inpainter.inpaint(img, mask)
+                    n_fixed += 1
+                    # 白字自检:仅在 OCR 框邻域内找漏擦字(远离框的白色物体不误伤)
+                    if white_glyph_check:
+                        hood = np.zeros((h, w), dtype='uint8')
+                        for gy1, gy2, gx1, gx2 in boxes:
+                            hood[max(0, gy1 - GLYPH_NEIGHBORHOOD):min(h, gy2 + GLYPH_NEIGHBORHOOD),
+                                 max(0, gx1 - GLYPH_NEIGHBORHOOD):min(w, gx2 + GLYPH_NEIGHBORHOOD)] = 255
+                        glyph = self.white_glyph(img, region)
+                        glyph = cv2.bitwise_and(glyph, hood)
+                        glyph = self.filter_glyph_by_height(glyph)
+                        resid = self.residual_white(fixed, glyph)
+                        if resid > RESID_MIN_PX:
+                            kernel = np.ones((GLYPH_DILATE, GLYPH_DILATE), 'uint8')
+                            glyph_mask = cv2.dilate(glyph, kernel)
+                            fixed = self.inpainter.inpaint(fixed, glyph_mask)
+                            n_repair += 1
+                            print(f'  [补擦] 帧 {n}: 残留 {resid}px 已二次修复')
+                    # 帧间防闪:mask 外严格保留原帧像素(模型对 mask 外的输出有逐帧
+                    # 随机细微差,整帧替换会造成全画面轻微闪烁)
+                    m3 = cv2.dilate(mask, np.ones((7, 7), 'uint8')).astype(np.float32)[:, :, None] / 255
+                    blended = (img.astype(np.float32) * (1 - m3) + fixed.astype(np.float32) * m3)
+                    frame = av.VideoFrame.from_ndarray(blended.astype('uint8'), format='rgb24')
+                # 显式 pts:PyAV 对 VideoStream.encode 的自动 pts 分配在长序列上会
+                # 产生乱序包(实测 flush 时 pts 跳回 3 导致 mux EINVAL/服务器丢帧),
+                # 按帧号单调递增是标准做法,时间戳完全可控
+                frame.pts = n - 1
+                frame.time_base = _FRAME_TB
+                for pkt in ov.encode(frame):
+                    dst.mux(pkt)
+                if progress and (n % 30 == 0 or n == total):
+                    progress(n, total, f'修复 {n_fixed} / 补擦 {n_repair}')
+            for pkt in ov.encode():
+                dst.mux(pkt)
+            dst.close()
 
         # 音频从源视频 copy 合回(源无音频时直接改名)
         has_audio = any(s.type == 'audio' for s in src.streams)
@@ -400,10 +474,12 @@ def main():
                     help='关闭白字自检(彩色字幕场景)')
     ap.add_argument('--threads', type=int, default=None, help='torch CPU 线程数(多 worker 并发时调小)')
     ap.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'],
-                    help="LAMA 推理设备:auto=有 CUDA 用 GPU(默认)")
+                    help="推理设备:auto=有 CUDA 用 GPU(默认)")
+    ap.add_argument('--inpaint-mode', default='lama', choices=['lama', 'propainter'],
+                    help='lama=单帧快速;propainter=时序修复(质量高,需 GPU,显存大)')
     args = ap.parse_args()
 
-    pipe = Pipeline(threads=args.threads, device=args.device)
+    pipe = Pipeline(threads=args.threads, device=args.device, inpaint_mode=args.inpaint_mode)
     stat = pipe.process_video(
         args.input, args.output,
         region=tuple(args.region) if args.region else None,
