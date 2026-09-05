@@ -41,7 +41,9 @@ LAMA_PT = os.path.join(BASE_DIR, 'backend', 'models', 'big-lama', 'big-lama.pt')
 
 from fractions import Fraction
 
-MASK_PAD = 10            # OCR 框外扩像素(create_mask 同款经验值)
+MASK_PAD = 4             # OCR 框外扩像素:mask 比字形宽的环带是 ProPainter
+                         # 传播距离最远、质量最差的区域(白雾残影所在),
+                         # 收紧外扩(4px 盖住字形抗锯齿边缘)可显著缩小环带
 MASK_EXPAND_DOWN = 0     # mask 向下扩展:实测下扩 55px 会把字幕正下方的画面
                          # (鞋子等)罩进 mask 擦掉,且逐帧开关造成内容闪现。
                          # emoji/贴纸的擦除改由检测扩展或后处理承担,不走盲下扩
