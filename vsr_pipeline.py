@@ -267,7 +267,48 @@ class Pipeline:
         return (ymin, ymax, xmin, xmax)
 
     @staticmethod
-    def expand_timeline(all_boxes, merge_gap=10):
+    def _boxes_overlap(b1, b2, pad=60):
+        """两框(外扩 pad)是否重叠:字幕随镜头轻微移动仍视为同一字幕。"""
+        return not (b1[3] < b2[2] - pad or b1[2] > b2[3] + pad
+                    or b1[1] < b2[0] - pad or b1[0] > b2[1] + pad)
+
+    @classmethod
+    def filter_boxes_by_continuity(cls, all_boxes, max_gap=5):
+        """检出框的位置连续性过滤:剔除孤立错位的误检框。
+
+        字幕在时间上连续,检出框应与前后检出帧的框位置衔接。一个框若与
+        前后(帧距 ≤max_gap)检出帧的所有框均不重叠,则是画面误检
+        (高光/动物被当文字),交给 ProPainter 会传播来错误内容
+        (实测 f271 雾块)。删除后该帧交由最近邻继承。
+        """
+        hits = [i for i, b in enumerate(all_boxes) if b]
+        out = [list(b) for b in all_boxes]
+
+        def overlap_any(b, others):
+            return any(cls._boxes_overlap(b, pb) for pb in others)
+
+        for i in hits:
+            prev = max((j for j in hits if j < i), default=None)
+            nxt = min((j for j in hits if j > i), default=None)
+            prev_ok = prev is not None and i - prev <= max_gap
+            nxt_ok = nxt is not None and nxt - i <= max_gap
+            if not prev_ok and not nxt_ok:
+                continue  # 邻居太远无法判定,保守保留
+            kept = []
+            for b in all_boxes[i]:
+                fail_prev = prev_ok and not overlap_any(b, all_boxes[prev])
+                fail_nxt = nxt_ok and not overlap_any(b, all_boxes[nxt])
+                if prev_ok and nxt_ok:
+                    if fail_prev and fail_nxt:
+                        continue  # 两侧都脱节:孤立误检,剔除
+                elif fail_prev or fail_nxt:
+                    continue  # 单侧可判定且脱节:剔除
+                kept.append(b)
+            out[i] = kept
+        return out
+
+    @classmethod
+    def expand_timeline(cls, all_boxes, merge_gap=10):
         """字幕时间线区间化 + 最近邻传播。
 
         目标是防字幕闪现(逐帧独立检测时字幕'忽检出忽漏检',擦与不擦交替):
@@ -279,6 +320,7 @@ class Pipeline:
         画面重绘成模糊涂抹(实测灾难)。最近邻帧的框最贴近该帧字幕的
         真实位置。
         """
+        all_boxes = cls.filter_boxes_by_continuity(all_boxes)
         n = len(all_boxes)
         hits = [i for i, b in enumerate(all_boxes) if b]
         if not hits:
