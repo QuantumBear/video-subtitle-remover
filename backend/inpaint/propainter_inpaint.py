@@ -33,8 +33,17 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
     masks_img = []
     masks_dilated = []
     flow_masks = []
+    # 逐帧 mask 列表(每帧各自的 mask,支持动态字幕的精确擦除)
+    if isinstance(mpath, (list, tuple)):
+        for m in mpath:
+            if isinstance(m, np.ndarray):
+                if m.ndim == 3:
+                    m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY) if m.shape[2] == 3 else m[:, :, 0]
+                masks_img.append(Image.fromarray(m))
+            else:
+                masks_img.append(Image.open(m))
     # 如果传入的直接为numpy array
-    if isinstance(mpath, np.ndarray):
+    elif isinstance(mpath, np.ndarray):
         if mpath.ndim == 3 and mpath.shape[2] == 1:
             mpath = mpath.squeeze(2)  # 从 (H,W,1) 转为 (H,W)
         elif mpath.ndim == 3 and mpath.shape[2] == 3:

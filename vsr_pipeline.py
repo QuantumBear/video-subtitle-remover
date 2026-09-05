@@ -410,10 +410,10 @@ class Pipeline:
                 nonlocal seg_frames, seg_masks, n_fixed
                 if not seg_frames:
                     return
-                mask_union = np.zeros((h, w), dtype='uint8')
-                for m in seg_masks:
-                    mask_union |= m
-                comps = self.inpainter.inpaint(seg_frames, mask_union)  # BGR 输出
+                # 逐帧 mask:精确贴合每帧字幕位置。段并集 mask 会把字幕移动带
+                # 内的人物/背景全部擦除(实测"原本画面被擦除"+帧间闪烁);
+                # ProPainter 的时序传播在逐帧精确 mask 下依然帧间一致
+                comps = self.inpainter.inpaint(seg_frames, seg_masks)  # BGR 输出
                 for comp in comps:
                     frame = av.VideoFrame.from_ndarray(
                         cv2.cvtColor(comp, cv2.COLOR_BGR2RGB), format='rgb24')
