@@ -344,8 +344,19 @@ class Pipeline:
         for lo, hi in ranges:
             frames_with = [i for i in range(lo, hi + 1) if all_boxes[i]]
             for i in range(lo, hi + 1):
-                if all_boxes[i]:
+                # 局部窗口(±2帧)并集:补跨帧漏检(某帧漏检的字行,常被相邻帧
+                # 检出)。窗口小,字幕移动量有限,并集不会横跨移动带(对比:
+                # 全区间并集会把整条移动带罩住,无真值可抄→白雾)
+                near = [j for j in frames_with if abs(j - i) <= 2]
+                if near:
+                    union = []
+                    for j in near:
+                        for b in all_boxes[j]:
+                            if b not in union:
+                                union.append(b)
+                    expanded[i] = union
                     continue
+                # 窗口内无检出(漏检串>5帧):继承最近检出帧的框
                 prev = max((j for j in frames_with if j < i), default=None)
                 nxt = min((j for j in frames_with if j > i), default=None)
                 if prev is None:
