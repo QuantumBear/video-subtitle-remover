@@ -145,7 +145,7 @@ def _dashscope_key():
 
 
 # ---------- VLM 贴纸/emoji 定位(可选,需 DashScope API Key) ----------
-def locate_stickers_vlm(video_path, region, samples=20, model='qwen3.7-plus'):
+def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20, model='qwen3.7-plus'):
     """采样帧调 VLM grounding 定位 emoji/贴纸框,按出现时间段扩展到逐帧。
 
     emoji 是图像贴纸不是文字,OCR 按设计不检测;VLM 语义定位是通用方案
@@ -171,12 +171,17 @@ def locate_stickers_vlm(video_path, region, samples=20, model='qwen3.7-plus'):
     c = av.open(video_path)
     vstream = next(s for s in c.streams if s.type == 'video')
     total = vstream.duration and int(float(vstream.duration * vstream.time_base * float(vstream.average_rate))) or 0
+    # 采样帧:外部指定(文字区间内保证覆盖)或均匀采样
+    if sample_frames:
+        sample_set = set(sample_frames)
+    else:
+        sample_set = set(range(0, total, max(1, total // samples)))
     step = max(1, total // samples) if total else 1
     hits = {}
     n = 0
     import json as _json
     for frame in c.decode(video=0):
-        if n % step == 0:
+        if n in sample_set:
             img = frame.to_image().crop((xmin, ymin, xmax, ymax))
             buf = os.path.join('/tmp', f'_sticker_{n}.png')
             img.save(buf)
@@ -526,7 +531,24 @@ class Pipeline:
         # 贴纸/emoji 定位(VLM,可选):并入对应帧的检出框,
         # 与文字框一起走时间线(最近邻传播覆盖贴纸的持续帧段)
         if locate_stickers:
-            sticker_boxes = locate_stickers_vlm(input_path, region)
+            # 贴纸伴随文字出现:在每个文字检出区间内保证 ≥2 个采样帧,
+            # 避免全片均匀采样的间隙漏掉 emoji(实测"偶尔出现"的根源)
+            hits_idx = sorted(i for i, b in enumerate(all_boxes) if b)
+            ranges = []
+            if hits_idx:
+                lo = hi = hits_idx[0]
+                for i in hits_idx[1:]:
+                    if i - hi <= 10:
+                        hi = i
+                    else:
+                        ranges.append((lo, hi)); lo = hi = i
+                ranges.append((lo, hi))
+            sample_frames = set()
+            for lo, hi in ranges:
+                span = hi - lo
+                for k in range(3):   # 每区间 3 个采样帧
+                    sample_frames.add(lo + span * k // max(2, 2) if span < 3 else lo + span * k // 2)
+            sticker_boxes = locate_stickers_vlm(input_path, region, sample_frames=sorted(sample_frames))
             # 贴纸是字幕的一部分:只保留在文字检出帧(±3 帧邻域)内的贴纸框,
             # 避免时间扩展越出字幕区间误擦无字幕画面
             text_hits = {i for i, b in enumerate(all_boxes) if b}
