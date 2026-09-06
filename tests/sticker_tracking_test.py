@@ -1,0 +1,48 @@
+"""贴纸/emoji 采样框跟踪的回归测试。
+
+测试不初始化 OCR、LAMA 或 ProPainter；只验证 VLM 结果进入时间线前的
+多目标跟踪逻辑。服务器完整依赖安装后可直接用 pytest 运行。
+"""
+import sys
+import types
+
+# 本地开发环境可能没有视频推理依赖；导入 vsr_pipeline 时这些模块只在
+# 实际处理视频/调用模型的方法体内使用，测试可用空模块替代。
+sys.modules.setdefault("av", types.ModuleType("av"))
+sys.modules.setdefault("cv2", types.ModuleType("cv2"))
+
+from vsr_pipeline import _group_sticker_boxes, _sticker_match_score
+
+
+def test_adjacent_stickers_keep_separate_tracks():
+    """同一帧相邻的三个 emoji 必须各自形成稳定轨迹，不能被合成一个框。"""
+    hits = {
+        0: [
+            (490, 525, 312, 342),
+            (490, 525, 343, 373),
+            (490, 525, 374, 404),
+        ],
+        40: [
+            (491, 526, 313, 343),
+            (491, 526, 344, 374),
+            (491, 526, 375, 405),
+        ],
+        80: [
+            (490, 525, 312, 342),
+            (490, 525, 343, 373),
+            (490, 525, 374, 404),
+        ],
+    }
+
+    stable = _group_sticker_boxes(hits)
+
+    assert len(stable) == 3
+    assert all(len(set(frames)) == 3 for _, frames in stable)
+
+
+def test_adjacent_boxes_do_not_match_even_when_vlm_boxes_touch():
+    """VLM 框略大而相邻时，中心距离仍应阻止错误合并。"""
+    left = (490, 525, 310, 350)
+    right = (490, 525, 340, 380)
+
+    assert _sticker_match_score(left, right) < 0

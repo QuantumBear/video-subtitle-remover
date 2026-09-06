@@ -144,6 +144,71 @@ def _dashscope_key():
         return None
 
 
+def _sticker_match_score(b1, b2):
+    """返回两个采样框是否属于同一个贴纸的匹配分数。
+
+    字幕框的连续性判断允许 ``pad=60``，但相邻 emoji 的间距往往小于
+    60px；直接复用该判断会把一排猫/狗 emoji 合并成一个轨迹，最后只
+    保留 VLM 返回的第一个框。这里用交叠比例和中心距离做更严格的
+    同目标匹配，保证相邻贴纸各自跟踪。
+    """
+    y1a, y2a, x1a, x2a = b1
+    y1b, y2b, x1b, x2b = b2
+    wa, ha = max(1, x2a - x1a), max(1, y2a - y1a)
+    wb, hb = max(1, x2b - x1b), max(1, y2b - y1b)
+    cxa, cya = (x1a + x2a) / 2, (y1a + y2a) / 2
+    cxb, cyb = (x1b + x2b) / 2, (y1b + y2b) / 2
+    size_ok = (0.4 <= wa / wb <= 2.5 and 0.4 <= ha / hb <= 2.5)
+    center_ok = (abs(cxa - cxb) <= 0.35 * (wa + wb)
+                 and abs(cya - cyb) <= 0.35 * (ha + hb))
+    if not size_ok or not center_ok:
+        return -1.0
+    area_a, area_b = wa * ha, wb * hb
+    inter_w = max(0, min(x2a, x2b) - max(x1a, x1b))
+    inter_h = max(0, min(y2a, y2b) - max(y1a, y1b))
+    overlap = (inter_w * inter_h) / min(area_a, area_b)
+    if overlap >= 0.15:
+        return overlap
+
+    # VLM 在不同帧的框边界会有轻微抖动；没有像素交叠时仍允许同一
+    # 目标匹配，但中心距离必须明显小于两个框的尺寸之和。相邻贴纸
+    # 的中心距离通常接近一个框宽度，因此不会被合并。
+    return 0.01
+
+
+def _group_sticker_boxes(hits, min_samples=2):
+    """将 VLM 在采样帧中的贴纸框按目标分组。
+
+    ``hits`` 是 ``{帧号: [框...]}``。同一采样帧的两个框绝不能互相
+    匹配；否则相邻 emoji 会因空间距离很近而被错误合并。返回稳定轨迹
+    ``[(代表框, [命中帧号...]), ...]``。
+    """
+    # [代表框, 命中帧列表, 最近命中帧号]
+    tracks = []
+    for frame_no, boxes in sorted(hits.items()):
+        used = set()
+        for box in boxes:
+            best_idx = None
+            best_score = -1.0
+            for idx, (representative, frames, last_frame) in enumerate(tracks):
+                # 同一采样帧的框必须保持独立；一帧内的重复框由 VLM
+                # 自己去重，不能在这里借“时间一致性”吞掉相邻目标。
+                if idx in used or last_frame >= frame_no:
+                    continue
+                score = _sticker_match_score(box, representative)
+                if score > best_score:
+                    best_idx, best_score = idx, score
+            if best_idx is None or best_score < 0:
+                tracks.append([box, [frame_no], frame_no])
+                used.add(len(tracks) - 1)
+            else:
+                tracks[best_idx][1].append(frame_no)
+                tracks[best_idx][2] = frame_no
+                used.add(best_idx)
+    return [(box, frames) for box, frames, _ in tracks
+            if len(set(frames)) >= min_samples]
+
+
 # ---------- VLM 贴纸/emoji 定位(可选,需 DashScope API Key) ----------
 def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20, model='qwen3.7-plus'):
     """采样帧调 VLM grounding 定位 emoji/贴纸框,按出现时间段扩展到逐帧。
@@ -164,7 +229,8 @@ def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20, mode
     W, H = xmax - xmin, ymax - ymin
 
     prompt = ('这是视频的一帧。请找出画面中所有 emoji 表情图标、贴纸、图案水印'
-              '(不是文字,不是真实物体)。输出 JSON 数组,每项 '
+              '(不是文字,不是真实物体)。相邻的多个图标必须分别输出独立框，'
+              '不要把一排图标合并成一个框；即使内容相同也分别输出。输出 JSON 数组,每项 '
               '{"label": "内容", "bbox_2d": [x1, y1, x2, y2]}(0-1000 归一化坐标)。'
               '没有则输出 []。只输出 JSON。')
 
@@ -214,21 +280,12 @@ def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20, mode
         n += 1
     c.close()
     # 多采样一致性:贴纸必须在 ≥2 个采样帧出现(位置重叠)才保留——
-    # 单帧命中的多是 VLM 对真实物体(鞋/动物)的误认,扩展擦除会误伤
-    import itertools
-    final_boxes = []   # (box, 出现的采样帧列表)
-    for n0, boxes in sorted(hits.items()):
-        for b in boxes:
-            placed = False
-            for entry in final_boxes:
-                if Pipeline._boxes_overlap(b, entry[0]):
-                    entry[1].append(n0)
-                    placed = True
-                    break
-            if not placed:
-                final_boxes.append((b, [n0]))
-    stable = [(b, ns) for b, ns in final_boxes if len(set(ns)) >= 2]
-    dropped = len(final_boxes) - len(stable)
+    # 单帧命中的多是 VLM 对真实物体(鞋/动物)的误认,扩展擦除会误伤。
+    # 这里不能用字幕的 pad=60 重叠判断:相邻 emoji 会被合成一个框。
+    stable = _group_sticker_boxes(hits)
+    total_hits = sum(len(boxes) for boxes in hits.values())
+    stable_hits = sum(len(set(ns)) for _, ns in stable)
+    dropped = total_hits - stable_hits
     if dropped:
         print(f'[sticker-vlm] 多采样一致性过滤: 丢弃 {dropped} 个单帧误检')
     # 时间扩展:同一贴纸的命中采样帧构成连续段,覆盖范围扩展到相邻采样帧的
