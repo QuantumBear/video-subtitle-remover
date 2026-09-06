@@ -231,14 +231,29 @@ def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20, mode
     dropped = len(final_boxes) - len(stable)
     if dropped:
         print(f'[sticker-vlm] 多采样一致性过滤: 丢弃 {dropped} 个单帧误检')
-    # 时间扩展:检出采样帧的前后 step/2 范围内的帧共享该框(贴纸持续出现)
+    # 时间扩展:同一贴纸的命中采样帧构成连续段,覆盖范围扩展到相邻采样帧的
+    # 中点(不跨过未命中的采样帧——那意味着贴纸已消失/场景已变)
+    all_samples = sorted(sample_set)
     out = {}
     for b, ns in stable:
-        for n0 in ns:
-            for i in range(max(0, n0 - step // 2), min(total, n0 + step // 2 + 1)):
-                out.setdefault(i, [])
-                if b not in out[i]:
-                    out[i].append(b)
+        ns_sorted = sorted(set(ns))
+        # 命中段的边界:扩展到相邻采样帧的中点
+        lo_s = ns_sorted[0]
+        hi_s = ns_sorted[-1]
+        lo_ext = lo_s
+        for s_i in all_samples:
+            if s_i < lo_s:
+                lo_ext = (s_i + lo_s) // 2   # 前一个未命中采样与命中帧的中点
+                break
+        hi_ext = hi_s
+        for s_i in reversed(all_samples):
+            if s_i > hi_s:
+                hi_ext = (hi_s + s_i) // 2
+                break
+        for i in range(max(0, lo_ext), min(total, hi_ext + 1)):
+            out.setdefault(i, [])
+            if b not in out[i]:
+                out[i].append(b)
     return out
 
 
@@ -545,9 +560,9 @@ class Pipeline:
                 ranges.append((lo, hi))
             sample_frames = set()
             for lo, hi in ranges:
-                span = hi - lo
-                for k in range(3):   # 每区间 3 个采样帧
-                    sample_frames.add(lo + span * k // max(2, 2) if span < 3 else lo + span * k // 2)
+                step = max(1, min(40, hi - lo))   # 区间内每 40 帧一帧(加密覆盖)
+                sample_frames.update(range(lo, hi + 1, step))
+                sample_frames.add(hi)
             sticker_boxes = locate_stickers_vlm(input_path, region, sample_frames=sorted(sample_frames))
             # 贴纸是字幕的一部分:只保留在文字检出帧(±3 帧邻域)内的贴纸框,
             # 避免时间扩展越出字幕区间误擦无字幕画面
