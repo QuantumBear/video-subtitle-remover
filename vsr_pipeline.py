@@ -18,6 +18,7 @@
   库:   from vsr_pipeline import process_video
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -122,7 +123,24 @@ class LamaEngine:
         return out
 
 
-# ---------- VLM 贴纸/emoji 定位(可选,需 DASHSCOPE_API_KEY) ----------
+# ---------- VLM 贴纸/emoji 定位(可选,需 DashScope API Key) ----------
+def _dashscope_key():
+    """DashScope API Key:环境变量 DASHSCOPE_API_KEY 优先,
+    其次 config/config.json 的 Service.DashscopeApiKey(config.json 已被
+    gitignore,key 不会入库)。都没有则返回 None。"""
+    key = os.environ.get('DASHSCOPE_API_KEY')
+    if key:
+        return key
+    try:
+        cfg_path = os.path.join(BASE_DIR, 'config', 'config.json')
+        with open(cfg_path, encoding='utf-8') as f:
+            data = json.load(f)
+        return (data.get('Service') or {}).get('DashscopeApiKey')
+    except Exception:
+        return None
+
+
+# ---------- VLM 贴纸/emoji 定位(可选,需 DashScope API Key) ----------
 def locate_stickers_vlm(video_path, region, samples=20, model='qwen3.7-plus'):
     """采样帧调 VLM grounding 定位 emoji/贴纸框,按出现时间段扩展到逐帧。
 
@@ -132,9 +150,10 @@ def locate_stickers_vlm(video_path, region, samples=20, model='qwen3.7-plus'):
     """
     import base64
     import requests
-    key = os.environ.get('DASHSCOPE_API_KEY')
+    key = _dashscope_key()
     if not key:
-        print('[sticker-vlm] 未设置 DASHSCOPE_API_KEY,跳过贴纸定位')
+        print('[sticker-vlm] 未配置 DASHSCOPE_API_KEY(环境变量或 config/config.json),'
+              '跳过贴纸定位,emoji 将保留')
         return {}
     base = os.environ.get('DASHSCOPE_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
     ymin, ymax, xmin, xmax = region
