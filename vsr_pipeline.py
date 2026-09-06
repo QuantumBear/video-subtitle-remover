@@ -462,7 +462,7 @@ class Pipeline:
         return expanded
 
     def process_video(self, input_path, output_path, region=None,
-                      white_glyph_check=True, progress=None, locate_stickers=False):
+                      white_glyph_check=True, progress=None, locate_stickers=True):
         """处理单条视频(两遍:先全片检测+时间线区间化,再逐帧修复)。
 
         :param region: (ymin, ymax, xmin, xmax) 字幕区域;None = 自动探测
@@ -648,8 +648,9 @@ def main():
                     help="推理设备:auto=有 CUDA 用 GPU(默认)")
     ap.add_argument('--inpaint-mode', default='lama', choices=['lama', 'propainter'],
                     help='lama=单帧快速;propainter=时序修复(质量高,需 GPU,显存大)')
-    ap.add_argument('--locate-stickers', action='store_true',
-                    help='用 VLM 定位 emoji/贴纸并一并擦除(需 DASHSCOPE_API_KEY 环境变量)')
+    ap.add_argument('--no-locate-stickers', dest='locate_stickers', action='store_false',
+                    help='关闭 VLM 贴纸/emoji 定位(默认开启;需 DASHSCOPE_API_KEY,'
+                         '未设置时自动跳过并保留 emoji)')
     args = ap.parse_args()
 
     pipe = Pipeline(threads=args.threads, device=args.device, inpaint_mode=args.inpaint_mode)
