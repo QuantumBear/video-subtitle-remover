@@ -58,6 +58,12 @@ MASK_EXPAND_DOWN = 0     # mask 向下扩展:实测下扩 55px 会把字幕正�
 GLYPH_DILATE = 21        # 字形 mask 膨胀核(约 10px,盖住笔画边缘)
 GLYPH_NEIGHBORHOOD = 60  # 字形自检的邻域:仅限 OCR 框向外扩该像素的范围
                          # (漏擦的字总是紧挨着被检出的字行;远处白色物体不进 mask,防误伤)
+PROP_TEXT_MIN_ASPECT = 3.0
+                         # ProPainter 精确字形遮罩只作用于明显的横向字幕框;
+                         # 方形/近方形框通常是 VLM 贴纸,必须保留整框擦除
+PROP_TEXT_MIN_GLYPH_PIXELS = 80
+                         # 框内至少有这么多白色字形像素才启用精确遮罩;
+                         # 抗压缩噪声或亮色物体不会触发
 WHITE_ORIG_TH = 228      # 原帧白字判据:三通道下限(经 f165 残留/f180 干净校准)
 WHITE_FIXED_TH = 210     # 修复帧"仍白"判据:放宽以抗重编码灰度漂移
 WHITE_RB_MAX = 25        # |R-B| 上限:排除蓝裤腿等彩色亮物
@@ -405,6 +411,33 @@ class Pipeline:
                  max(0, xmin):min(w, xmax)] = 255
         return mask
 
+    def propainter_boxes_to_mask(self, boxes, frame_rgb, region):
+        """为 ProPainter 生成精确遮罩,避免把字幕框内背景整体重绘。
+
+        OCR 只返回文字行的外接矩形,而不是字形轮廓。矩形中未被文字
+        覆盖的楼梯、裤腿等真实像素若一并送入 ProPainter,模型会重新生成
+        它们,在 4–5 秒这类字幕压在物体上的场景尤其明显。对明显横向的
+        白色字幕框,改用原帧白色字形作为遮罩;方形/无白字框则保留整框,
+        兼容 VLM 贴纸和有色字幕。
+        """
+        h, w = frame_rgb.shape[:2]
+        glyph = self.filter_glyph_by_height(self.white_glyph(frame_rgb, region))
+        mask = np.zeros((h, w), dtype='uint8')
+        for ymin, ymax, xmin, xmax in boxes:
+            y1, y2 = max(0, ymin), min(h, ymax)
+            x1, x2 = max(0, xmin), min(w, xmax)
+            if y2 <= y1 or x2 <= x1:
+                continue
+            bw, bh = x2 - x1, y2 - y1
+            local_glyph = glyph[y1:y2, x1:x2]
+            # 长横框 + 足量白字形 = OCR 字幕;其它框按贴纸/彩色字幕处理。
+            if (bw >= PROP_TEXT_MIN_ASPECT * max(1, bh)
+                    and int((local_glyph > 0).sum()) >= PROP_TEXT_MIN_GLYPH_PIXELS):
+                mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], local_glyph)
+            else:
+                mask[y1:y2, x1:x2] = 255
+        return mask
+
     @staticmethod
     def white_glyph(frame, region):
         """原帧白字形检测(独立于 OCR,差分验收的同款判据)。"""
@@ -689,7 +722,9 @@ class Pipeline:
                 img = np.asarray(frame.to_image())  # RGB
                 boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
                 if boxes:
-                    seg_masks.append(self.boxes_to_mask(boxes, h, w))
+                    # 文字框只遮白色字形,保留字间的楼梯/裤腿等真实像素;
+                    # VLM 贴纸和有色字幕仍由精确矩形覆盖。
+                    seg_masks.append(self.propainter_boxes_to_mask(boxes, img, region))
                     seg_frames.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
                     seg_pts.append(n - 1)
                     if len(seg_frames) >= SEG_LEN + OVERLAP:

@@ -6,6 +6,8 @@
 import sys
 import types
 
+import numpy as np
+
 # 本地开发环境可能没有视频推理依赖；导入 vsr_pipeline 时这些模块只在
 # 实际处理视频/调用模型的方法体内使用，测试可用空模块替代。
 sys.modules.setdefault("av", types.ModuleType("av"))
@@ -20,6 +22,7 @@ from vsr_pipeline import (
     _group_sticker_boxes,
     _sticker_box_from_vlm,
     _sticker_match_score,
+    Pipeline,
 )
 
 
@@ -70,3 +73,32 @@ def test_propainter_window_fits_24gb_profile():
     assert PROPAINTER_SEG_LEN == 40
     assert PROPAINTER_OVERLAP == 20
     assert PROPAINTER_SUB_VIDEO_LENGTH == 60
+
+
+def test_propainter_text_mask_preserves_background_between_glyphs():
+    """横向白字幕框只遮字形,不能把字间的楼梯/人物一起擦掉。"""
+    pipe = Pipeline.__new__(Pipeline)
+    # 测试只关注遮罩策略;跳过依赖 OpenCV 的全局连通域过滤。
+    pipe.filter_glyph_by_height = lambda glyph: glyph
+    frame = np.zeros((120, 240, 3), dtype=np.uint8)
+    frame[40:60, 20:60] = 255
+    frame[40:60, 80:120] = 255
+
+    mask = pipe.propainter_boxes_to_mask(
+        [(35, 65, 15, 125)], frame, (0, 120, 0, 240))
+
+    assert mask[50, 30] == 255       # 字形被遮住
+    assert mask[50, 70] == 0         # 字形之间的真实背景保留
+    assert mask[50, 120] == 0        # OCR 框外背景也保留
+
+
+def test_propainter_sticker_box_still_uses_full_rectangle():
+    """近方形贴纸框没有白字形时仍须整框擦除。"""
+    pipe = Pipeline.__new__(Pipeline)
+    pipe.filter_glyph_by_height = lambda glyph: glyph
+    frame = np.zeros((120, 240, 3), dtype=np.uint8)
+
+    mask = pipe.propainter_boxes_to_mask(
+        [(35, 75, 150, 190)], frame, (0, 120, 0, 240))
+
+    assert mask[50, 170] == 255
