@@ -34,6 +34,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 默认禁止 PaddleOCR 启动时联网检查模型源(服务器离线场景/加快启动);
 # 需要联网检查时显式设 PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=False
 os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
+# 减少 PyTorch 显存碎片(reserved but unallocated 可达数 GB,是 OOM 常因)
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 # ---------- 可调参数(均有实测依据,见 docs/02-use/04) ----------
 DEFAULT_DET_MODEL_DIR = os.path.join(BASE_DIR, 'backend', 'models', 'V5', 'ch_det_fast')
@@ -543,7 +545,9 @@ class Pipeline:
         if self.inpaint_mode == 'propainter':
             # ---- ProPainter 分支:按连续字幕段批处理(时序模型,不可逐帧) ----
             self._ensure_propainter()
-            SEG_LEN, OVERLAP = 80, 20   # 每段输出 80 帧,尾部 20 帧重叠给下一段当上下文
+            SEG_LEN, OVERLAP = 60, 20   # 每段输出 60 帧,尾部 20 帧重叠给下一段当上下文
+                                        # (24G 卡实测 100 帧输入在 transformer 阶段 OOM,
+                                        #  80 帧输入留 ~20% 余量;段边界由重叠保证平滑)
             seg_frames, seg_masks, seg_pts = [], [], []   # BGR 帧 + 每帧 mask + 帧号
 
             def flush_segment(n_out):
