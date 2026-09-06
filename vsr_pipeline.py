@@ -65,6 +65,11 @@ MIN_BOX_ASPECT = 1.8     # 检出框最小宽高比(w/h):字幕行是水平长�
                          # 近方形框是动物/物体误检(实测狗被检出 1.1:1 的框),
                          # 这类框交给修复模型会造成大面积雾块;emoji 框靠下扩覆盖
 RESID_MIN_PX = 50        # 帧内残留像素超过该值才触发补擦(抗压缩噪声)
+# ProPainter 在 24GB 卡上的显存安全窗口。段输出与模型内部子窗口保持
+# 一致，避免服务器上还存在 CUDA/驱动非 PyTorch 占用时，80 帧窗口 OOM。
+PROPAINTER_SEG_LEN = 40
+PROPAINTER_OVERLAP = 20
+PROPAINTER_SUB_VIDEO_LENGTH = PROPAINTER_SEG_LEN + PROPAINTER_OVERLAP
 # ffmpeg:优先用系统 PATH 里的(服务器/Linux 场景),否则回退仓库自带的平台二进制
 FFMPEG = shutil.which('ffmpeg') or os.path.join(BASE_DIR, 'backend', 'ffmpeg', 'macos', 'ffmpeg')
 
@@ -363,7 +368,7 @@ class Pipeline:
             self.inpainter = PropainterInpaint(
                 device=self._pp_device,
                 model_dir=ModelConfig().PROPAINTER_MODEL_DIR,
-                sub_video_length=80,
+                sub_video_length=PROPAINTER_SUB_VIDEO_LENGTH,
                 use_fp16=self._pp_device.type == 'cuda',
             )
             print('[init] ProPainter 已加载')
@@ -649,9 +654,10 @@ class Pipeline:
         if self.inpaint_mode == 'propainter':
             # ---- ProPainter 分支:按连续字幕段批处理(时序模型,不可逐帧) ----
             self._ensure_propainter()
-            SEG_LEN, OVERLAP = 60, 20   # 每段输出 60 帧,尾部 20 帧重叠给下一段当上下文
-                                        # (24G 卡实测 100 帧输入在 transformer 阶段 OOM,
-                                        #  80 帧输入留 ~20% 余量;段边界由重叠保证平滑)
+            SEG_LEN, OVERLAP = PROPAINTER_SEG_LEN, PROPAINTER_OVERLAP
+                                        # 每段输出 40 帧,尾部 20 帧重叠给下一段当上下文
+                                        # (24G 卡在实际服务器非 PyTorch 显存占用较高时,
+                                        #  80 帧窗口仍会 OOM;60 帧输入优先保证稳定运行)
             seg_frames, seg_masks, seg_pts = [], [], []   # BGR 帧 + 每帧 mask + 帧号
 
             def flush_segment(n_out):

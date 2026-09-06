@@ -13,6 +13,9 @@ sys.modules.setdefault("cv2", types.ModuleType("cv2"))
 
 from vsr_pipeline import (
     MASK_PAD,
+    PROPAINTER_OVERLAP,
+    PROPAINTER_SEG_LEN,
+    PROPAINTER_SUB_VIDEO_LENGTH,
     STICKER_MASK_PAD,
     _group_sticker_boxes,
     _sticker_box_from_vlm,
@@ -60,3 +63,10 @@ def test_sticker_coordinate_conversion_uses_wider_padding():
 
     assert STICKER_MASK_PAD > MASK_PAD
     assert box == (408, 452, 218, 272)
+
+
+def test_propainter_window_fits_24gb_profile():
+    """24GB 配置的单次输入应为 60 帧，且保留 20 帧边界上下文。"""
+    assert PROPAINTER_SEG_LEN == 40
+    assert PROPAINTER_OVERLAP == 20
+    assert PROPAINTER_SUB_VIDEO_LENGTH == 60
