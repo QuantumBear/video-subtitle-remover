@@ -34,8 +34,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 默认禁止 PaddleOCR 启动时联网检查模型源(服务器离线场景/加快启动);
 # 需要联网检查时显式设 PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=False
 os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
-# 减少 PyTorch 显存碎片(reserved but unallocated 可达数 GB,是 OOM 常因)
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+# 减少 PyTorch 显存碎片(reserved but unallocated 可达数 GB,是 OOM 常因)。
+# 注意不能用 expandable_segments:它依赖 CUDA 虚拟内存 API,在虚拟化/
+# 容器 GPU 环境会报 "operation not supported"(实测),用老式碎片控制
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:128')
 
 # ---------- 可调参数(均有实测依据,见 docs/02-use/04) ----------
 DEFAULT_DET_MODEL_DIR = os.path.join(BASE_DIR, 'backend', 'models', 'V5', 'ch_det_fast')
