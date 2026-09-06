@@ -122,6 +122,98 @@ class LamaEngine:
         return out
 
 
+# ---------- VLM 贴纸/emoji 定位(可选,需 DASHSCOPE_API_KEY) ----------
+def locate_stickers_vlm(video_path, region, samples=20, model='qwen3.7-plus'):
+    """采样帧调 VLM grounding 定位 emoji/贴纸框,按出现时间段扩展到逐帧。
+
+    emoji 是图像贴纸不是文字,OCR 按设计不检测;VLM 语义定位是通用方案
+    (盲下扩会误擦字幕正下方的鞋子等画面,已实测)。
+    返回 {帧号: [(ymin,ymax,xmin,xmax), ...]}(0-1000 归一化坐标已换算)。
+    """
+    import base64
+    import requests
+    key = os.environ.get('DASHSCOPE_API_KEY')
+    if not key:
+        print('[sticker-vlm] 未设置 DASHSCOPE_API_KEY,跳过贴纸定位')
+        return {}
+    base = os.environ.get('DASHSCOPE_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
+    ymin, ymax, xmin, xmax = region
+    W, H = xmax - xmin, ymax - ymin
+
+    prompt = ('这是视频的一帧。请找出画面中所有 emoji 表情图标、贴纸、图案水印'
+              '(不是文字,不是真实物体)。输出 JSON 数组,每项 '
+              '{"label": "内容", "bbox_2d": [x1, y1, x2, y2]}(0-1000 归一化坐标)。'
+              '没有则输出 []。只输出 JSON。')
+
+    c = av.open(video_path)
+    vstream = next(s for s in c.streams if s.type == 'video')
+    total = vstream.duration and int(float(vstream.duration * vstream.time_base * float(vstream.average_rate))) or 0
+    step = max(1, total // samples) if total else 1
+    hits = {}
+    n = 0
+    import json as _json
+    for frame in c.decode(video=0):
+        if n % step == 0:
+            img = frame.to_image().crop((xmin, ymin, xmax, ymax))
+            buf = os.path.join('/tmp', f'_sticker_{n}.png')
+            img.save(buf)
+            b64 = base64.b64encode(open(buf, 'rb').read()).decode()
+            os.remove(buf)
+            try:
+                resp = requests.post(
+                    f'{base}/chat/completions',
+                    headers={'Authorization': f'Bearer {key}'},
+                    json={'model': model, 'messages': [{'role': 'user', 'content': [
+                        {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{b64}'}},
+                        {'type': 'text', 'text': prompt}]}]},
+                    timeout=120)
+                content = resp.json()['choices'][0]['message']['content'].strip()
+                if content.startswith('```'):
+                    content = content.split('```')[1]
+                    if content.startswith('json'):
+                        content = content[4:]
+                for b in _json.loads(content):
+                    x1, y1, x2, y2 = b['bbox_2d']
+                    boxes = (max(0, int(y1 * H / 1000) + ymin - MASK_PAD),
+                             min(ymax, int(y2 * H / 1000) + ymin + MASK_PAD),
+                             max(0, int(x1 * W / 1000) + xmin - MASK_PAD),
+                             min(xmax, int(x2 * W / 1000) + xmin + MASK_PAD))
+                    if boxes[1] > boxes[0] and boxes[3] > boxes[2]:
+                        hits[n] = hits.get(n, []) + [boxes]
+                        print(f'[sticker-vlm] f{n}: {b.get("label","")[:20]} {boxes}')
+            except Exception as e:
+                print(f'[sticker-vlm] f{n} 定位失败: {e}')
+        n += 1
+    c.close()
+    # 多采样一致性:贴纸必须在 ≥2 个采样帧出现(位置重叠)才保留——
+    # 单帧命中的多是 VLM 对真实物体(鞋/动物)的误认,扩展擦除会误伤
+    import itertools
+    final_boxes = []   # (box, 出现的采样帧列表)
+    for n0, boxes in sorted(hits.items()):
+        for b in boxes:
+            placed = False
+            for entry in final_boxes:
+                if Pipeline._boxes_overlap(b, entry[0]):
+                    entry[1].append(n0)
+                    placed = True
+                    break
+            if not placed:
+                final_boxes.append((b, [n0]))
+    stable = [(b, ns) for b, ns in final_boxes if len(set(ns)) >= 2]
+    dropped = len(final_boxes) - len(stable)
+    if dropped:
+        print(f'[sticker-vlm] 多采样一致性过滤: 丢弃 {dropped} 个单帧误检')
+    # 时间扩展:检出采样帧的前后 step/2 范围内的帧共享该框(贴纸持续出现)
+    out = {}
+    for b, ns in stable:
+        for n0 in ns:
+            for i in range(max(0, n0 - step // 2), min(total, n0 + step // 2 + 1)):
+                out.setdefault(i, [])
+                if b not in out[i]:
+                    out[i].append(b)
+    return out
+
+
 # ---------- 模型单例(worker 进程内 import 一次,处理多条视频复用) ----------
 class Pipeline:
     """持有常驻模型,提供单视频处理入口。"""
@@ -370,7 +462,7 @@ class Pipeline:
         return expanded
 
     def process_video(self, input_path, output_path, region=None,
-                      white_glyph_check=True, progress=None):
+                      white_glyph_check=True, progress=None, locate_stickers=False):
         """处理单条视频(两遍:先全片检测+时间线区间化,再逐帧修复)。
 
         :param region: (ymin, ymax, xmin, xmax) 字幕区域;None = 自动探测
@@ -408,6 +500,20 @@ class Pipeline:
             if progress and (len(all_boxes) % 30 == 0 or len(all_boxes) == total):
                 progress(len(all_boxes), total, '检测中')
         src.close()
+        # 贴纸/emoji 定位(VLM,可选):并入对应帧的检出框,
+        # 与文字框一起走时间线(最近邻传播覆盖贴纸的持续帧段)
+        if locate_stickers:
+            sticker_boxes = locate_stickers_vlm(input_path, region)
+            # 贴纸是字幕的一部分:只保留在文字检出帧(±3 帧邻域)内的贴纸框,
+            # 避免时间扩展越出字幕区间误擦无字幕画面
+            text_hits = {i for i, b in enumerate(all_boxes) if b}
+            for i, boxes in sticker_boxes.items():
+                if i >= len(all_boxes):
+                    continue
+                near_text = any(j in text_hits for j in range(max(0, i - 3), min(len(all_boxes), i + 4)))
+                if near_text:
+                    all_boxes[i] = all_boxes[i] + [b for b in boxes if b not in all_boxes[i]]
+
         # 时间线区间化:无检出帧继承最近检出帧的框(防字幕闪现,详见方法注释)
         all_boxes = self.expand_timeline(all_boxes)
 
@@ -542,6 +648,8 @@ def main():
                     help="推理设备:auto=有 CUDA 用 GPU(默认)")
     ap.add_argument('--inpaint-mode', default='lama', choices=['lama', 'propainter'],
                     help='lama=单帧快速;propainter=时序修复(质量高,需 GPU,显存大)')
+    ap.add_argument('--locate-stickers', action='store_true',
+                    help='用 VLM 定位 emoji/贴纸并一并擦除(需 DASHSCOPE_API_KEY 环境变量)')
     args = ap.parse_args()
 
     pipe = Pipeline(threads=args.threads, device=args.device, inpaint_mode=args.inpaint_mode)
@@ -549,6 +657,7 @@ def main():
         args.input, args.output,
         region=tuple(args.region) if args.region else None,
         white_glyph_check=not args.no_white_glyph_check,
+        locate_stickers=args.locate_stickers,
         progress=lambda d, t, s: print(f'  进度 {d}/{t} ({s})'))
     print('统计:', stat)
 
