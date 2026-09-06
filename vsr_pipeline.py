@@ -543,29 +543,33 @@ class Pipeline:
         if self.inpaint_mode == 'propainter':
             # ---- ProPainter 分支:按连续字幕段批处理(时序模型,不可逐帧) ----
             self._ensure_propainter()
-            seg_frames, seg_masks = [], []   # BGR 帧 + 每帧 mask
+            SEG_LEN, OVERLAP = 80, 20   # 每段输出 80 帧,尾部 20 帧重叠给下一段当上下文
+            seg_frames, seg_masks, seg_pts = [], [], []   # BGR 帧 + 每帧 mask + 帧号
 
-            def flush_segment():
-                nonlocal seg_frames, seg_masks, n_fixed
-                if not seg_frames:
+            def flush_segment(n_out):
+                """处理当前缓冲:送入全部帧(含尾部重叠上下文),只输出前 n_out 帧。
+
+                重叠帧不输出、留给下一段作为它的"过去"——段边界的最后一帧
+                因此拥有后向上下文,消除段边界跳变(实测 4.96x)。
+                逐帧 mask 列表(非并集):保证传播源不被并集污染(并集会让
+                所有帧的移动带都成空洞,无真值可抄→白雾)。
+                """
+                nonlocal seg_frames, seg_masks, seg_pts, n_fixed
+                if not seg_frames or n_out <= 0:
                     return
-                # 逐帧精确 mask 是 ProPainter 的正确用法:字幕移动时,某帧被遮
-                # 的位置在相邻帧是未遮的真实背景,传播来的才是真实像素。若用
-                # 段并集 mask,整条移动带在所有帧都被标记为遮蔽——无真值可抄,
-                # 模型只能生成白色雾块(实测楼梯/裤腿上的白雾残影)
-                comps = self.inpainter.inpaint(seg_frames, seg_masks)  # BGR 输出
-                for comp in comps:
+                comps = self.inpainter.inpaint(seg_frames, seg_masks)  # BGR 输出,逐帧 mask
+                for j in range(n_out):
                     frame = av.VideoFrame.from_ndarray(
-                        cv2.cvtColor(comp, cv2.COLOR_BGR2RGB), format='rgb24')
-                    frame.pts = seg_pts[0]
+                        cv2.cvtColor(comps[j], cv2.COLOR_BGR2RGB), format='rgb24')
+                    frame.pts = seg_pts[j]
                     frame.time_base = _FRAME_TB
                     for pkt in ov.encode(frame):
                         dst.mux(pkt)
-                    seg_pts.pop(0)
-                n_fixed += len(seg_frames)
-                seg_frames, seg_masks = [], []
+                n_fixed += n_out
+                seg_frames = seg_frames[n_out:]
+                seg_masks = seg_masks[n_out:]
+                seg_pts = seg_pts[n_out:]
 
-            seg_pts = []
             for frame in src.decode(video=0):
                 n += 1
                 img = np.asarray(frame.to_image())  # RGB
@@ -574,18 +578,17 @@ class Pipeline:
                     seg_masks.append(self.boxes_to_mask(boxes, h, w))
                     seg_frames.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
                     seg_pts.append(n - 1)
-                    if len(seg_frames) >= 400:   # 段长 100→400:段边界是实测最大的
-                        flush_segment()          # 闪烁源(边界跳变 4.96x);ProPainter
-                                                 # 内部自带 sub_video_length 分块,显存可控
+                    if len(seg_frames) >= SEG_LEN + OVERLAP:
+                        flush_segment(SEG_LEN)
                 else:
-                    flush_segment()
+                    flush_segment(len(seg_frames))   # 段结束:重叠无意义,全部输出
                     frame.pts = n - 1
                     frame.time_base = _FRAME_TB
                     for pkt in ov.encode(frame):
                         dst.mux(pkt)
                 if progress and (n % 30 == 0 or n == total):
                     progress(n, total, f'ProPainter 修复 {n_fixed}')
-            flush_segment()
+            flush_segment(len(seg_frames))
             for pkt in ov.encode():
                 dst.mux(pkt)
             dst.close()
