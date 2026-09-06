@@ -11,7 +11,13 @@ import types
 sys.modules.setdefault("av", types.ModuleType("av"))
 sys.modules.setdefault("cv2", types.ModuleType("cv2"))
 
-from vsr_pipeline import _group_sticker_boxes, _sticker_match_score
+from vsr_pipeline import (
+    MASK_PAD,
+    STICKER_MASK_PAD,
+    _group_sticker_boxes,
+    _sticker_box_from_vlm,
+    _sticker_match_score,
+)
 
 
 def test_adjacent_stickers_keep_separate_tracks():
@@ -46,3 +52,11 @@ def test_adjacent_boxes_do_not_match_even_when_vlm_boxes_touch():
     right = (490, 525, 340, 380)
 
     assert _sticker_match_score(left, right) < 0
+
+
+def test_sticker_coordinate_conversion_uses_wider_padding():
+    """贴纸坐标换算应使用独立的 12px 外扩，而非字幕的 4px。"""
+    box = _sticker_box_from_vlm((100, 100, 200, 200), (400, 600, 200, 500))
+
+    assert STICKER_MASK_PAD > MASK_PAD
+    assert box == (408, 452, 218, 272)

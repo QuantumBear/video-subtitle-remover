@@ -49,6 +49,9 @@ from fractions import Fraction
 MASK_PAD = 4             # OCR 框外扩像素:mask 比字形宽的环带是 ProPainter
                          # 传播距离最远、质量最差的区域(白雾残影所在),
                          # 收紧外扩(4px 盖住字形抗锯齿边缘)可显著缩小环带
+STICKER_MASK_PAD = 12    # VLM 贴纸框独立外扩:模型框边界通常比 OCR 框更松,
+                         # 4px 会在 emoji 边缘留下橙色残片;贴纸区域小,
+                         # 增加到 12px 不扩大字幕的擦除范围
 MASK_EXPAND_DOWN = 0     # mask 向下扩展:实测下扩 55px 会把字幕正下方的画面
                          # (鞋子等)罩进 mask 擦掉,且逐帧开关造成内容闪现。
                          # emoji/贴纸的擦除改由检测扩展或后处理承担,不走盲下扩
@@ -209,6 +212,17 @@ def _group_sticker_boxes(hits, min_samples=2):
             if len(set(frames)) >= min_samples]
 
 
+def _sticker_box_from_vlm(bbox_2d, region):
+    """将 VLM 的 0–1000 坐标框换算为全帧框，并使用贴纸专用外扩。"""
+    x1, y1, x2, y2 = bbox_2d
+    ymin, ymax, xmin, xmax = region
+    width, height = xmax - xmin, ymax - ymin
+    return (max(0, int(y1 * height / 1000) + ymin - STICKER_MASK_PAD),
+            min(ymax, int(y2 * height / 1000) + ymin + STICKER_MASK_PAD),
+            max(0, int(x1 * width / 1000) + xmin - STICKER_MASK_PAD),
+            min(xmax, int(x2 * width / 1000) + xmin + STICKER_MASK_PAD))
+
+
 # ---------- VLM 贴纸/emoji 定位(可选,需 DashScope API Key) ----------
 def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20, model='qwen3.7-plus'):
     """采样帧调 VLM grounding 定位 emoji/贴纸框,按出现时间段扩展到逐帧。
@@ -226,8 +240,6 @@ def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20, mode
         return {}
     base = os.environ.get('DASHSCOPE_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
     ymin, ymax, xmin, xmax = region
-    W, H = xmax - xmin, ymax - ymin
-
     prompt = ('这是视频的一帧。请找出画面中所有 emoji 表情图标、贴纸、图案水印'
               '(不是文字,不是真实物体)。相邻的多个图标必须分别输出独立框，'
               '不要把一排图标合并成一个框；即使内容相同也分别输出。输出 JSON 数组,每项 '
@@ -267,11 +279,7 @@ def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20, mode
                     if content.startswith('json'):
                         content = content[4:]
                 for b in _json.loads(content):
-                    x1, y1, x2, y2 = b['bbox_2d']
-                    boxes = (max(0, int(y1 * H / 1000) + ymin - MASK_PAD),
-                             min(ymax, int(y2 * H / 1000) + ymin + MASK_PAD),
-                             max(0, int(x1 * W / 1000) + xmin - MASK_PAD),
-                             min(xmax, int(x2 * W / 1000) + xmin + MASK_PAD))
+                    boxes = _sticker_box_from_vlm(b['bbox_2d'], region)
                     if boxes[1] > boxes[0] and boxes[3] > boxes[2]:
                         hits[n] = hits.get(n, []) + [boxes]
                         print(f'[sticker-vlm] f{n}: {b.get("label","")[:20]} {boxes}')
