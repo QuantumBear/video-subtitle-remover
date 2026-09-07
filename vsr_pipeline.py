@@ -835,7 +835,6 @@ class Pipeline:
                 n += 1
                 if n - 1 in scene_changes:
                     flush_segment(len(seg_frames))
-                    templates.reset()
                 img = np.asarray(frame.to_image())  # RGB
                 boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
                 stickers = sticker_boxes.get(n - 1, [])

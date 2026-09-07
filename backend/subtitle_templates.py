@@ -19,7 +19,10 @@ class _Template:
 
 
 class SubtitleTemplates:
-    """Keep local glyph references; the caller resets at scene boundaries.
+    """Keep bounded local glyph references across scene boundaries.
+
+    References expire by frame age and cache limit; reuse requires matching
+    current subtitle content. Call ``reset`` to explicitly discard references.
 
     Coordinates are half-open ``(y1, y2, x1, x2)``. Only original input
     masks become references, so inferred pixels cannot reinforce themselves.
@@ -86,8 +89,19 @@ class SubtitleTemplates:
                 return
         self._templates.append(reference)
         if len(self._templates) > self._CACHE_LIMIT:
-            self._templates.sort(key=lambda item: (item.pixels, item.frame_number), reverse=True)
-            del self._templates[self._CACHE_LIMIT:]
+            # Repeated observations of one line must not evict another line's only reference.
+            groups = []
+            for index, item in enumerate(self._templates):
+                for group in groups:
+                    if self._nearby(self._templates[group[0]].box, item.box):
+                        group.append(index)
+                        break
+                else:
+                    groups.append([index])
+            crowded = max(groups, key=len)
+            victim = min(crowded, key=lambda index: (self._templates[index].pixels,
+                                                     self._templates[index].frame_number))
+            del self._templates[victim]
 
     @staticmethod
     def _nearby(source, target):

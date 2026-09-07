@@ -25,12 +25,17 @@ def write_frames(path, frames):
             container.mux(packet)
 
 
-def text_frame():
+def text_frame(text="Sturdy steel", *, light_background=False, thin_shadow=False):
     frame = np.full((128, 360, 3), 80, dtype=np.uint8)
-    cv2.putText(frame, "Sturdy steel", (25, 83), cv2.FONT_HERSHEY_SIMPLEX,
-                1.2, (15, 15, 15), 6, cv2.LINE_AA)
-    cv2.putText(frame, "Sturdy steel", (25, 83), cv2.FONT_HERSHEY_SIMPLEX,
-                1.2, (255, 255, 255), 2, cv2.LINE_AA)
+    if light_background:
+        frame[:, 120:310] = 242
+    scale = 0.9 if thin_shadow else 1.2
+    origin = (26, 84) if thin_shadow else (25, 83)
+    color = (65, 65, 65) if thin_shadow else (15, 15, 15)
+    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX,
+                scale, color, 2 if thin_shadow else 6, cv2.LINE_AA)
+    cv2.putText(frame, text, (25, 83), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (255, 255, 255), 2, cv2.LINE_AA)
     return frame, (48, 94, 18, 260)
 
 
@@ -116,28 +121,71 @@ def test_final_audit_failure_keeps_first_pass_and_reports_unchecked_frames(tmp_p
         assert len(list(container.decode(video=0))) == 4
 
 
-def test_template_cache_resets_at_scene_boundary(tmp_path, monkeypatch):
-    import vsr_pipeline
-    from backend.subtitle_templates import SubtitleTemplates
-
+def test_matching_subtitle_survives_scene_cut_without_mixing_model_frames(tmp_path):
+    clear, box = text_frame(thin_shadow=True)
+    bright, _ = text_frame(light_background=True, thin_shadow=True)
+    region = (0, 128, 0, 360)
     source, output = tmp_path / "source.mp4", tmp_path / "result.mp4"
-    write_frames(source, [np.full((48, 64, 3), value, np.uint8)
-                          for value in [0] * 3 + [150] * 3])
-    events = []
-
-    class ObservedTemplates(SubtitleTemplates):
-        def refine(self, frames, masks, boxes, numbers):
-            events.append(list(numbers))
-            return super().refine(frames, masks, boxes, numbers)
-
-        def reset(self):
-            events.append("reset")
-            return super().reset()
-
-    monkeypatch.setattr(vsr_pipeline, "SubtitleTemplates", ObservedTemplates, raising=False)
+    write_frames(source, [clear] * 3 + [bright] * 3)
     pipe = Pipeline.__new__(Pipeline)
     pipe.inpaint_mode = "propainter"
-    pipe.detect = lambda *args: [(20, 30, 10, 50)]
-    pipe.inpainter = SimpleNamespace(inpaint=lambda frames, masks: [f.copy() for f in frames])
-    pipe.process_video(source, output, locate_stickers=False)
-    assert events[-3:] == [[0, 1, 2], "reset", [3, 4, 5]]
+    pipe.detect = lambda *args: [box]
+    complete = pipe.propainter_boxes_to_mask([box], clear, region)
+    damaged = pipe.propainter_boxes_to_mask([box], bright, region)
+    raw = pipe.white_glyph(bright, region)
+    filtered = pipe.filter_glyph_by_height(raw)
+    hidden_white = (complete > 0) & (raw > 0) & (filtered == 0)
+    assert np.count_nonzero(hidden_white[:, 120:260]) > 200
+    assert not np.any(damaged[hidden_white])
+    _, detection = pipe._detect_timeline(source, region)
+    assert detection["scene_change_frames"] == [3]
+    calls = []
+
+    def inpaint(frames, masks):
+        calls.append(([frame.copy() for frame in frames], [mask.copy() for mask in masks]))
+        return [np.full_like(frame, 80) for frame in frames]
+
+    pipe.inpainter = SimpleNamespace(inpaint=inpaint)
+    stats = pipe.process_video(source, output, locate_stickers=False, white_glyph_check=False)
+    assert [len(frames) for frames, _ in calls] == [3, 3]
+    for (frames, _), expected in zip(calls, [clear, bright]):
+        assert all(np.array_equal(frame, expected) for frame in frames)
+    for mask in calls[1][1]:
+        assert np.all(mask[hidden_white] > 0)
+        np.testing.assert_array_equal(mask, np.maximum(complete, damaged))
+    assert stats["frames"] == 6 and stats["template_recovered"] == 3
+
+
+@pytest.mark.parametrize("source_text,target_text", [("Sturdy steel", "Sturdy wheel"),
+                                                     ("Sturdy tile", "Sturdy file"),
+                                                     ("Sturdy file", "Sturdy tile"),
+                                                     ("Sturdy steel", "")])
+def test_scene_cut_cannot_copy_changed_or_disappeared_subtitles(tmp_path, source_text, target_text):
+    clear, box = text_frame(source_text, thin_shadow=True)
+    changed, _ = text_frame(target_text, light_background=True, thin_shadow=True)
+    region = (0, 128, 0, 360)
+    source, output = tmp_path / "source.mp4", tmp_path / "result.mp4"
+    write_frames(source, [clear] * 3 + [changed] * 3)
+    pipe = Pipeline.__new__(Pipeline)
+    pipe.inpaint_mode = "propainter"
+    pipe.detect = lambda *args: [box]
+    damaged = pipe.propainter_boxes_to_mask([box], changed, region)
+    _, detection = pipe._detect_timeline(source, region)
+    assert detection["scene_change_frames"] == [3]
+    calls = []
+
+    def inpaint(frames, masks):
+        calls.append([mask.copy() for mask in masks])
+        return [np.full_like(frame, 80) for frame in frames]
+
+    pipe.inpainter = SimpleNamespace(inpaint=inpaint)
+    stats = pipe.process_video(source, output, locate_stickers=False, white_glyph_check=False)
+    assert stats["frames"] == 6 and stats["template_recovered"] == 0
+    if target_text:
+        assert [len(masks) for masks in calls] == [3, 3]
+        for mask in calls[1]:
+            np.testing.assert_array_equal(mask, damaged)
+    else:
+        assert not damaged.any()
+        assert [len(masks) for masks in calls] == [3]
+        assert stats["inpainted"] == 3

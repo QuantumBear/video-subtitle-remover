@@ -192,6 +192,51 @@ def test_repeated_overlapping_windows_keep_a_bounded_patch_cache(templates_class
     np.testing.assert_array_equal(result, complete)
 
 
+def multiline_subtitle(short_text="Sturdy"):
+    rows = [subtitle(text) for text in [short_text, "Sturdy steel", "Smoothest stone"]]
+    frame = np.concatenate([image for image, _, _ in rows])
+    complete = np.concatenate([mask for _, mask, _ in rows])
+    boxes = [(y1 + 128 * row, y2 + 128 * row, x1, x2)
+             for row, (_, _, (y1, y2, x1, x2)) in enumerate(rows)]
+    return frame, complete, boxes
+
+
+@pytest.fixture(params=[((0, 60),), ((0, 40), (20, 60))],
+                ids=["full-window", "overlapping-windows"])
+def crowded_multiline_cache(templates_class, request):
+    frame, complete, boxes = multiline_subtitle()
+    damaged = complete.copy()
+    damaged[:128, 110:225] = 0
+    assert np.count_nonzero(damaged[:128]) < np.count_nonzero(complete[:128])
+    templates = templates_class((0, 384, 0, 360))
+    for start, stop in request.param:
+        numbers = list(range(start, stop))
+        observations = [complete if number == 0 else damaged for number in numbers]
+        jittered_boxes = []
+        for number in numbers:
+            # Each coordinate moves at most one pixel without exactly repeating a box.
+            offsets = [(number // 3 ** axis) % 3 - 1 for axis in range(4)]
+            jittered_boxes.append([tuple(value + offset for value, offset in zip(box, offsets))
+                                   for box in boxes])
+        result, _ = templates.refine([frame] * len(numbers), observations, jittered_boxes, numbers)
+        assert templates.stats["cached_templates"] == 64
+    return templates, complete, result[-1]
+
+
+def test_long_line_observations_cannot_evict_short_line_reference(crowded_multiline_cache):
+    _, complete, result = crowded_multiline_cache
+    np.testing.assert_array_equal(result, complete)
+
+
+def test_retained_short_line_reference_cannot_restore_changed_text(crowded_multiline_cache):
+    templates, _, _ = crowded_multiline_cache
+    frame, complete, boxes = multiline_subtitle("Steady")
+    damaged = complete.copy()
+    damaged[:128, 110:225] = 0
+    result, _ = refine_one(templates, frame, damaged, boxes, 60)
+    np.testing.assert_array_equal(result, damaged)
+
+
 def test_overlapping_window_keeps_reference_valid_for_its_earliest_frames(templates_class):
     frame, complete, box = subtitle()
     damaged = partial(complete)
