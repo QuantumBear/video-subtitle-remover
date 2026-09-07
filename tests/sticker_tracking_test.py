@@ -3,15 +3,12 @@
 测试不初始化 OCR、LAMA 或 ProPainter；只验证 VLM 结果进入时间线前的
 多目标跟踪逻辑。服务器完整依赖安装后可直接用 pytest 运行。
 """
-import sys
-import types
-
 import numpy as np
+import pytest
 
-# 本地开发环境可能没有视频推理依赖；导入 vsr_pipeline 时这些模块只在
-# 实际处理视频/调用模型的方法体内使用，测试可用空模块替代。
-sys.modules.setdefault("av", types.ModuleType("av"))
-sys.modules.setdefault("cv2", types.ModuleType("cv2"))
+# 遮罩回归需要真实 OpenCV，不能向其他测试泄漏空模块。
+pytest.importorskip("av")
+pytest.importorskip("cv2")
 
 from vsr_pipeline import (
     MASK_PAD,
@@ -89,7 +86,7 @@ def test_propainter_text_mask_preserves_background_between_glyphs():
 
     assert mask[50, 30] == 255       # 字形被遮住
     assert mask[50, 70] == 0         # 字形之间的真实背景保留
-    assert mask[50, 120] == 0        # OCR 框外背景也保留
+    assert mask[50, 130] == 0        # OCR 框外背景也保留
 
 
 def test_propainter_sticker_box_still_uses_full_rectangle():

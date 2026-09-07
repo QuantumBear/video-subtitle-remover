@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """VSR 生产流水线:实测验证的去字幕最佳流程,作为对外服务的处理核心。
 
-流程(每帧闭环,不需要独立验收阶段):
-  1. PaddleOCR(mobile)在字幕区域内检测文字框
-  2. 无框帧直接写出;有框帧:框外扩 10px 生成 mask → LAMA 修复
-  3. 白字自检:原帧白字形位置上若修复帧仍呈白色 → 说明有漏擦
-     → 用原帧字形膨胀生成贴合 mask → LAMA 二次补擦(当帧内完成)
-  4. 音频从源视频 copy 合回
+流程:
+  1. PaddleOCR 按检测反馈调整采样间隔，物化独立的逐帧字幕轨迹
+  2. 可选 DashScope 贴纸定位，经时间/空间关联后生成独立遮罩
+  3. LAMA 单帧或 ProPainter 分段修复，受限白字残留复核
+  4. 合回源音频；最终画质仍需关键帧验收
 
 与 backend/main.py 的区别:
   - 无 GUI/进度条/临时文件包袱,模型常驻(worker 进程 import 一次可处理多条视频)
@@ -14,21 +13,34 @@
   - 差分验收的判据固化在代码里(白字判据经正反例校准,详见 docs/02-use/04)
 
 用法:
-  CLI:  python vsr_pipeline.py -i in.mp4 -o out.mp4 -c 450 1010 0 720
-  库:   from vsr_pipeline import process_video
+  CLI:  python vsr_pipeline.py -i in.mp4 -o out.mp4 --inpaint-mode propainter
+  库:   Pipeline(...).process_video(input_path, output_path)
 """
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import time
+from collections import deque
+from fractions import Fraction
 
 import av
 import cv2
 import numpy as np
 import torch
+
+from backend.subtitle_tracking import (
+    associate_sticker_hits,
+    group_sticker_boxes as _group_sticker_boxes,
+    materialize_tracks,
+    merge_residual_runs,
+    plan_vlm_frames,
+    sticker_match_score as _sticker_match_score,
+    track_text_boxes,
+)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 默认禁止 PaddleOCR 启动时联网检查模型源(服务器离线场景/加快启动);
@@ -39,12 +51,10 @@ os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
 # 容器 GPU 环境会报 "operation not supported"(实测),用老式碎片控制
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:128')
 
-# ---------- 可调参数(均有实测依据,见 docs/02-use/04) ----------
+# ---------- 可调参数(验证记录见 docs/02-use/04) ----------
 DEFAULT_DET_MODEL_DIR = os.path.join(BASE_DIR, 'backend', 'models', 'V5', 'ch_det_fast')
 DEFAULT_DET_MODEL_NAME = 'PP-OCRv5_mobile_det'
 LAMA_PT = os.path.join(BASE_DIR, 'backend', 'models', 'big-lama', 'big-lama.pt')
-
-from fractions import Fraction
 
 MASK_PAD = 4             # OCR 框外扩像素:mask 比字形宽的环带是 ProPainter
                          # 传播距离最远、质量最差的区域(白雾残影所在),
@@ -58,19 +68,24 @@ MASK_EXPAND_DOWN = 0     # mask 向下扩展:实测下扩 55px 会把字幕正�
 GLYPH_DILATE = 21        # 字形 mask 膨胀核(约 10px,盖住笔画边缘)
 GLYPH_NEIGHBORHOOD = 60  # 字形自检的邻域:仅限 OCR 框向外扩该像素的范围
                          # (漏擦的字总是紧挨着被检出的字行;远处白色物体不进 mask,防误伤)
-PROP_TEXT_MIN_ASPECT = 3.0
-                         # ProPainter 精确字形遮罩只作用于明显的横向字幕框;
-                         # 方形/近方形框通常是 VLM 贴纸,必须保留整框擦除
 PROP_TEXT_MIN_GLYPH_PIXELS = 80
                          # 框内至少有这么多白色字形像素才启用精确遮罩;
                          # 抗压缩噪声或亮色物体不会触发
 WHITE_ORIG_TH = 228      # 原帧白字判据:三通道下限(经 f165 残留/f180 干净校准)
 WHITE_FIXED_TH = 210     # 修复帧"仍白"判据:放宽以抗重编码灰度漂移
+WHITE_EDGE_TH = 180
+WHITE_EDGE_RADIUS = 3
+WHITE_EDGE_DILATE = 3
 WHITE_RB_MAX = 25        # |R-B| 上限:排除蓝裤腿等彩色亮物
 MIN_BOX_ASPECT = 1.8     # 检出框最小宽高比(w/h):字幕行是水平长条(实测≥2.7),
                          # 近方形框是动物/物体误检(实测狗被检出 1.1:1 的框),
-                         # 这类框交给修复模型会造成大面积雾块;emoji 框靠下扩覆盖
+                         # 贴纸通过独立 VLM 定位，不依赖 OCR 框下扩
 RESID_MIN_PX = 50        # 帧内残留像素超过该值才触发补擦(抗压缩噪声)
+OCR_STRIDE = 5          # 稳定时的最大间隔；有变化立即回到逐帧检测
+OCR_REFINE_RADIUS = 15  # 变化时向前补查的最大帧数
+OCR_STABLE_HITS = 2     # 连续稳定两次后增大间隔
+SCENE_THUMB_SIZE = 32
+SCENE_MEAN_DIFF = 18.0
 # ProPainter 在 24GB 卡上的显存安全窗口。段输出与模型内部子窗口保持
 # 一致，避免服务器上还存在 CUDA/驱动非 PyTorch 占用时，80 帧窗口 OOM。
 PROPAINTER_SEG_LEN = 40
@@ -158,91 +173,30 @@ def _dashscope_key():
         return None
 
 
-def _sticker_match_score(b1, b2):
-    """返回两个采样框是否属于同一个贴纸的匹配分数。
-
-    字幕框的连续性判断允许 ``pad=60``，但相邻 emoji 的间距往往小于
-    60px；直接复用该判断会把一排猫/狗 emoji 合并成一个轨迹，最后只
-    保留 VLM 返回的第一个框。这里用交叠比例和中心距离做更严格的
-    同目标匹配，保证相邻贴纸各自跟踪。
-    """
-    y1a, y2a, x1a, x2a = b1
-    y1b, y2b, x1b, x2b = b2
-    wa, ha = max(1, x2a - x1a), max(1, y2a - y1a)
-    wb, hb = max(1, x2b - x1b), max(1, y2b - y1b)
-    cxa, cya = (x1a + x2a) / 2, (y1a + y2a) / 2
-    cxb, cyb = (x1b + x2b) / 2, (y1b + y2b) / 2
-    size_ok = (0.4 <= wa / wb <= 2.5 and 0.4 <= ha / hb <= 2.5)
-    center_ok = (abs(cxa - cxb) <= 0.35 * (wa + wb)
-                 and abs(cya - cyb) <= 0.35 * (ha + hb))
-    if not size_ok or not center_ok:
-        return -1.0
-    area_a, area_b = wa * ha, wb * hb
-    inter_w = max(0, min(x2a, x2b) - max(x1a, x1b))
-    inter_h = max(0, min(y2a, y2b) - max(y1a, y1b))
-    overlap = (inter_w * inter_h) / min(area_a, area_b)
-    if overlap >= 0.15:
-        return overlap
-
-    # VLM 在不同帧的框边界会有轻微抖动；没有像素交叠时仍允许同一
-    # 目标匹配，但中心距离必须明显小于两个框的尺寸之和。相邻贴纸
-    # 的中心距离通常接近一个框宽度，因此不会被合并。
-    return 0.01
-
-
-def _group_sticker_boxes(hits, min_samples=2):
-    """将 VLM 在采样帧中的贴纸框按目标分组。
-
-    ``hits`` 是 ``{帧号: [框...]}``。同一采样帧的两个框绝不能互相
-    匹配；否则相邻 emoji 会因空间距离很近而被错误合并。返回稳定轨迹
-    ``[(代表框, [命中帧号...]), ...]``。
-    """
-    # [代表框, 命中帧列表, 最近命中帧号]
-    tracks = []
-    for frame_no, boxes in sorted(hits.items()):
-        used = set()
-        for box in boxes:
-            best_idx = None
-            best_score = -1.0
-            for idx, (representative, frames, last_frame) in enumerate(tracks):
-                # 同一采样帧的框必须保持独立；一帧内的重复框由 VLM
-                # 自己去重，不能在这里借“时间一致性”吞掉相邻目标。
-                if idx in used or last_frame >= frame_no:
-                    continue
-                score = _sticker_match_score(box, representative)
-                if score > best_score:
-                    best_idx, best_score = idx, score
-            if best_idx is None or best_score < 0:
-                tracks.append([box, [frame_no], frame_no])
-                used.add(len(tracks) - 1)
-            else:
-                tracks[best_idx][1].append(frame_no)
-                tracks[best_idx][2] = frame_no
-                used.add(best_idx)
-    return [(box, frames) for box, frames, _ in tracks
-            if len(set(frames)) >= min_samples]
-
-
-def _sticker_box_from_vlm(bbox_2d, region):
+def _sticker_box_from_vlm(bbox_2d, region, pad=STICKER_MASK_PAD):
     """将 VLM 的 0–1000 坐标框换算为全帧框，并使用贴纸专用外扩。"""
-    x1, y1, x2, y2 = bbox_2d
+    x1, y1, x2, y2 = (float(value) for value in bbox_2d)
+    if not all(math.isfinite(value) for value in (x1, y1, x2, y2)) or x1 >= x2 or y1 >= y2:
+        raise ValueError('invalid sticker coordinates')
     ymin, ymax, xmin, xmax = region
     width, height = xmax - xmin, ymax - ymin
-    return (max(0, int(y1 * height / 1000) + ymin - STICKER_MASK_PAD),
-            min(ymax, int(y2 * height / 1000) + ymin + STICKER_MASK_PAD),
-            max(0, int(x1 * width / 1000) + xmin - STICKER_MASK_PAD),
-            min(xmax, int(x2 * width / 1000) + xmin + STICKER_MASK_PAD))
+    return (max(ymin, int(y1 * height / 1000) + ymin - pad),
+            min(ymax, int(y2 * height / 1000) + ymin + pad),
+            max(xmin, int(x1 * width / 1000) + xmin - pad),
+            min(xmax, int(x2 * width / 1000) + xmin + pad))
 
 
 # ---------- VLM 贴纸/emoji 定位(可选,需 DashScope API Key) ----------
-def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20, model='qwen3.7-plus'):
-    """采样帧调 VLM grounding 定位 emoji/贴纸框,按出现时间段扩展到逐帧。
+def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20,
+                        model='qwen3.7-plus', max_calls=32, timeout=120):
+    """采样帧调 VLM 定位贴纸原始框，关联和外扩由轨迹层完成。
 
     emoji 是图像贴纸不是文字,OCR 按设计不检测;VLM 语义定位是通用方案
     (盲下扩会误擦字幕正下方的鞋子等画面,已实测)。
     返回 {帧号: [(ymin,ymax,xmin,xmax), ...]}(0-1000 归一化坐标已换算)。
     """
     import base64
+    from io import BytesIO
     import requests
     key = _dashscope_key()
     if not key:
@@ -257,80 +211,50 @@ def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20, mode
               '{"label": "内容", "bbox_2d": [x1, y1, x2, y2]}(0-1000 归一化坐标)。'
               '没有则输出 []。只输出 JSON。')
 
-    c = av.open(video_path)
-    vstream = next(s for s in c.streams if s.type == 'video')
-    total = vstream.duration and int(float(vstream.duration * vstream.time_base * float(vstream.average_rate))) or 0
-    # 采样帧:外部指定(文字区间内保证覆盖)或均匀采样
-    if sample_frames:
-        sample_set = set(sample_frames)
-    else:
-        sample_set = set(range(0, total, max(1, total // samples)))
-    step = max(1, total // samples) if total else 1
-    hits = {}
-    n = 0
-    import json as _json
-    for frame in c.decode(video=0):
-        if n in sample_set:
-            img = frame.to_image().crop((xmin, ymin, xmax, ymax))
-            buf = os.path.join('/tmp', f'_sticker_{n}.png')
-            img.save(buf)
-            b64 = base64.b64encode(open(buf, 'rb').read()).decode()
-            os.remove(buf)
-            try:
-                resp = requests.post(
-                    f'{base}/chat/completions',
-                    headers={'Authorization': f'Bearer {key}'},
-                    json={'model': model, 'messages': [{'role': 'user', 'content': [
-                        {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{b64}'}},
-                        {'type': 'text', 'text': prompt}]}]},
-                    timeout=120)
-                content = resp.json()['choices'][0]['message']['content'].strip()
-                if content.startswith('```'):
-                    content = content.split('```')[1]
-                    if content.startswith('json'):
-                        content = content[4:]
-                for b in _json.loads(content):
-                    boxes = _sticker_box_from_vlm(b['bbox_2d'], region)
-                    if boxes[1] > boxes[0] and boxes[3] > boxes[2]:
-                        hits[n] = hits.get(n, []) + [boxes]
-                        print(f'[sticker-vlm] f{n}: {b.get("label","")[:20]} {boxes}')
-            except Exception as e:
-                print(f'[sticker-vlm] f{n} 定位失败: {e}')
-        n += 1
-    c.close()
-    # 多采样一致性:贴纸必须在 ≥2 个采样帧出现(位置重叠)才保留——
-    # 单帧命中的多是 VLM 对真实物体(鞋/动物)的误认,扩展擦除会误伤。
-    # 这里不能用字幕的 pad=60 重叠判断:相邻 emoji 会被合成一个框。
-    stable = _group_sticker_boxes(hits)
-    total_hits = sum(len(boxes) for boxes in hits.values())
-    stable_hits = sum(len(set(ns)) for _, ns in stable)
-    dropped = total_hits - stable_hits
-    if dropped:
-        print(f'[sticker-vlm] 多采样一致性过滤: 丢弃 {dropped} 个单帧误检')
-    # 时间扩展:同一贴纸的命中采样帧构成连续段,覆盖范围扩展到相邻采样帧的
-    # 中点(不跨过未命中的采样帧——那意味着贴纸已消失/场景已变)
-    all_samples = sorted(sample_set)
-    out = {}
-    for b, ns in stable:
-        ns_sorted = sorted(set(ns))
-        # 命中段的边界:扩展到相邻采样帧的中点
-        lo_s = ns_sorted[0]
-        hi_s = ns_sorted[-1]
-        lo_ext = lo_s
-        for s_i in all_samples:
-            if s_i < lo_s:
-                lo_ext = (s_i + lo_s) // 2   # 前一个未命中采样与命中帧的中点
-                break
-        hi_ext = hi_s
-        for s_i in reversed(all_samples):
-            if s_i > hi_s:
-                hi_ext = (hi_s + s_i) // 2
-                break
-        for i in range(max(0, lo_ext), min(total, hi_ext + 1)):
-            out.setdefault(i, [])
-            if b not in out[i]:
-                out[i].append(b)
-    return out
+    max_calls = max(0, int(max_calls))
+    hits, calls = {}, 0
+    with av.open(video_path) as src:
+        stream = src.streams.video[0]
+        total = stream.frames or (int(stream.duration * stream.time_base * stream.average_rate)
+                                  if stream.duration else 0)
+        if sample_frames is None:
+            sample_frames = range(0, total, max(1, total // max(1, samples)))
+        # 先按优先级截断，再按解码顺序请求；失败也占用预算。
+        sample_set = set(list(dict.fromkeys(i for i in sample_frames if i >= 0))[:max_calls])
+        if sample_set:
+            for n, frame in enumerate(src.decode(video=0)):
+                if calls >= max_calls or n > max(sample_set):
+                    break
+                if n not in sample_set:
+                    continue
+                calls += 1
+                try:
+                    img = frame.to_image().crop((xmin, ymin, xmax, ymax))
+                    buf = BytesIO()
+                    img.save(buf, format='PNG')
+                    b64 = base64.b64encode(buf.getvalue()).decode()
+                    resp = requests.post(
+                        f'{base}/chat/completions',
+                        headers={'Authorization': f'Bearer {key}'},
+                        json={'model': model, 'messages': [{'role': 'user', 'content': [
+                            {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{b64}'}},
+                            {'type': 'text', 'text': prompt}]}]}, timeout=timeout)
+                    resp.raise_for_status()
+                    content = resp.json()['choices'][0]['message']['content'].strip()
+                    if content.startswith('```'):
+                        content = content.split('```')[1]
+                        if content.startswith('json'):
+                            content = content[4:]
+                    parsed = json.loads(content)
+                    if not isinstance(parsed, list):
+                        raise ValueError('expected sticker list')
+                    boxes = [_sticker_box_from_vlm(item['bbox_2d'], region, pad=0) for item in parsed]
+                    hits[n] = list(dict.fromkeys(box for box in boxes
+                                                if box[0] < box[1] and box[2] < box[3]))
+                except Exception as exc:
+                    print(f'[sticker-vlm] f{n} 定位失败: {type(exc).__name__}')
+    print(f'[sticker-vlm] calls={calls}/{max_calls} hits={sum(map(len, hits.values()))}')
+    return hits
 
 
 # ---------- 模型单例(worker 进程内 import 一次,处理多条视频复用) ----------
@@ -399,9 +323,97 @@ class Pipeline:
                 if bw < MIN_BOX_ASPECT * bh:
                     continue
                 # 坐标平移回全帧,外扩后输出
-                boxes.append((max(0, int(y1) + ymin - MASK_PAD), int(y2) + ymin + MASK_PAD,
-                              max(0, int(x1) + xmin - MASK_PAD), int(x2) + xmin + MASK_PAD))
+                box = (max(ymin, int(y1) + ymin - MASK_PAD),
+                       min(ymax, int(y2) + ymin + MASK_PAD),
+                       max(xmin, int(x1) + xmin - MASK_PAD),
+                       min(xmax, int(x2) + xmin + MASK_PAD))
+                if box[0] < box[1] and box[2] < box[3]:
+                    boxes.append(box)
         return boxes
+
+    @staticmethod
+    def _detection_stable(previous, current, previous_img, current_img):
+        if len(previous) != len(current):
+            return False
+        unmatched = list(current)
+        for old in previous:
+            match = next((box for box in unmatched
+                          if max(abs(a - b) for a, b in zip(old, box)) <= 4), None)
+            if match is None:
+                return False
+            unmatched.remove(match)
+            y1, y2, x1, x2 = match
+            before = cv2.resize(previous_img[y1:y2, x1:x2], (32, 8))
+            after = cv2.resize(current_img[y1:y2, x1:x2], (32, 8))
+            if np.abs(before.astype(np.float32) - after).mean() > SCENE_MEAN_DIFF:
+                return False
+        return True
+
+    def _detect_timeline(self, input_path, region, ocr_stride=OCR_STRIDE,
+                         ocr_refine_radius=OCR_REFINE_RADIUS, progress=None):
+        """按检测反馈调整间隔；只缓存最近跳过的帧用于变化后的回查。"""
+        stride = max(1, int(ocr_stride))
+        radius = max(1, int(ocr_refine_radius))
+        pending = deque(maxlen=min(stride, radius))
+        sampled, sample_frames, scene_changes = {}, [], []
+        previous_boxes, previous_img, previous_thumb = None, None, None
+        interval, stable_hits, next_frame, refined = 1, 0, 0, 0
+
+        def observe(frame_no, img, scene_change=False):
+            nonlocal previous_boxes, previous_img, interval, stable_hits, next_frame, refined
+            boxes = self.detect(img, region)
+            sample_frames.append(frame_no)
+            changed = (scene_change or previous_boxes is None
+                       or not self._detection_stable(previous_boxes, boxes, previous_img, img))
+            if changed:
+                for skipped_no, skipped_img in pending:
+                    sampled[skipped_no] = self.detect(skipped_img, region)
+                    refined += 1
+                interval, stable_hits = 1, 0
+            else:
+                stable_hits += 1
+                if stable_hits >= OCR_STABLE_HITS:
+                    interval = min(stride, interval * 2)
+                    stable_hits = 0
+            sampled[frame_no] = boxes
+            pending.clear()
+            previous_boxes, previous_img = boxes, img
+            next_frame = frame_no + interval
+
+        total, last_img = 0, None
+        with av.open(input_path) as src:
+            stream = src.streams.video[0]
+            estimate = stream.frames or 0
+            for frame_no, frame in enumerate(src.decode(video=0)):
+                img = frame.to_ndarray(format='rgb24')
+                y1, y2, x1, x2 = region
+                thumb = cv2.resize(img[y1:y2, x1:x2], (SCENE_THUMB_SIZE, SCENE_THUMB_SIZE))
+                cut = (previous_thumb is not None
+                       and np.abs(thumb.astype(np.float32) - previous_thumb).mean() > SCENE_MEAN_DIFF)
+                if cut:
+                    scene_changes.append(frame_no)
+                if frame_no >= next_frame or cut:
+                    observe(frame_no, img, cut)
+                else:
+                    pending.append((frame_no, img))
+                previous_thumb, last_img, total = thumb, img, frame_no + 1
+                if progress and (total % 30 == 0 or total == estimate):
+                    progress(total, estimate, f'检测中 OCR {len(sampled)}')
+        if total and total - 1 not in sampled:
+            # 最后一帧必须检测，但不能把它再作为跳过帧重复回查。
+            pending.pop()
+            observe(total - 1, last_img)
+        max_gap = max(10, 2 * stride)
+        tracks = track_text_boxes(sampled, total, max_gap=max_gap,
+                                  scene_change_frames=scene_changes)
+        timeline = materialize_tracks(tracks, total, max_interpolation_gap=max_gap)
+        accepted = sum(len(track.frames) for track in tracks)
+        return timeline, {
+            'ocr_calls': len(sampled), 'sampled': len(sample_frames), 'refined': refined,
+            'tracks': len(tracks), 'discarded': sum(map(len, sampled.values())) - accepted,
+            'sampled_frames': sample_frames,
+            'scene_change_frames': scene_changes,
+        }
 
     @staticmethod
     def boxes_to_mask(boxes, h, w):
@@ -411,41 +423,57 @@ class Pipeline:
                  max(0, xmin):min(w, xmax)] = 255
         return mask
 
-    def propainter_boxes_to_mask(self, boxes, frame_rgb, region):
+    def propainter_boxes_to_mask(self, boxes, frame_rgb, region, sticker_boxes=()):
         """为 ProPainter 生成精确遮罩,避免把字幕框内背景整体重绘。
 
         OCR 只返回文字行的外接矩形,而不是字形轮廓。矩形中未被文字
         覆盖的楼梯、裤腿等真实像素若一并送入 ProPainter,模型会重新生成
         它们,在 4–5 秒这类字幕压在物体上的场景尤其明显。对明显横向的
-        白色字幕框,改用原帧白色字形作为遮罩;方形/无白字框则保留整框,
-        兼容 VLM 贴纸和有色字幕。
+        白色字幕框,改用原帧白色字形作为遮罩;无白字框保留整框。
+        贴纸类型独立传入，保持矩形遮罩。
         """
         h, w = frame_rgb.shape[:2]
-        glyph = self.filter_glyph_by_height(self.white_glyph(frame_rgb, region))
+        if not boxes and not sticker_boxes:
+            return np.zeros((h, w), dtype='uint8')
+        raw = self.white_glyph(frame_rgb, region)
+        glyph = self.filter_glyph_by_height(raw)
+        loose = self.filter_glyph_by_height(self.white_glyph(frame_rgb, region, WHITE_EDGE_TH))
         mask = np.zeros((h, w), dtype='uint8')
+        ry1, ry2, rx1, rx2 = region
         for ymin, ymax, xmin, xmax in boxes:
-            y1, y2 = max(0, ymin), min(h, ymax)
-            x1, x2 = max(0, xmin), min(w, xmax)
+            y1, y2 = max(0, ry1, ymin), min(h, ry2, ymax)
+            x1, x2 = max(0, rx1, xmin), min(w, rx2, xmax)
             if y2 <= y1 or x2 <= x1:
                 continue
-            bw, bh = x2 - x1, y2 - y1
             local_glyph = glyph[y1:y2, x1:x2]
-            # 长横框 + 足量白字形 = OCR 字幕;其它框按贴纸/彩色字幕处理。
-            if (bw >= PROP_TEXT_MIN_ASPECT * max(1, bh)
-                    and int((local_glyph > 0).sum()) >= PROP_TEXT_MIN_GLYPH_PIXELS):
+            # OCR 已完成文字形态过滤，外扩后的宽高比不能再排除短字幕。
+            if int((local_glyph > 0).sum()) >= PROP_TEXT_MIN_GLYPH_PIXELS:
+                near_core = cv2.dilate(local_glyph, np.ones(
+                    (2 * WHITE_EDGE_RADIUS + 1, 2 * WHITE_EDGE_RADIUS + 1), dtype='uint8'))
+                edge = cv2.bitwise_and(loose[y1:y2, x1:x2], near_core)
+                edge = cv2.dilate(edge, np.ones((WHITE_EDGE_DILATE, WHITE_EDGE_DILATE), dtype='uint8'))
+                text_mask = cv2.bitwise_or(local_glyph, edge)
+                mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], text_mask)
+            elif np.count_nonzero(raw[y1:y2, x1:x2]) >= PROP_TEXT_MIN_GLYPH_PIXELS:
+                # 白色大物体被连通域过滤后不能退回整行矩形擦除。
                 mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], local_glyph)
             else:
+                mask[y1:y2, x1:x2] = 255
+        for ymin, ymax, xmin, xmax in sticker_boxes:
+            y1, y2 = max(0, ry1, ymin), min(h, ry2, ymax)
+            x1, x2 = max(0, rx1, xmin), min(w, rx2, xmax)
+            if y1 < y2 and x1 < x2:
                 mask[y1:y2, x1:x2] = 255
         return mask
 
     @staticmethod
-    def white_glyph(frame, region):
+    def white_glyph(frame, region, threshold=WHITE_ORIG_TH):
         """原帧白字形检测(独立于 OCR,差分验收的同款判据)。"""
         glyph = np.zeros(frame.shape[:2], dtype='uint8')
         ymin, ymax, xmin, xmax = region
         r = frame[ymin:ymax, xmin:xmax].astype(np.int16)
-        white = ((r[:, :, 0] > WHITE_ORIG_TH) & (r[:, :, 1] > WHITE_ORIG_TH)
-                 & (r[:, :, 2] > WHITE_ORIG_TH) & (np.abs(r[:, :, 0] - r[:, :, 2]) < WHITE_RB_MAX))
+        white = ((r[:, :, 0] > threshold) & (r[:, :, 1] > threshold)
+                 & (r[:, :, 2] > threshold) & (np.abs(r[:, :, 0] - r[:, :, 2]) < WHITE_RB_MAX))
         glyph[ymin:ymax, xmin:xmax] = white.astype('uint8') * 255
         return glyph
 
@@ -467,6 +495,58 @@ class Pipeline:
         still = ((f[:, :, 0] > WHITE_FIXED_TH) & (f[:, :, 1] > WHITE_FIXED_TH)
                  & (f[:, :, 2] > WHITE_FIXED_TH) & (np.abs(f[:, :, 0] - f[:, :, 2]) < WHITE_RB_MAX))
         return int(((glyph > 0) & still).sum())
+
+    def _residual_mask(self, fixed_bgr, original_bgr, boxes):
+        h, w = fixed_bgr.shape[:2]
+        original = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2RGB)
+        fixed = cv2.cvtColor(fixed_bgr, cv2.COLOR_BGR2RGB)
+        core = self.filter_glyph_by_height(self.white_glyph(original, (0, h, 0, w)))
+        original_edges = self.white_glyph(original, (0, h, 0, w), WHITE_EDGE_TH)
+        near_core = cv2.dilate(core, np.ones((7, 7), dtype='uint8'))
+        allowed = cv2.bitwise_and(original_edges, near_core)
+        still_white = self.filter_glyph_by_height(self.white_glyph(fixed, (0, h, 0, w), WHITE_EDGE_TH))
+        residual = cv2.bitwise_and(allowed, still_white)
+        return cv2.bitwise_and(residual, self.boxes_to_mask(boxes, h, w))
+
+    def _repair_propainter_segment(self, frames_bgr, masks, boxes, white_glyph_check=True):
+        if len(frames_bgr) == 1:
+            # RAFT 需要帧对；复制末帧只补上下文，不增加输出帧数。
+            result, repairs = self._repair_propainter_segment(
+                frames_bgr * 2, masks * 2, boxes * 2, white_glyph_check)
+            return result[:1], repairs
+        raw = self.inpainter.inpaint(frames_bgr, masks)
+        # 模型内部膨胀仅用于推理，输出严格限制在调用方的精确遮罩内。
+        first = [np.where(mask[:, :, None] > 0, fixed, original)
+                 for fixed, original, mask in zip(raw, frames_bgr, masks)]
+        del raw
+        if not white_glyph_check:
+            return first, 0
+        try:
+            residual = [self._residual_mask(fixed, original, text_boxes)
+                        for fixed, original, text_boxes in zip(first, frames_bgr, boxes)]
+            runs = merge_residual_runs(
+                [i for i, mask in enumerate(residual) if np.count_nonzero(mask) >= RESID_MIN_PX],
+                total=len(first), context=5, max_runs=1)
+            repairs = 0
+            for lo, hi in runs:
+                local_masks = [cv2.bitwise_and(
+                    cv2.dilate(residual[i], np.ones((5, 5), dtype='uint8')),
+                    self.boxes_to_mask(boxes[i], *residual[i].shape))
+                    for i in range(lo, hi + 1)]
+                # 二次修复以首轮结果为输入，避免把已擦掉的文字重新传播回来。
+                second = self.inpainter.inpaint([f.copy() for f in first[lo:hi + 1]], local_masks)
+                if len(second) != hi - lo + 1:
+                    raise ValueError('unexpected repair frame count')
+                repaired_frames = [np.where(mask[:, :, None] > 0, repaired, first[i])
+                                   for i, (mask, repaired) in enumerate(zip(local_masks, second), start=lo)]
+                first[lo:hi + 1] = repaired_frames
+                repairs += 1
+            return first, repairs
+        except Exception as exc:
+            print(f'[propainter] 局部残留复修失败，保留首轮结果: {type(exc).__name__}')
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return first, 0
 
     def auto_region(self, input_path, samples=24):
         """自动探测字幕区域:均匀采样帧做全屏 OCR,取检出框并集外扩。
@@ -608,90 +688,74 @@ class Pipeline:
         return expanded
 
     def process_video(self, input_path, output_path, region=None,
-                      white_glyph_check=True, progress=None, locate_stickers=True):
-        """处理单条视频(两遍:先全片检测+时间线区间化,再逐帧修复)。
+                      white_glyph_check=True, progress=None, locate_stickers=True,
+                      ocr_stride=OCR_STRIDE, ocr_refine_radius=OCR_REFINE_RADIUS,
+                      vlm_max_calls=32):
+        """处理单条视频：反馈式 OCR 和轨迹检测，然后按帧或分段修复。
 
-        :param region: (ymin, ymax, xmin, xmax) 字幕区域;None = 自动探测
-                       (采样帧 OCR 定位字幕活动带,失败回退全屏)
+        :param region: (ymin, ymax, xmin, xmax) 字幕区域;None = 全屏检测
+        :param ocr_stride: 稳定检测时逐步增大的帧间隔上限，默认 5
         :param white_glyph_check: 白字自检开关(白字幕场景必开;彩色字幕场景关闭,
                                   避免把画面中的白色物体误当残留)
         :param progress: 回调 fn(done_frames, total_frames, stage)
         """
-        if region is None:
-            region = self.auto_region(input_path)
-        src = av.open(input_path)
-        vstream = next(s for s in src.streams if s.type == 'video')
-        fps = float(vstream.average_rate)
-        w, h = vstream.codec_context.width, vstream.codec_context.height
-        total = vstream.duration and int(float(vstream.duration * vstream.time_base * fps)) or 0
-        if region is None:
-            region = (0, h, 0, w)
-
-        global _FRAME_TB
-        _FRAME_TB = Fraction(1, int(round(fps)))
-        tmp_out = output_path + '.tmp.mp4'
-        dst = av.open(tmp_out, 'w')
-        ov = dst.add_stream('libx264', rate=int(round(fps)))
-        ov.width = w; ov.height = h; ov.pix_fmt = 'yuv420p'
-        # bf=0 禁用 B 帧:B 帧延迟队列导致 encode() flush 时吐出无效 packet
-        # (本机 mux EINVAL 崩溃、服务器上被静默丢帧,输出少 2~4 帧)
-        ov.options = {'crf': '18', 'bf': '0'}
-
+        input_path, output_path = os.fspath(input_path), os.fspath(output_path)
+        mode = 'full-frame' if region is None else 'roi'
+        with av.open(input_path) as metadata:
+            vstream = metadata.streams.video[0]
+            rate = vstream.average_rate or Fraction(30, 1)
+            w, h = vstream.codec_context.width, vstream.codec_context.height
+        fps = float(rate)
+        region = tuple(region) if region is not None else (0, h, 0, w)
+        ry1, ry2, rx1, rx2 = region
+        if not (0 <= ry1 < ry2 <= h and 0 <= rx1 < rx2 <= w):
+            raise ValueError(f'字幕区域超出视频尺寸 {w}x{h}: {region}')
+        ocr_stride, ocr_refine_radius = max(1, int(ocr_stride)), max(1, int(ocr_refine_radius))
+        vlm_max_calls = max(1, int(vlm_max_calls))
         t0 = time.time()
-        # 第一遍:全片逐帧 OCR 检测(只记录框,不修复)
-        print('[pass1] 全片字幕检测...')
-        all_boxes = []
-        for frame in src.decode(video=0):
-            all_boxes.append(self.detect(np.asarray(frame.to_image()), region))
-            if progress and (len(all_boxes) % 30 == 0 or len(all_boxes) == total):
-                progress(len(all_boxes), total, '检测中')
-        src.close()
-        # 贴纸/emoji 定位(VLM,可选):并入对应帧的检出框,
-        # 与文字框一起走时间线(最近邻传播覆盖贴纸的持续帧段)
+        print(f'[detect] mode={mode} roi={region} stride={ocr_stride} adaptive=feedback')
+        all_boxes, detection = self._detect_timeline(
+            input_path, region, ocr_stride, ocr_refine_radius, progress)
+        total = len(all_boxes)
+        print(f'[detect] sampled={detection["sampled"]} refined={detection["refined"]} '
+              f'ocr_calls={detection["ocr_calls"]} tracks={detection["tracks"]} '
+              f'discarded={detection["discarded"]}')
+        sticker_boxes = {}
         if locate_stickers:
-            # 贴纸伴随文字出现:在每个文字检出区间内保证 ≥2 个采样帧,
-            # 避免全片均匀采样的间隙漏掉 emoji(实测"偶尔出现"的根源)
-            hits_idx = sorted(i for i, b in enumerate(all_boxes) if b)
-            ranges = []
-            if hits_idx:
-                lo = hi = hits_idx[0]
-                for i in hits_idx[1:]:
-                    if i - hi <= 10:
-                        hi = i
-                    else:
-                        ranges.append((lo, hi)); lo = hi = i
-                ranges.append((lo, hi))
-            sample_frames = set()
-            for lo, hi in ranges:
-                step = max(1, min(40, hi - lo))   # 区间内每 40 帧一帧(加密覆盖)
-                sample_frames.update(range(lo, hi + 1, step))
-                sample_frames.add(hi)
-            sticker_boxes = locate_stickers_vlm(input_path, region, sample_frames=sorted(sample_frames))
-            # 贴纸是字幕的一部分:只保留在文字检出帧(±3 帧邻域)内的贴纸框,
-            # 避免时间扩展越出字幕区间误擦无字幕画面
-            text_hits = {i for i, b in enumerate(all_boxes) if b}
-            for i, boxes in sticker_boxes.items():
-                if i >= len(all_boxes):
-                    continue
-                near_text = any(j in text_hits for j in range(max(0, i - 3), min(len(all_boxes), i + 4)))
-                if near_text:
-                    all_boxes[i] = all_boxes[i] + [b for b in boxes if b not in all_boxes[i]]
-
-        # 时间线区间化:无检出帧继承最近检出帧的框(防字幕闪现,详见方法注释)
-        all_boxes = self.expand_timeline(all_boxes)
+            try:
+                samples = plan_vlm_frames(total, all_boxes, vlm_max_calls, max(1, round(fps)),
+                                          scene_change_frames=detection['scene_change_frames'])
+                hits = locate_stickers_vlm(input_path, region, sample_frames=samples,
+                                           max_calls=vlm_max_calls)
+                associated = associate_sticker_hits(hits, all_boxes, total,
+                    max_gap=max(1, round(fps * 2)), scene_change_frames=detection['scene_change_frames'])
+                sticker_boxes = {i: [(max(ry1, y1 - STICKER_MASK_PAD), min(ry2, y2 + STICKER_MASK_PAD),
+                                      max(rx1, x1 - STICKER_MASK_PAD), min(rx2, x2 + STICKER_MASK_PAD))
+                                     for y1, y2, x1, x2 in boxes]
+                                 for i, boxes in associated.items()}
+                print(f'[sticker-vlm] associated_frames={len(sticker_boxes)}')
+            except Exception as exc:
+                print(f'[sticker-vlm] 跳过贴纸层: {type(exc).__name__}')
 
         # 第二遍:修复 + 写出
+        frame_tb = 1 / rate
+        tmp_out = output_path + '.tmp.mp4'
+        dst = av.open(tmp_out, 'w')
+        ov = dst.add_stream('libx264', rate=rate)
+        ov.width = w; ov.height = h; ov.pix_fmt = 'yuv420p'
+        ov.options = {'crf': '18', 'bf': '0'}
         src = av.open(input_path)
-        n_fixed = n_repair = n = 0
+        n_fixed = n_repair = n_checked = n = 0
+        roi_mask = self.boxes_to_mask([region], h, w)
+        scene_changes = set(detection['scene_change_frames'])
 
         if self.inpaint_mode == 'propainter':
             # ---- ProPainter 分支:按连续字幕段批处理(时序模型,不可逐帧) ----
-            self._ensure_propainter()
             SEG_LEN, OVERLAP = PROPAINTER_SEG_LEN, PROPAINTER_OVERLAP
                                         # 每段输出 40 帧,尾部 20 帧重叠给下一段当上下文
                                         # (24G 卡在实际服务器非 PyTorch 显存占用较高时,
                                         #  80 帧窗口仍会 OOM;60 帧输入优先保证稳定运行)
-            seg_frames, seg_masks, seg_pts = [], [], []   # BGR 帧 + 每帧 mask + 帧号
+            seg_frames, seg_masks, seg_pts, seg_boxes = [], [], [], []
 
             def flush_segment(n_out):
                 """处理当前缓冲:送入全部帧(含尾部重叠上下文),只输出前 n_out 帧。
@@ -701,38 +765,50 @@ class Pipeline:
                 逐帧 mask 列表(非并集):保证传播源不被并集污染(并集会让
                 所有帧的移动带都成空洞,无真值可抄→白雾)。
                 """
-                nonlocal seg_frames, seg_masks, seg_pts, n_fixed
+                nonlocal seg_frames, seg_masks, seg_pts, seg_boxes, n_fixed, n_repair, n_checked
                 if not seg_frames or n_out <= 0:
                     return
-                comps = self.inpainter.inpaint(seg_frames, seg_masks)  # BGR 输出,逐帧 mask
+                self._ensure_propainter()
+                comps, repairs = self._repair_propainter_segment(
+                    seg_frames, seg_masks, seg_boxes, white_glyph_check)
+                n_repair += repairs
+                if white_glyph_check:
+                    n_checked += n_out
                 for j in range(n_out):
+                    comp = np.where(roi_mask[:, :, None] > 0, comps[j], seg_frames[j])
                     frame = av.VideoFrame.from_ndarray(
-                        cv2.cvtColor(comps[j], cv2.COLOR_BGR2RGB), format='rgb24')
+                        cv2.cvtColor(comp, cv2.COLOR_BGR2RGB), format='rgb24')
                     frame.pts = seg_pts[j]
-                    frame.time_base = _FRAME_TB
+                    frame.time_base = frame_tb
                     for pkt in ov.encode(frame):
                         dst.mux(pkt)
                 n_fixed += n_out
                 seg_frames = seg_frames[n_out:]
                 seg_masks = seg_masks[n_out:]
                 seg_pts = seg_pts[n_out:]
+                seg_boxes = seg_boxes[n_out:]
 
             for frame in src.decode(video=0):
                 n += 1
+                if n - 1 in scene_changes:
+                    flush_segment(len(seg_frames))
                 img = np.asarray(frame.to_image())  # RGB
                 boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
-                if boxes:
+                stickers = sticker_boxes.get(n - 1, [])
+                mask = self.propainter_boxes_to_mask(boxes, img, region, sticker_boxes=stickers)
+                if mask.any():
                     # 文字框只遮白色字形,保留字间的楼梯/裤腿等真实像素;
                     # VLM 贴纸和有色字幕仍由精确矩形覆盖。
-                    seg_masks.append(self.propainter_boxes_to_mask(boxes, img, region))
+                    seg_masks.append(mask)
                     seg_frames.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
                     seg_pts.append(n - 1)
+                    seg_boxes.append(boxes)
                     if len(seg_frames) >= SEG_LEN + OVERLAP:
                         flush_segment(SEG_LEN)
                 else:
                     flush_segment(len(seg_frames))   # 段结束:重叠无意义,全部输出
                     frame.pts = n - 1
-                    frame.time_base = _FRAME_TB
+                    frame.time_base = frame_tb
                     for pkt in ov.encode(frame):
                         dst.mux(pkt)
                 if progress and (n % 30 == 0 or n == total):
@@ -746,7 +822,8 @@ class Pipeline:
             for frame in src.decode(video=0):
                 n += 1
                 img = np.asarray(frame.to_image())  # RGB
-                boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
+                text_boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
+                boxes = text_boxes + sticker_boxes.get(n - 1, [])
                 if boxes:
                     mask = self.boxes_to_mask(boxes, h, w)
                     fixed = self.inpainter.inpaint(img, mask)
@@ -754,7 +831,7 @@ class Pipeline:
                     # 白字自检:仅在 OCR 框邻域内找漏擦字(远离框的白色物体不误伤)
                     if white_glyph_check:
                         hood = np.zeros((h, w), dtype='uint8')
-                        for gy1, gy2, gx1, gx2 in boxes:
+                        for gy1, gy2, gx1, gx2 in text_boxes:
                             hood[max(0, gy1 - GLYPH_NEIGHBORHOOD):min(h, gy2 + GLYPH_NEIGHBORHOOD),
                                  max(0, gx1 - GLYPH_NEIGHBORHOOD):min(w, gx2 + GLYPH_NEIGHBORHOOD)] = 255
                         glyph = self.white_glyph(img, region)
@@ -764,19 +841,21 @@ class Pipeline:
                         if resid > RESID_MIN_PX:
                             kernel = np.ones((GLYPH_DILATE, GLYPH_DILATE), 'uint8')
                             glyph_mask = cv2.dilate(glyph, kernel)
+                            glyph_mask = cv2.bitwise_and(glyph_mask, roi_mask)
                             fixed = self.inpainter.inpaint(fixed, glyph_mask)
                             n_repair += 1
                             print(f'  [补擦] 帧 {n}: 残留 {resid}px 已二次修复')
                     # 帧间防闪:mask 外严格保留原帧像素(模型对 mask 外的输出有逐帧
                     # 随机细微差,整帧替换会造成全画面轻微闪烁)
-                    m3 = cv2.dilate(mask, np.ones((7, 7), 'uint8')).astype(np.float32)[:, :, None] / 255
+                    blend_mask = cv2.bitwise_and(cv2.dilate(mask, np.ones((7, 7), 'uint8')), roi_mask)
+                    m3 = blend_mask.astype(np.float32)[:, :, None] / 255
                     blended = (img.astype(np.float32) * (1 - m3) + fixed.astype(np.float32) * m3)
                     frame = av.VideoFrame.from_ndarray(blended.astype('uint8'), format='rgb24')
                 # 显式 pts:PyAV 对 VideoStream.encode 的自动 pts 分配在长序列上会
                 # 产生乱序包(实测 flush 时 pts 跳回 3 导致 mux EINVAL/服务器丢帧),
                 # 按帧号单调递增是标准做法,时间戳完全可控
                 frame.pts = n - 1
-                frame.time_base = _FRAME_TB
+                frame.time_base = frame_tb
                 for pkt in ov.encode(frame):
                     dst.mux(pkt)
                 if progress and (n % 30 == 0 or n == total):
@@ -785,7 +864,7 @@ class Pipeline:
                 dst.mux(pkt)
             dst.close()
 
-        # 音频从源视频 copy 合回(源无音频时直接改名)
+        # 源音频以 AAC 合回，源无音频时直接改名。
         has_audio = any(s.type == 'audio' for s in src.streams)
         src.close()
         if has_audio:
@@ -793,15 +872,17 @@ class Pipeline:
             subprocess.check_output([
                 FFMPEG, '-y', '-i', tmp_out, '-i', input_path,
                 '-map', '0:v:0', '-map', '1:a:0',
-                '-c:v', 'copy', '-c:a', 'aac', '-shortest',
+                # 音频边界可能略早于视频；-shortest 会截掉已写出的末帧。
+                '-c:v', 'copy', '-c:a', 'aac',
                 '-loglevel', 'error', final])
             os.remove(tmp_out)
             os.replace(final, output_path)
         else:
             os.replace(tmp_out, output_path)
-        print(f'[done] {n} 帧 | 修复 {n_fixed} | 补擦 {n_repair} | '
+        print(f'[done] {n} 帧 | 修复 {n_fixed} | 残留复核 {n_checked} | 补擦 {n_repair} | '
               f'耗时 {time.time() - t0:.0f}s → {output_path}')
         return {'frames': n, 'inpainted': n_fixed, 'repaired': n_repair,
+                'ocr_calls': detection['ocr_calls'], 'tracks': detection['tracks'],
                 'seconds': time.time() - t0}
 
 
@@ -811,7 +892,13 @@ def main():
     ap.add_argument('-i', '--input', required=True)
     ap.add_argument('-o', '--output', required=True)
     ap.add_argument('-c', '--region', nargs=4, type=int, metavar=('YMIN', 'YMAX', 'XMIN', 'XMAX'),
-                    help='字幕区域;不传则全屏(建议总是显式指定)')
+                    help='手动检测区域;不传则全屏自适应检测')
+    ap.add_argument('--ocr-stride', type=int, default=OCR_STRIDE,
+                    help='OCR 稳定后逐步增大的采样间隔上限(帧),默认 5')
+    ap.add_argument('--ocr-refine-radius', type=int, default=OCR_REFINE_RADIUS,
+                    help='检测变化时向前补查的最大帧数,默认 15')
+    ap.add_argument('--vlm-max-calls', type=int, default=32,
+                    help='单视频 DashScope 最大请求次数(含失败),默认 32')
     ap.add_argument('--no-white-glyph-check', action='store_true',
                     help='关闭白字自检(彩色字幕场景)')
     ap.add_argument('--threads', type=int, default=None, help='torch CPU 线程数(多 worker 并发时调小)')
@@ -830,6 +917,8 @@ def main():
         region=tuple(args.region) if args.region else None,
         white_glyph_check=not args.no_white_glyph_check,
         locate_stickers=args.locate_stickers,
+        ocr_stride=args.ocr_stride, ocr_refine_radius=args.ocr_refine_radius,
+        vlm_max_calls=args.vlm_max_calls,
         progress=lambda d, t, s: print(f'  进度 {d}/{t} ({s})'))
     print('统计:', stat)
 
