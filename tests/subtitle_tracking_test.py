@@ -127,6 +127,37 @@ def test_scene_change_frame_belongs_to_new_scene():
     assert [track.frames for track in tracks] == [[5, 10]]
 
 
+def test_confirmed_single_observations_keep_separate_scene_tracks():
+    box = (100, 130, 80, 280)
+    observations = {0: [box], 2: [box], 4: [box]}
+    tracks = track_text_boxes(
+        observations, 5, scene_change_frames=[1, 3],
+        confirmed_observations={(0, box), (2, box)},
+    )
+    assert [track.frames for track in tracks] == [[0], [2]]
+    assert materialize_tracks(tracks, 5) == [[box], [], [box], [], []]
+
+
+def test_confirmation_only_retains_the_exact_observed_frame_and_line():
+    top = (100, 130, 80, 280)
+    bottom = (135, 165, 80, 280)
+    nearby_top = (101, 131, 81, 281)
+    tracks = track_text_boxes(
+        {0: [top, bottom], 1: [top, bottom]}, 2, scene_change_frames=[1],
+        confirmed_observations={(0, top), (1, nearby_top), (2, bottom)},
+    )
+    assert materialize_tracks(tracks, 2) == [[top], []]
+
+
+def test_confirmation_cannot_create_an_unobserved_frame_or_box():
+    box = (100, 130, 80, 280)
+    tracks = track_text_boxes(
+        {0: [], 1: [box], 2: []}, 3,
+        confirmed_observations={(0, box), (2, box)},
+    )
+    assert tracks == []
+
+
 def test_text_tracks_discard_invalid_boxes():
     invalid = [(100, 100, 20, 50), (130, 100, 20, 50), (100, 130, 50, 20)]
     assert track_text_boxes({0: invalid, 5: invalid}, 6) == []

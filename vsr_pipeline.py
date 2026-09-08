@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import time
+from bisect import bisect_right
 from collections import deque
 from fractions import Fraction
 
@@ -359,7 +360,29 @@ class Pipeline:
         pending = deque(maxlen=min(stride, radius))
         sampled, sample_frames, scene_changes = {}, [], []
         previous_boxes, previous_img, previous_thumb = None, None, None
+        previous_observation, confirmed = None, set()
+        templates = SubtitleTemplates(region)
         interval, stable_hits, next_frame, refined = 1, 0, 0, 0
+
+        def record_observation(frame_no, img, boxes):
+            nonlocal previous_observation
+            sampled[frame_no] = boxes
+            if previous_observation is not None:
+                last_no, last_img, last_boxes = previous_observation
+                crosses_scene = (bisect_right(scene_changes, last_no)
+                                 != bisect_right(scene_changes, frame_no))
+                if (0 < frame_no - last_no <= stride and crosses_scene
+                        and last_boxes and boxes):
+                    pairs = templates.match_observations(
+                        cv2.cvtColor(last_img, cv2.COLOR_RGB2BGR),
+                        self.propainter_boxes_to_mask(last_boxes, last_img, region), last_boxes,
+                        cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
+                        self.propainter_boxes_to_mask(boxes, img, region), boxes)
+                    for previous_index, current_index in pairs:
+                        confirmed.add((last_no, tuple(last_boxes[previous_index])))
+                        confirmed.add((frame_no, tuple(boxes[current_index])))
+            # Empty and changed observations also replace the previous evidence.
+            previous_observation = (frame_no, img, boxes)
 
         def observe(frame_no, img, scene_change=False):
             nonlocal previous_boxes, previous_img, interval, stable_hits, next_frame, refined
@@ -369,7 +392,7 @@ class Pipeline:
                        or not self._detection_stable(previous_boxes, boxes, previous_img, img))
             if changed:
                 for skipped_no, skipped_img in pending:
-                    sampled[skipped_no] = self.detect(skipped_img, region)
+                    record_observation(skipped_no, skipped_img, self.detect(skipped_img, region))
                     refined += 1
                 interval, stable_hits = 1, 0
             else:
@@ -377,7 +400,7 @@ class Pipeline:
                 if stable_hits >= OCR_STABLE_HITS:
                     interval = min(stride, interval * 2)
                     stable_hits = 0
-            sampled[frame_no] = boxes
+            record_observation(frame_no, img, boxes)
             pending.clear()
             previous_boxes, previous_img = boxes, img
             next_frame = frame_no + interval
@@ -407,12 +430,15 @@ class Pipeline:
             observe(total - 1, last_img)
         max_gap = max(10, 2 * stride)
         tracks = track_text_boxes(sampled, total, max_gap=max_gap,
-                                  scene_change_frames=scene_changes)
+                                  scene_change_frames=scene_changes,
+                                  confirmed_observations=confirmed)
         timeline = materialize_tracks(tracks, total, max_interpolation_gap=max_gap)
         accepted = sum(len(track.frames) for track in tracks)
+        detected = sum(map(len, sampled.values()))
         return timeline, {
             'ocr_calls': len(sampled), 'sampled': len(sample_frames), 'refined': refined,
-            'tracks': len(tracks), 'discarded': sum(map(len, sampled.values())) - accepted,
+            'tracks': len(tracks), 'detected': detected, 'accepted': accepted,
+            'discarded': detected - accepted,
             'sampled_frames': sample_frames,
             'scene_change_frames': scene_changes,
         }

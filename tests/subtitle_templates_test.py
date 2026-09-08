@@ -46,6 +46,85 @@ def refine_one(templates, frame, mask, box, number):
     return masks[0], boxes[0]
 
 
+def test_observation_match_verifies_both_original_glyphs_without_changing_cache(templates_class):
+    source, source_mask, source_box = subtitle()
+    target, target_mask, target_box = subtitle(dx=3, dy=-2)
+    target[np.all(target == (62, 81, 105), axis=2)] = (105, 125, 80)
+    templates = templates_class((0, 128, 0, 360))
+    refine_one(templates, source, source_mask, [source_box], 0)
+    cache_stats = templates.stats.copy()
+    originals = [item.copy() for item in (source, source_mask, target, target_mask)]
+
+    pairs = templates.match_observations(source, source_mask, [source_box],
+                                         target, target_mask, [target_box])
+
+    assert pairs == [(0, 0)]
+    assert templates.stats == cache_stats
+    for actual, original in zip((source, source_mask, target, target_mask), originals):
+        np.testing.assert_array_equal(actual, original)
+
+
+@pytest.mark.parametrize("source_text,target_text", [
+    ("Sturdy steel", "Smooth stone"), ("Sturdy steel", "Sturdy wheel"),
+    ("The tile", "The file"), ("The file", "The tile"),
+    ("Sturdy tile", "Sturdy file"), ("Sturdy file", "Sturdy tile"),
+])
+def test_observation_match_rejects_changed_words_and_strokes(templates_class, source_text, target_text):
+    source, source_mask, source_box = subtitle(source_text)
+    target, target_mask, target_box = subtitle(target_text)
+    templates = templates_class((0, 128, 0, 360))
+    assert templates.match_observations(source, source_mask, [source_box],
+                                        target, target_mask, [target_box]) == []
+
+
+@pytest.mark.parametrize("narrow_side", [0, 1])
+def test_observation_match_checks_changed_suffix_beyond_the_shorter_box(templates_class, narrow_side):
+    observations = [subtitle("Sturdy steel"), subtitle("Sturdy wheel")]
+    frame, mask, box = observations[narrow_side]
+    mask[:, 160:] = 0
+    observations[narrow_side] = frame, mask, (box[0], box[1], box[2], 160)
+    source, source_mask, source_box = observations[0]
+    target, target_mask, target_box = observations[1]
+    templates = templates_class((0, 128, 0, 360))
+    assert templates.match_observations(source, source_mask, [source_box],
+                                        target, target_mask, [target_box]) == []
+
+
+@pytest.mark.parametrize("damaged_side", [0, 1])
+@pytest.mark.parametrize("mask_kind", ["partial", "rectangle", "empty"])
+def test_observation_match_requires_two_reliable_raw_masks(templates_class, damaged_side, mask_kind):
+    frame, complete, box = subtitle()
+    damaged = partial(complete) if mask_kind == "partial" else np.zeros_like(complete)
+    if mask_kind == "rectangle":
+        damaged[box[0]:box[1], box[2]:box[3]] = 255
+    masks = [complete, complete]
+    masks[damaged_side] = damaged
+    templates = templates_class((0, 128, 0, 360))
+    refine_one(templates, frame, complete, [box], 0)
+    assert templates.match_observations(frame, masks[0], [box],
+                                        frame, masks[1], [box]) == []
+
+
+def test_observation_match_reports_only_supported_line_indices(templates_class):
+    source, source_mask, source_boxes = multiline_subtitle("Sturdy")
+    target, target_mask, target_boxes = multiline_subtitle("Steady")
+    templates = templates_class((0, 384, 0, 360))
+    assert templates.match_observations(source, source_mask, source_boxes,
+                                        target, target_mask, list(reversed(target_boxes))) == [(1, 1), (2, 0)]
+
+
+def test_observation_match_ignores_boxes_outside_roi_without_renumbering(templates_class):
+    frame, mask, boxes = multiline_subtitle()
+    templates = templates_class((128, 256, 0, 360))
+    assert templates.match_observations(frame, mask, boxes, frame, mask, boxes) == [(1, 1)]
+
+
+def test_observation_match_does_not_reuse_a_current_box(templates_class):
+    frame, mask, box = subtitle()
+    templates = templates_class((0, 128, 0, 360))
+    assert templates.match_observations(frame, mask, [box, box], frame, mask, [box]) == [(0, 0)]
+
+
 def test_recovers_missing_glyphs_without_filling_interword_background(templates_class):
     frame, complete, box = subtitle()
     templates = templates_class((0, 128, 0, 360))

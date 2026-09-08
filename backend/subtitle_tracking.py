@@ -94,10 +94,12 @@ def track_text_boxes(
     max_gap: int = 10,
     max_center_delta: float = 90.0,
     scene_change_frames: Sequence[int] = (),
+    confirmed_observations: Iterable[Tuple[int, Box]] = (),
 ) -> List[BoxTrack]:
     """按中心移动、尺寸比例和时间间隙贪心匹配采样框。
 
-    每个采样帧中的一个框最多归属于一条轨迹；孤立命中会被丢弃。
+    每个采样帧中的一个框最多归属于一条轨迹；孤立命中须有精确到
+    ``(frame_number, box)`` 的内容确认依据，否则会被丢弃。
     ``total_frames`` 用于忽略视频范围外的帧号，避免外部数据污染轨迹。
     """
     if total_frames <= 0:
@@ -105,6 +107,7 @@ def track_text_boxes(
     min_hits = max(1, int(min_hits))
     max_gap = max(0, int(max_gap))
     max_center_delta = max(0.0, float(max_center_delta))
+    confirmed = set(confirmed_observations)
     def match_score(box, previous):
         y1, y2, x1, x2 = box
         py1, py2, px1, px2 = previous
@@ -130,6 +133,7 @@ def track_text_boxes(
         track for track in _track_boxes(
             sampled, total_frames, max_gap, match_score, scene_change_frames
         ) if len(track.frames) >= min_hits
+        or any((frame, box) in confirmed for frame, box in zip(track.frames, track.boxes))
     ]
 
 

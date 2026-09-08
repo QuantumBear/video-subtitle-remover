@@ -57,7 +57,7 @@ class SubtitleTemplates:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
         return gray - cv2.GaussianBlur(gray, (0, 0), 1)
 
-    def _remember(self, frame, mask, box, frame_number):
+    def _make_reference(self, frame, mask, box, frame_number):
         y1, y2, x1, x2 = box
         glyph = np.where(mask[y1:y2, x1:x2] > 0, 255, 0).astype(np.uint8)
         pixels = int(np.count_nonzero(glyph))
@@ -76,15 +76,20 @@ class SubtitleTemplates:
             return
         contrast = self._contrast(patch) * (glyph > 0)
         core = (white & (glyph > 0)).astype(np.uint8)
-        reference = _Template(frame_number, box, glyph, edges, support, contrast, core, pixels)
+        return _Template(frame_number, box, glyph, edges, support, contrast, core, pixels)
+
+    def _remember(self, frame, mask, box, frame_number):
+        reference = self._make_reference(frame, mask, box, frame_number)
+        if reference is None:
+            return
         for index, previous in enumerate(self._templates):
             if previous.box != box:
                 continue
             same_observation = previous.frame_number == frame_number
-            same_content = (np.array_equal(previous.glyph, glyph)
-                            and np.array_equal(previous.edges, edges))
+            same_content = (np.array_equal(previous.glyph, reference.glyph)
+                            and np.array_equal(previous.edges, reference.edges))
             if same_observation or same_content:
-                if pixels >= previous.pixels and frame_number >= previous.frame_number:
+                if reference.pixels >= previous.pixels and frame_number >= previous.frame_number:
                     self._templates[index] = reference
                 return
         self._templates.append(reference)
@@ -102,6 +107,38 @@ class SubtitleTemplates:
             victim = min(crowded, key=lambda index: (self._templates[index].pixels,
                                                      self._templates[index].frame_number))
             del self._templates[victim]
+
+    def match_observations(self, previous_frame_bgr, previous_mask, previous_boxes,
+                           current_frame_bgr, current_mask, current_boxes):
+        """Return one-to-one pairs of input box indices verified in both directions.
+
+        Both masks must come from their original observations. References are
+        local to this pair and neither read nor update the recovery cache.
+        """
+        references = []
+        for frame, mask, boxes in ((previous_frame_bgr, previous_mask, previous_boxes),
+                                   (current_frame_bgr, current_mask, current_boxes)):
+            if frame.shape[:2] != mask.shape:
+                raise ValueError("frame and mask dimensions must match")
+            valid = []
+            for index, box in enumerate(boxes):
+                clipped = self._clip_box(box, mask.shape)
+                if clipped is not None:
+                    reference = self._make_reference(frame, mask, clipped, 0)
+                    if reference is not None:
+                        valid.append((index, reference))
+            references.append(valid)
+        pairs, matched_current = [], set()
+        for previous_index, previous in references[0]:
+            for current_index, current in references[1]:
+                if current_index in matched_current:
+                    continue
+                if (self._align(previous, current_frame_bgr, current.box) is not None
+                        and self._align(current, previous_frame_bgr, previous.box) is not None):
+                    pairs.append((previous_index, current_index))
+                    matched_current.add(current_index)
+                    break
+        return pairs
 
     @staticmethod
     def _nearby(source, target):
