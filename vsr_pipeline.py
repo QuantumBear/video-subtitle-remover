@@ -266,7 +266,7 @@ DEFAULT_STICKER_BACKEND = 'vlm'   # 保持默认行为不变；本地后端需�
 
 
 def locate_stickers_gdino(video_path, region, sample_frames, detector,
-                          prompt=None, score_threshold=None, max_area_ratio=None):
+                          prompt=None, score_threshold=None, max_area_px=None):
     """用常驻的本地检测器定位贴纸原始框，语义与 locate_stickers_vlm 对齐。
 
     与 VLM 路径的差异只在"哪来的框":本地推理无调用预算、无 Key 依赖，
@@ -277,8 +277,8 @@ def locate_stickers_gdino(video_path, region, sample_frames, detector,
         prompt=prompt or sticker_detect.DEFAULT_PROMPT,
         score_threshold=(sticker_detect.DEFAULT_SCORE_THRESHOLD
                          if score_threshold is None else score_threshold),
-        max_area_ratio=(sticker_detect.DEFAULT_MAX_AREA_RATIO
-                        if max_area_ratio is None else max_area_ratio))
+        max_area_px=(sticker_detect.DEFAULT_MAX_AREA_PX
+                     if max_area_px is None else max_area_px))
 
 
 # ---------- 模型单例(worker 进程内 import 一次,处理多条视频复用) ----------
@@ -673,10 +673,15 @@ class Pipeline:
         boxes_all = [b for b in boxes_all
                      if any(lo <= (b[0] + b[1]) / 2 <= hi for lo, hi in keep_ranges)]
         print(f'[auto-region] 聚类过滤后保留 {len(boxes_all)}/{len(centers)} 框')
-        ymin = max(0, min(b[0] for b in boxes_all) - 80)
-        ymax = min(h, max(b[1] for b in boxes_all) + 80)
-        xmin = max(0, min(b[2] for b in boxes_all) - 40)
-        xmax = min(w, max(b[3] for b in boxes_all) + 40)
+        # y 方向外扩 20px:原始字幕带 y 范围与人工 ROI 只差约 10px,
+        # 20px 足够覆盖字幕移动与漏检字的邻域;80px 会把 ROI 胀大
+        # 到接近全屏，失去裁剪送检的意义。
+        ymin = max(0, min(b[0] for b in boxes_all) - 20)
+        ymax = min(h, max(b[1] for b in boxes_all) + 20)
+        # x 方向按检出框自身的范围外扩 20px:竖屏字幕占满宽度时自然
+        # 接近全宽，横屏字幕偏右/偏左时自然收紧，无需按方向分支。
+        xmin = max(0, min(b[2] for b in boxes_all) - 20)
+        xmax = min(w, max(b[3] for b in boxes_all) + 20)
         print(f'[auto-region] 采样检出 {len(boxes_all)} 框 → region: {(ymin, ymax, xmin, xmax)}')
         return (ymin, ymax, xmin, xmax)
 
@@ -778,10 +783,11 @@ class Pipeline:
                       ocr_stride=OCR_STRIDE, ocr_refine_radius=OCR_REFINE_RADIUS,
                       vlm_max_calls=32, sticker_max_frames=None,
                       sticker_prompt=None, sticker_score=None,
-                      sticker_max_area_ratio=None):
+                      sticker_max_area_px=None):
         """处理单条视频：反馈式 OCR 和轨迹检测，然后按帧或分段修复。
 
-        :param region: (ymin, ymax, xmin, xmax) 字幕区域;None = 全屏检测
+        :param region: (ymin, ymax, xmin, xmax) 字幕区域;None 时自动推断字幕带,
+                       推断失败回退全屏
         :param ocr_stride: 稳定检测时逐步增大的帧间隔上限，默认 5
         :param white_glyph_check: 白字自检开关(白字幕场景必开;彩色字幕场景关闭,
                                   避免把画面中的白色物体误当残留)
@@ -791,17 +797,25 @@ class Pipeline:
         :param sticker_prompt: 仅 gdino 后端生效，开放词汇提示串。默认串按实测素材
                                标定，换素材若召回不足需针对性补充短语
         :param sticker_score: 仅 gdino 后端生效，置信度下限
-        :param sticker_max_area_ratio: 仅 gdino 后端生效，框面积占 crop 的上限。
-                                       这是区分 emoji 与整幅物体误检的关键判据
+        :param sticker_max_area_px: 仅 gdino 后端生效，贴纸框绝对像素面积上限。
+                                    这是区分 emoji 与整幅物体误检的关键判据,
+                                    用绝对像素而非相对比例,避免 ROI 尺寸变化时判据漂移
         """
         input_path, output_path = os.fspath(input_path), os.fspath(output_path)
-        mode = 'full-frame' if region is None else 'roi'
         with av.open(input_path) as metadata:
             vstream = metadata.streams.video[0]
             rate = vstream.average_rate or Fraction(30, 1)
             w, h = vstream.codec_context.width, vstream.codec_context.height
         fps = float(rate)
-        region = tuple(region) if region is not None else (0, h, 0, w)
+        # region=None 时用全屏 OCR 采样自动推断字幕带;推断失败回退全屏。
+        # 人工指定 region 则直接使用(精确场景)。
+        if region is None:
+            inferred = self.auto_region(input_path, samples=24)
+            region = inferred if inferred else (0, h, 0, w)
+            print(f'[detect] auto-region={"inferred" if inferred else "fallback-full"} roi={region}')
+        else:
+            region = tuple(region)
+        mode = 'roi' if region != (0, h, 0, w) else 'full-frame'
         ry1, ry2, rx1, rx2 = region
         if not (0 <= ry1 < ry2 <= h and 0 <= rx1 < rx2 <= w):
             raise ValueError(f'字幕区域超出视频尺寸 {w}x{h}: {region}')
@@ -829,7 +843,7 @@ class Pipeline:
                     hits = locate_stickers_gdino(
                         input_path, region, samples, self._ensure_sticker_detector(),
                         prompt=sticker_prompt, score_threshold=sticker_score,
-                        max_area_ratio=sticker_max_area_ratio)
+                        max_area_px=sticker_max_area_px)
                 else:
                     samples = plan_vlm_frames(total, all_boxes, vlm_max_calls, max(1, round(fps)),
                                               scene_change_frames=detection['scene_change_frames'])
@@ -1057,10 +1071,11 @@ def main():
                          '默认串按实测素材标定,换素材召回不足时需补充对应短语')
     ap.add_argument('--sticker-score', type=float, default=None,
                     help=f'gdino 后端置信度下限,默认 {sticker_detect.DEFAULT_SCORE_THRESHOLD}')
-    ap.add_argument('--sticker-max-area-ratio', type=float, default=None,
-                    help='gdino 后端框面积占检测区域的上限,默认 '
-                         f'{sticker_detect.DEFAULT_MAX_AREA_RATIO}。这是区分 emoji '
-                         '与整幅物体误检的关键判据,随素材的 emoji 显示尺寸标定')
+    ap.add_argument('--sticker-max-area-px', type=float, default=None,
+                    help=f'gdino 后端贴纸框绝对像素面积上限,默认 '
+                         f'{sticker_detect.DEFAULT_MAX_AREA_PX}。这是区分 emoji 与'
+                         '整幅物体误检的关键判据;用绝对像素而非相对比例,避免 ROI '
+                         '尺寸变化时判据漂移')
     args = ap.parse_args()
 
     pipe = Pipeline(threads=args.threads, device=args.device, inpaint_mode=args.inpaint_mode,
@@ -1076,7 +1091,7 @@ def main():
         sticker_max_frames=args.sticker_max_frames,
         sticker_prompt=args.sticker_prompt,
         sticker_score=args.sticker_score,
-        sticker_max_area_ratio=args.sticker_max_area_ratio,
+        sticker_max_area_px=args.sticker_max_area_px,
         progress=lambda d, t, s: print(f'  进度 {d}/{t} ({s})'))
     print('统计:', stat)
 

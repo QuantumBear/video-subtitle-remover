@@ -380,3 +380,6 @@ inference.onnx
 *.mp4
 .serena/
 test_openai_client.sh
+
+# 本地 GroundingDINO 贴纸检测权重
+/backend/models/grounding-dino-tiny/model.safetensors

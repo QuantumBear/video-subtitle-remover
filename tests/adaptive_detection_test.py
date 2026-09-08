@@ -117,7 +117,11 @@ def test_process_video_keeps_frame_count_pts_and_roi(tmp_path, roi, mode):
     pipe = Pipeline.__new__(Pipeline)
     pipe.inpaint_mode = mode
     regions, windows = [], []
-    pipe.auto_region = lambda *a: pytest.fail("obsolete auto_region was called")
+    # region=None 时走自动推断,用假结果模拟;显式传 roi 则直接使用,不触发推断。
+    # 推断结果取一个明显的 ROI 值,验证它确实传到了后续检测环节。
+    FAKE_ROI = (5, 45, 2, 62)
+    pipe.auto_region = lambda path, samples=24: FAKE_ROI if roi is None else pytest.fail(
+        "显式传 roi 时不应调用 auto_region")
     pipe.detect = lambda img, region: regions.append(region) or [(20, 30, 10, 50)]
 
     def inpaint(frames, masks):
@@ -129,7 +133,7 @@ def test_process_video_keeps_frame_count_pts_and_roi(tmp_path, roi, mode):
     pipe.inpainter = SimpleNamespace(inpaint=inpaint)
     stat = pipe.process_video(str(path), str(out), region=roi, locate_stickers=False)
     assert stat["frames"] == 83
-    assert set(regions) == {roi or (0, 48, 0, 64)}
+    assert set(regions) == {(5, 45, 2, 62) if roi is None else roi}
     if mode == "propainter":
         assert windows and max(windows) <= 60
     with av.open(str(out)) as result:

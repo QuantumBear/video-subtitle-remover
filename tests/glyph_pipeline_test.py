@@ -146,7 +146,8 @@ def test_matching_subtitle_survives_scene_cut_without_mixing_model_frames(tmp_pa
         return [np.full_like(frame, 80) for frame in frames]
 
     pipe.inpainter = SimpleNamespace(inpaint=inpaint)
-    stats = pipe.process_video(source, output, locate_stickers=False, white_glyph_check=False)
+    stats = pipe.process_video(source, output, region=region,
+                               locate_stickers=False, white_glyph_check=False)
     assert [len(frames) for frames, _ in calls] == [3, 3]
     for (frames, _), expected in zip(calls, [clear, bright]):
         assert all(np.array_equal(frame, expected) for frame in frames)
@@ -179,7 +180,8 @@ def test_scene_cut_cannot_copy_changed_or_disappeared_subtitles(tmp_path, source
         return [np.full_like(frame, 80) for frame in frames]
 
     pipe.inpainter = SimpleNamespace(inpaint=inpaint)
-    stats = pipe.process_video(source, output, locate_stickers=False, white_glyph_check=False)
+    stats = pipe.process_video(source, output, region=region,
+                               locate_stickers=False, white_glyph_check=False)
     assert stats["frames"] == 6 and stats["template_recovered"] == 0
     if target_text:
         assert [len(masks) for masks in calls] == [3, 3]

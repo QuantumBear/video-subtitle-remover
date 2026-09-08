@@ -32,22 +32,26 @@ DEFAULT_SCORE_THRESHOLD = 0.25    # 单体召回 85%(0.30 只有 56%,实测会�
                                   # 代价是少量远离字幕的小物体误检(实测 5/60 帧命中
                                   # 同一车身零件),这类框由 associate_sticker_hits
                                   # 的"须靠近字幕框"约束兜底
-DEFAULT_MAX_AREA_RATIO = 0.003    # 占 crop 面积上限；720×560 下约 1200px，emoji 实测最大 898px
+DEFAULT_MAX_AREA_PX = 1200       # 绝对像素上限；emoji 实测最大 898px，留 ~30% 余量。
+                                  # 用绝对值而非相对 crop 的比例：ROI 自适应后尺度会变，
+                                  # 全屏下比例判据会漂到 2 倍以上，导致误检框漏过；
+                                  # 绝对像素不随裁剪尺寸变化，判据一致性更好
 DEFAULT_MAX_FRAMES = 200          # 本地推理无 API 成本，采样密度只受算力约束
 
 
 def filter_detections(
     detections: Sequence[dict],
-    crop_area: int,
     score_threshold: float = DEFAULT_SCORE_THRESHOLD,
-    max_area_ratio: float = DEFAULT_MAX_AREA_RATIO,
+    max_area_px: float = DEFAULT_MAX_AREA_PX,
 ) -> List[Tuple[float, float, float, float]]:
     """按置信度与面积上限筛出贴纸框，返回 crop 坐标系的 (x1, y1, x2, y2)。
 
     面积上限是本方案能用的前提：开放词汇检测器对真实物体的高分误检
     全部是整幅级大框，仅靠置信度无法与 emoji 分开。
+    面积用绝对像素而非相对比例：ROI 自适应后裁剪尺寸变化较大，
+    比例判据会漂移；绝对像素不随裁剪尺寸变化，判据一致性更好。
     """
-    max_area = max(1.0, float(crop_area) * float(max_area_ratio))
+    max_area = max(1.0, float(max_area_px))
     kept = []
     for det in detections:
         if float(det['score']) < score_threshold:
@@ -89,7 +93,7 @@ class GroundingDinoStickerDetector:
         self.model = self.model.to(self.device).eval()
 
     def detect_crop(self, crop, prompt: str, score_threshold: float,
-                    max_area_ratio: float) -> List[Tuple[float, float, float, float]]:
+                    max_area_px: float) -> List[Tuple[float, float, float, float]]:
         """对单张 RGB crop 推理，返回已过滤的 crop 坐标框。"""
         import torch
         from PIL import Image
@@ -109,13 +113,12 @@ class GroundingDinoStickerDetector:
         )[0]
         detections = [{'score': float(s), 'box': [float(v) for v in b]}
                       for s, b in zip(results['scores'], results['boxes'])]
-        return filter_detections(detections, crop.shape[0] * crop.shape[1],
-                                 score_threshold, max_area_ratio)
+        return filter_detections(detections, score_threshold, max_area_px)
 
     def locate(self, video_path, region: Sequence[int], sample_frames: Sequence[int],
                prompt: str = DEFAULT_PROMPT,
                score_threshold: float = DEFAULT_SCORE_THRESHOLD,
-               max_area_ratio: float = DEFAULT_MAX_AREA_RATIO) -> Dict[int, List[Box]]:
+               max_area_px: float = DEFAULT_MAX_AREA_PX) -> Dict[int, List[Box]]:
         """按采样帧定位贴纸，返回 ``{帧号: [未外扩全帧框]}``。
 
         本地推理不会像 API 那样失败，因此每个采样帧都会留下条目（无贴纸即空列表）。
@@ -138,7 +141,7 @@ class GroundingDinoStickerDetector:
                 if n not in target:
                     continue
                 crop = np.asarray(frame.to_image())[ymin:ymax, xmin:xmax]
-                boxes = self.detect_crop(crop, prompt, score_threshold, max_area_ratio)
+                boxes = self.detect_crop(crop, prompt, score_threshold, max_area_px)
                 frame_boxes = [to_frame_box(b, region) for b in boxes]
                 hits[n] = list(dict.fromkeys(
                     b for b in frame_boxes if b[0] < b[1] and b[2] < b[3]))

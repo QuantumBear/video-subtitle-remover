@@ -1,38 +1,35 @@
 # -*- coding: utf-8 -*-
 """本地 GroundingDINO 贴纸检测的判据与后端分流测试。
 
-判据数值取自实测标定（720×560 crop）：emoji 框 693–898px，
-物体误检框 9.2 万–39.6 万px。测试锁定"面积上限把两者分开"这一关键行为，
-以及两个后端在流水线里可互换、互不越界。
+判据数值取自实测标定：emoji 框 693–898 px，物体误检框 9.2 万–39.6 万 px。
+测试锁定"面积上限把两者分开"这一关键行为，以及两个后端在流水线里
+可互换、互不越界。
 """
-import numpy as np
 import pytest
 
 from backend import sticker_detect
 
 
-CROP_AREA = 720 * 560          # 与标定素材一致
-EMOJI = {'score': 0.48, 'box': [343.3, 50.8, 371.1, 77.8]}      # 实测 ~751px
+EMOJI = {'score': 0.48, 'box': [343.3, 50.8, 371.1, 77.8]}      # 实测 ~751 px
 BIG_OBJECT = {'score': 0.49, 'box': [10.0, 10.0, 500.0, 480.0]}  # 实测量级的整幅误检
 
 
 def test_area_limit_rejects_high_score_whole_frame_detections():
     """核心判据：物体误检分数比 emoji 还高，只有面积上限能挡住它。"""
-    kept = sticker_detect.filter_detections([EMOJI, BIG_OBJECT], CROP_AREA)
+    kept = sticker_detect.filter_detections([EMOJI, BIG_OBJECT])
     assert kept == [tuple(EMOJI['box'])]
 
 
 def test_without_area_limit_object_misdetections_survive():
     """反证：放开面积上限后误检混入，说明该判据不可省。"""
-    kept = sticker_detect.filter_detections(
-        [EMOJI, BIG_OBJECT], CROP_AREA, max_area_ratio=1.0)
+    kept = sticker_detect.filter_detections([EMOJI, BIG_OBJECT], max_area_px=1_000_000)
     assert len(kept) == 2
 
 
 def test_score_threshold_drops_low_confidence_boxes():
     faint = {'score': 0.21, 'box': [343.0, 50.0, 371.0, 78.0]}
-    assert sticker_detect.filter_detections([faint], CROP_AREA) == []
-    assert sticker_detect.filter_detections([faint], CROP_AREA, score_threshold=0.2)
+    assert sticker_detect.filter_detections([faint]) == []
+    assert sticker_detect.filter_detections([faint], score_threshold=0.2)
 
 
 def test_default_threshold_keeps_weak_emoji_that_strict_cutoff_would_miss():
@@ -42,8 +39,8 @@ def test_default_threshold_keeps_weak_emoji_that_strict_cutoff_would_miss():
     0.25 提到 85%。0.26–0.29 这段分数区间正是差距所在。
     """
     weak = {'score': 0.27, 'box': [313.0, 47.0, 341.0, 77.0]}   # 实测同排 emoji 的弱检出
-    assert sticker_detect.filter_detections([weak], CROP_AREA) == [(313.0, 47.0, 341.0, 77.0)]
-    assert sticker_detect.filter_detections([weak], CROP_AREA, score_threshold=0.30) == []
+    assert sticker_detect.filter_detections([weak]) == [(313.0, 47.0, 341.0, 77.0)]
+    assert sticker_detect.filter_detections([weak], score_threshold=0.30) == []
 
 
 def test_degenerate_boxes_are_discarded():
@@ -52,18 +49,20 @@ def test_degenerate_boxes_are_discarded():
         {'score': 0.9, 'box': [10.0, 20.0, 30.0, 20.0]},   # 零高
         {'score': 0.9, 'box': [30.0, 30.0, 10.0, 10.0]},   # 反向
     ]
-    assert sticker_detect.filter_detections(boxes, CROP_AREA) == []
+    assert sticker_detect.filter_detections(boxes) == []
 
 
-def test_area_ratio_scales_with_crop_size():
-    """面积上限按 crop 比例计算，换分辨率时判据随之缩放。
+def test_area_limit_is_absolute_pixels_not_relative():
+    """面积上限用绝对像素而非相对 crop 比例：ROI 尺寸变化时判据不漂移。
 
-    同一个 900px 的框：在 720×560 下限额约 1210px 予以保留，
-    在 320×240 下限额约 230px 予以丢弃。
+    同一个 900px 的框，在 720×560 crop 和 320×240 crop 下都应保留
+    （都在 1200px 绝对上限内），因为 emoji 的物理像素尺寸不随裁剪变化。
+    若用比例判据，320×240 下限额会缩到 230px，真 emoji 反而被误杀。
     """
     box = {'score': 0.9, 'box': [0.0, 0.0, 30.0, 30.0]}     # 900px，与实测 emoji 同量级
-    assert sticker_detect.filter_detections([box], 720 * 560) == [(0.0, 0.0, 30.0, 30.0)]
-    assert sticker_detect.filter_detections([box], 320 * 240) == []
+    assert sticker_detect.filter_detections([box]) == [(0.0, 0.0, 30.0, 30.0)]
+    # 同一个框，换个"crop 尺寸"概念，判据不变（filter_detections 根本不吃 crop_area）
+    assert sticker_detect.filter_detections([box]) == [(0.0, 0.0, 30.0, 30.0)]
 
 
 def test_to_frame_box_offsets_by_region_without_padding():
@@ -107,7 +106,7 @@ def test_gdino_backend_never_calls_dashscope(monkeypatch):
     assert captured['frames'] == [0, 5]
     # 未显式传参时应落到实测标定的默认判据
     assert captured['score_threshold'] == sticker_detect.DEFAULT_SCORE_THRESHOLD
-    assert captured['max_area_ratio'] == sticker_detect.DEFAULT_MAX_AREA_RATIO
+    assert captured['max_area_px'] == sticker_detect.DEFAULT_MAX_AREA_PX
     assert captured['prompt'] == sticker_detect.DEFAULT_PROMPT
 
 
@@ -123,9 +122,9 @@ def test_gdino_backend_forwards_explicit_overrides():
 
     vsr_pipeline.locate_stickers_gdino(
         'x.mp4', (0, 48, 0, 64), [0], FakeDetector(),
-        prompt='emoji.', score_threshold=0.5, max_area_ratio=0.01)
+        prompt='emoji.', score_threshold=0.5, max_area_px=500)
     assert captured == {'prompt': 'emoji.', 'score_threshold': 0.5,
-                        'max_area_ratio': 0.01}
+                        'max_area_px': 500}
 
 
 def test_locate_returns_empty_dict_for_empty_schedule():
