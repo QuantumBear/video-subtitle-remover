@@ -47,7 +47,8 @@ _progress_re = re.compile(r'进度 (\d+)/(\d+) \((.*)\)')
 class Task:
     """一个处理任务:状态 + 文件路径 + 子进程句柄 + 进度信息。"""
 
-    def __init__(self, task_id, input_path, output_path, region, white_glyph_check, inpaint_mode='lama', locate_stickers=True):
+    def __init__(self, task_id, input_path, output_path, region, white_glyph_check,
+                 inpaint_mode='lama', locate_stickers=True, sticker_backend='vlm'):
         self.id = task_id
         self.input_path = input_path
         self.output_path = output_path
@@ -55,6 +56,7 @@ class Task:
         self.white_glyph_check = white_glyph_check
         self.inpaint_mode = inpaint_mode
         self.locate_stickers = locate_stickers
+        self.sticker_backend = sticker_backend
         self.status = 'running'          # running / done / failed
         self.progress = '0/0'            # 已处理/总帧
         self.detail = ''                 # 修复/补擦统计等细节
@@ -107,6 +109,8 @@ def _run_task(task: Task):
         cmd += ['--inpaint-mode', task.inpaint_mode]
         if not task.locate_stickers:
             cmd += ['--no-locate-stickers']
+        else:
+            cmd += ['--sticker-backend', task.sticker_backend]
         task.proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, cwd=BASE_DIR)
@@ -147,7 +151,8 @@ async def create_task(file: UploadFile = File(...),
                       region: str = Form(''),
                       white_glyph_check: bool = Form(True),
                       inpaint_mode: str = Form('lama'),
-                      locate_stickers: bool = Form(True)):
+                      locate_stickers: bool = Form(True),
+                      sticker_backend: str = Form('vlm')):
     """上传视频创建处理任务。并发槽满返回 503(不排队,客户端自行重试)。"""
     if not _slot_acquire():
         raise HTTPException(503, f'并发已满({MAX_CONCURRENCY}),请稍后重试')
@@ -164,7 +169,10 @@ async def create_task(file: UploadFile = File(...),
             raise HTTPException(400, '上传文件为空')
         if inpaint_mode not in ('lama', 'propainter'):
             raise HTTPException(400, "inpaint_mode 只支持 lama / propainter")
-        task = Task(task_id, input_path, output_path, region_tuple, white_glyph_check, inpaint_mode, locate_stickers)
+        if sticker_backend not in ('vlm', 'gdino'):
+            raise HTTPException(400, "sticker_backend 只支持 vlm / gdino")
+        task = Task(task_id, input_path, output_path, region_tuple, white_glyph_check,
+                    inpaint_mode, locate_stickers, sticker_backend)
         _tasks[task_id] = task
         threading.Thread(target=_run_task, args=(task,), daemon=True).start()
         return {'task_id': task_id, 'status': 'running'}

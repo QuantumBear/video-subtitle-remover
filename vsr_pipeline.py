@@ -3,7 +3,7 @@
 
 流程:
   1. PaddleOCR 按检测反馈调整采样间隔，物化独立的逐帧字幕轨迹
-  2. 可选 DashScope 贴纸定位，经时间/空间关联后生成独立遮罩
+  2. 可选贴纸定位(DashScope VLM 或本地 GroundingDINO)，经时间/空间关联后生成独立遮罩
   3. LAMA 单帧或 ProPainter 分段修复，受限白字残留复核
   4. 合回源音频；最终画质仍需关键帧验收
 
@@ -33,6 +33,7 @@ import cv2
 import numpy as np
 import torch
 
+from backend import sticker_detect
 from backend.subtitle_templates import SubtitleTemplates
 from backend.subtitle_tracking import (
     associate_sticker_hits,
@@ -61,7 +62,7 @@ LAMA_PT = os.path.join(BASE_DIR, 'backend', 'models', 'big-lama', 'big-lama.pt')
 MASK_PAD = 4             # OCR 框外扩像素:mask 比字形宽的环带是 ProPainter
                          # 传播距离最远、质量最差的区域(白雾残影所在),
                          # 收紧外扩(4px 盖住字形抗锯齿边缘)可显著缩小环带
-STICKER_MASK_PAD = 12    # VLM 贴纸框独立外扩:模型框边界通常比 OCR 框更松,
+STICKER_MASK_PAD = 12    # 贴纸框独立外扩:定位模型的框边界通常比 OCR 框更松,
                          # 4px 会在 emoji 边缘留下橙色残片;贴纸区域小,
                          # 增加到 12px 不扩大字幕的擦除范围
 MASK_EXPAND_DOWN = 0     # mask 向下扩展:实测下扩 55px 会把字幕正下方的画面
@@ -82,7 +83,7 @@ GLYPH_OUTLINE_RADIUS = 2  # 在亮字形外再覆盖窄暗描边，不填充整�
 WHITE_RB_MAX = 25        # |R-B| 上限:排除蓝裤腿等彩色亮物
 MIN_BOX_ASPECT = 1.8     # 检出框最小宽高比(w/h):字幕行是水平长条(实测≥2.7),
                          # 近方形框是动物/物体误检(实测狗被检出 1.1:1 的框),
-                         # 贴纸通过独立 VLM 定位，不依赖 OCR 框下扩
+                         # 贴纸通过独立的贴纸定位后端处理，不依赖 OCR 框下扩
 RESID_MIN_PX = 50        # 帧内残留像素超过该值才触发补擦(抗压缩噪声)
 OCR_STRIDE = 5          # 稳定时的最大间隔；有变化立即回到逐帧检测
 OCR_REFINE_RADIUS = 15  # 变化时向前补查的最大帧数
@@ -159,7 +160,7 @@ class LamaEngine:
         return out
 
 
-# ---------- VLM 贴纸/emoji 定位(可选,需 DashScope API Key) ----------
+# ---------- 贴纸/emoji 定位后端 A:DashScope VLM(需 API Key) ----------
 def _dashscope_key():
     """DashScope API Key:环境变量 DASHSCOPE_API_KEY 优先,
     其次 config/config.json 的 Service.DashscopeApiKey(config.json 已被
@@ -189,7 +190,6 @@ def _sticker_box_from_vlm(bbox_2d, region, pad=STICKER_MASK_PAD):
             min(xmax, int(x2 * width / 1000) + xmin + pad))
 
 
-# ---------- VLM 贴纸/emoji 定位(可选,需 DashScope API Key) ----------
 def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20,
                         model='qwen3.7-plus', max_calls=32, timeout=120):
     """采样帧调 VLM 定位贴纸原始框，关联和外扩由轨迹层完成。
@@ -260,16 +260,45 @@ def locate_stickers_vlm(video_path, region, sample_frames=None, samples=20,
     return hits
 
 
+# ---------- 贴纸/emoji 定位后端 B:本地 GroundingDINO(需权重,无 API 依赖) ----------
+STICKER_BACKENDS = ('vlm', 'gdino')
+DEFAULT_STICKER_BACKEND = 'vlm'   # 保持默认行为不变；本地后端需先备妥权重再切换
+
+
+def locate_stickers_gdino(video_path, region, sample_frames, detector,
+                          prompt=None, score_threshold=None, max_area_ratio=None):
+    """用常驻的本地检测器定位贴纸原始框，语义与 locate_stickers_vlm 对齐。
+
+    与 VLM 路径的差异只在"哪来的框":本地推理无调用预算、无 Key 依赖，
+    可密集采样;关联与外扩仍由轨迹层统一承担。
+    """
+    return detector.locate(
+        video_path, region, sample_frames,
+        prompt=prompt or sticker_detect.DEFAULT_PROMPT,
+        score_threshold=(sticker_detect.DEFAULT_SCORE_THRESHOLD
+                         if score_threshold is None else score_threshold),
+        max_area_ratio=(sticker_detect.DEFAULT_MAX_AREA_RATIO
+                        if max_area_ratio is None else max_area_ratio))
+
+
 # ---------- 模型单例(worker 进程内 import 一次,处理多条视频复用) ----------
 class Pipeline:
     """持有常驻模型,提供单视频处理入口。"""
 
     def __init__(self, det_model_dir=DEFAULT_DET_MODEL_DIR,
                  det_model_name=DEFAULT_DET_MODEL_NAME,
-                 lama_pt=LAMA_PT, threads=None, device='auto', inpaint_mode='lama'):
+                 lama_pt=LAMA_PT, threads=None, device='auto', inpaint_mode='lama',
+                 sticker_backend=DEFAULT_STICKER_BACKEND, sticker_model_id=None):
         if threads:
             torch.set_num_threads(threads)
         self.inpaint_mode = inpaint_mode
+        if sticker_backend not in STICKER_BACKENDS:
+            raise ValueError(f'未知 sticker_backend: {sticker_backend}')
+        self.sticker_backend = sticker_backend
+        self._sticker_device = device
+        self._sticker_model_id = sticker_model_id
+        # 贴纸检测器惰性加载:关闭贴纸层或走 VLM 后端时不应付出权重加载成本
+        self._sticker_detector = None
         print(f'[init] 加载 OCR 检测模型: {det_model_dir}')
         from paddleocr import TextDetection
         # OCR 固定 CPU:占比小(~13%),不值得为它装 paddle-gpu
@@ -292,6 +321,17 @@ class Pipeline:
             print(f'[init] ProPainter 模式(引擎将在首次修复时加载,device: {self._pp_device})')
         else:
             raise ValueError(f'未知 inpaint_mode: {inpaint_mode}')
+
+    def _ensure_sticker_detector(self):
+        """本地贴纸检测器惰性加载(首次定位时)。"""
+        if self._sticker_detector is None:
+            from backend import sticker_detect
+            model_id = self._sticker_model_id or sticker_detect.DEFAULT_MODEL_ID
+            print(f'[init] 加载贴纸检测模型: {model_id}')
+            self._sticker_detector = sticker_detect.GroundingDinoStickerDetector(
+                model_id=model_id, device=self._sticker_device)
+            print(f'[init] 贴纸检测器就绪(device: {self._sticker_detector.device})')
+        return self._sticker_detector
 
     def _ensure_propainter(self):
         """ProPainter 惰性加载(首次修复时)。"""
@@ -736,7 +776,9 @@ class Pipeline:
     def process_video(self, input_path, output_path, region=None,
                       white_glyph_check=True, progress=None, locate_stickers=True,
                       ocr_stride=OCR_STRIDE, ocr_refine_radius=OCR_REFINE_RADIUS,
-                      vlm_max_calls=32):
+                      vlm_max_calls=32, sticker_max_frames=None,
+                      sticker_prompt=None, sticker_score=None,
+                      sticker_max_area_ratio=None):
         """处理单条视频：反馈式 OCR 和轨迹检测，然后按帧或分段修复。
 
         :param region: (ymin, ymax, xmin, xmax) 字幕区域;None = 全屏检测
@@ -744,6 +786,13 @@ class Pipeline:
         :param white_glyph_check: 白字自检开关(白字幕场景必开;彩色字幕场景关闭,
                                   避免把画面中的白色物体误当残留)
         :param progress: 回调 fn(done_frames, total_frames, stage)
+        :param vlm_max_calls: 仅 vlm 后端生效，单视频最大请求次数
+        :param sticker_max_frames: 仅 gdino 后端生效，最大采样帧数
+        :param sticker_prompt: 仅 gdino 后端生效，开放词汇提示串。默认串按实测素材
+                               标定，换素材若召回不足需针对性补充短语
+        :param sticker_score: 仅 gdino 后端生效，置信度下限
+        :param sticker_max_area_ratio: 仅 gdino 后端生效，框面积占 crop 的上限。
+                                       这是区分 emoji 与整幅物体误检的关键判据
         """
         input_path, output_path = os.fspath(input_path), os.fspath(output_path)
         mode = 'full-frame' if region is None else 'roi'
@@ -758,6 +807,8 @@ class Pipeline:
             raise ValueError(f'字幕区域超出视频尺寸 {w}x{h}: {region}')
         ocr_stride, ocr_refine_radius = max(1, int(ocr_stride)), max(1, int(ocr_refine_radius))
         vlm_max_calls = max(1, int(vlm_max_calls))
+        if sticker_max_frames is None:
+            sticker_max_frames = sticker_detect.DEFAULT_MAX_FRAMES
         t0 = time.time()
         print(f'[detect] mode={mode} roi={region} stride={ocr_stride} adaptive=feedback')
         all_boxes, detection = self._detect_timeline(
@@ -769,19 +820,30 @@ class Pipeline:
         sticker_boxes = {}
         if locate_stickers:
             try:
-                samples = plan_vlm_frames(total, all_boxes, vlm_max_calls, max(1, round(fps)),
-                                          scene_change_frames=detection['scene_change_frames'])
-                hits = locate_stickers_vlm(input_path, region, sample_frames=samples,
-                                           max_calls=vlm_max_calls)
+                if self.sticker_backend == 'gdino':
+                    # 本地推理无调用预算,采样密度只受算力约束;采样越密,
+                    # associate_sticker_hits 的"成功但为空"证据越多,轨迹越准
+                    budget = max(1, int(sticker_max_frames))
+                    samples = plan_vlm_frames(total, all_boxes, budget, max(1, round(fps)),
+                                              scene_change_frames=detection['scene_change_frames'])
+                    hits = locate_stickers_gdino(
+                        input_path, region, samples, self._ensure_sticker_detector(),
+                        prompt=sticker_prompt, score_threshold=sticker_score,
+                        max_area_ratio=sticker_max_area_ratio)
+                else:
+                    samples = plan_vlm_frames(total, all_boxes, vlm_max_calls, max(1, round(fps)),
+                                              scene_change_frames=detection['scene_change_frames'])
+                    hits = locate_stickers_vlm(input_path, region, sample_frames=samples,
+                                               max_calls=vlm_max_calls)
                 associated = associate_sticker_hits(hits, all_boxes, total,
                     max_gap=max(1, round(fps * 2)), scene_change_frames=detection['scene_change_frames'])
                 sticker_boxes = {i: [(max(ry1, y1 - STICKER_MASK_PAD), min(ry2, y2 + STICKER_MASK_PAD),
                                       max(rx1, x1 - STICKER_MASK_PAD), min(rx2, x2 + STICKER_MASK_PAD))
                                      for y1, y2, x1, x2 in boxes]
                                  for i, boxes in associated.items()}
-                print(f'[sticker-vlm] associated_frames={len(sticker_boxes)}')
+                print(f'[sticker-{self.sticker_backend}] associated_frames={len(sticker_boxes)}')
             except Exception as exc:
-                print(f'[sticker-vlm] 跳过贴纸层: {type(exc).__name__}')
+                print(f'[sticker-{self.sticker_backend}] 跳过贴纸层: {type(exc).__name__}')
 
         # 第二遍:修复 + 写出
         frame_tb = 1 / rate
@@ -971,7 +1033,7 @@ def main():
     ap.add_argument('--ocr-refine-radius', type=int, default=OCR_REFINE_RADIUS,
                     help='检测变化时向前补查的最大帧数,默认 15')
     ap.add_argument('--vlm-max-calls', type=int, default=32,
-                    help='单视频 DashScope 最大请求次数(含失败),默认 32')
+                    help='vlm 后端单视频最大请求次数(含失败),默认 32')
     ap.add_argument('--no-white-glyph-check', action='store_true',
                     help='关闭白字自检(彩色字幕场景)')
     ap.add_argument('--threads', type=int, default=None, help='torch CPU 线程数(多 worker 并发时调小)')
@@ -980,11 +1042,30 @@ def main():
     ap.add_argument('--inpaint-mode', default='lama', choices=['lama', 'propainter'],
                     help='lama=单帧快速;propainter=时序修复(质量高,需 GPU,显存大)')
     ap.add_argument('--no-locate-stickers', dest='locate_stickers', action='store_false',
-                    help='关闭 VLM 贴纸/emoji 定位(默认开启;需 DASHSCOPE_API_KEY,'
-                         '未设置时自动跳过并保留 emoji)')
+                    help='关闭贴纸/emoji 定位(默认开启)')
+    ap.add_argument('--sticker-backend', default=DEFAULT_STICKER_BACKEND,
+                    choices=list(STICKER_BACKENDS),
+                    help='贴纸定位后端:vlm=DashScope(默认,需 DASHSCOPE_API_KEY,'
+                         '未设置时自动跳过并保留 emoji);'
+                         'gdino=本地 GroundingDINO(需权重,无 API 依赖,可密集采样)')
+    ap.add_argument('--sticker-model-id', default=None,
+                    help=f'gdino 后端的模型 ID,默认 {sticker_detect.DEFAULT_MODEL_ID}')
+    ap.add_argument('--sticker-max-frames', type=int, default=None,
+                    help=f'gdino 后端最大采样帧数,默认 {sticker_detect.DEFAULT_MAX_FRAMES}')
+    ap.add_argument('--sticker-prompt', default=None,
+                    help='gdino 后端的开放词汇提示串(短语以 . 分隔)。'
+                         '默认串按实测素材标定,换素材召回不足时需补充对应短语')
+    ap.add_argument('--sticker-score', type=float, default=None,
+                    help=f'gdino 后端置信度下限,默认 {sticker_detect.DEFAULT_SCORE_THRESHOLD}')
+    ap.add_argument('--sticker-max-area-ratio', type=float, default=None,
+                    help='gdino 后端框面积占检测区域的上限,默认 '
+                         f'{sticker_detect.DEFAULT_MAX_AREA_RATIO}。这是区分 emoji '
+                         '与整幅物体误检的关键判据,随素材的 emoji 显示尺寸标定')
     args = ap.parse_args()
 
-    pipe = Pipeline(threads=args.threads, device=args.device, inpaint_mode=args.inpaint_mode)
+    pipe = Pipeline(threads=args.threads, device=args.device, inpaint_mode=args.inpaint_mode,
+                    sticker_backend=args.sticker_backend,
+                    sticker_model_id=args.sticker_model_id)
     stat = pipe.process_video(
         args.input, args.output,
         region=tuple(args.region) if args.region else None,
@@ -992,6 +1073,10 @@ def main():
         locate_stickers=args.locate_stickers,
         ocr_stride=args.ocr_stride, ocr_refine_radius=args.ocr_refine_radius,
         vlm_max_calls=args.vlm_max_calls,
+        sticker_max_frames=args.sticker_max_frames,
+        sticker_prompt=args.sticker_prompt,
+        sticker_score=args.sticker_score,
+        sticker_max_area_ratio=args.sticker_max_area_ratio,
         progress=lambda d, t, s: print(f'  进度 {d}/{t} ({s})'))
     print('统计:', stat)
 
