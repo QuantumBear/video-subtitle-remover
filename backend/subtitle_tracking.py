@@ -271,8 +271,10 @@ def associate_sticker_hits(
     ``hits`` 必须保留成功但未发现贴纸的空列表，失败请求则不应进入
     ``hits``。任一成功采样中的目标缺失都会终止该目标轨迹。单次命中
     只传播指定半径；稳定轨迹向最近缺失采样的中点扩展，最多扩展
-    ``max_gap`` 帧。匹配和传播均限制在同一场景，每个输出框仍须靠近
-    同场景、同帧或时间半径内的字幕。
+    ``max_gap`` 帧。匹配和传播均限制在同一场景。字幕邻近只是单次
+    命中的兜底证据（防孤立误检）；多帧稳定轨迹以面积/分数判据和
+    采样缺席证据为准，不要求靠近字幕——贴纸排与字幕分行的版式下
+    硬性邻近门槛会误杀全部合法检出。
     """
     total_frames = int(total_frames)
     if total_frames <= 0:
@@ -347,8 +349,9 @@ def associate_sticker_hits(
                     track.frames[right] - track.frames[right - 1]
                 )
                 box = tuple(round(a[i] + (b[i] - a[i]) * ratio) for i in range(4))
-            if near_text(frame_no, box):
-                result.setdefault(frame_no, []).append(box)
+            if single_hit and not near_text(frame_no, box):
+                continue
+            result.setdefault(frame_no, []).append(box)
     return result
 
 

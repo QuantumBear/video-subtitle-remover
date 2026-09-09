@@ -127,14 +127,6 @@ def test_single_hit_cannot_borrow_subtitles_from_another_scene():
     assert result == {}
 
 
-def test_stable_hits_cannot_borrow_subtitles_from_another_scene():
-    result = tracking.associate_sticker_hits(
-        {12: [STICKER], 14: [STICKER]},
-        text_timeline(30, start=15),
-        30,
-        scene_change_frames=[15],
-    )
-    assert result == {}
 
 
 def test_sticker_gap_larger_than_limit_is_not_filled():
@@ -179,17 +171,33 @@ def test_sticker_grouping_matches_gradual_movement_against_latest_box():
     assert groups[0][1] == list(range(0, 101, 10))
 
 
-def test_stable_sticker_also_requires_nearby_subtitles():
+def test_stable_track_survives_without_nearby_subtitles():
+    """稳定轨迹不依赖字幕邻近：面积判据已是主要防误检手段，字幕邻近只是
+    单帧命中的兜底。真实场景中贴纸排(y~500)与字幕(y~800)相距 245px,
+    硬性邻近门槛会把合法检出全部误杀。"""
     far = (10, 45, 600, 635)
-    assert tracking.associate_sticker_hits(
+    result = tracking.associate_sticker_hits(
         {10: [far], 20: [far]}, text_timeline(40), 40
-    ) == {}
+    )
+    assert set(result) == set(range(4, 27))
 
 
-def test_stable_sticker_propagation_respects_short_text_window():
+def test_stable_track_propagation_bounds_without_subtitles():
+    """豁免字幕邻近后,传播范围仍由单命中半径决定(各 ±6 帧)。"""
     hits = {10: [STICKER], 40: [STICKER]}
     result = tracking.associate_sticker_hits(hits, text_timeline(60, 20, 25), 60)
-    assert set(result) == set(range(14, 32))
+    assert set(result) == set(range(4, 47))
+
+
+def test_stable_track_without_subtitles_stays_inside_its_scene():
+    """字幕缺失时场景边界仍然生效:稳定轨迹不得跨场景输出。"""
+    result = tracking.associate_sticker_hits(
+        {12: [STICKER], 14: [STICKER]},
+        text_timeline(30, start=15),
+        30,
+        scene_change_frames=[15],
+    )
+    assert set(result) == set(range(6, 15))
 
 
 def test_moving_sticker_interpolates_boxes_without_spatial_union():
