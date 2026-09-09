@@ -104,8 +104,8 @@ def _run_task(task: Task):
                '-i', task.input_path, '-o', task.output_path]
         if task.region:
             cmd += ['-c', *[str(x) for x in task.region]]
-        if not task.white_glyph_check:
-            cmd += ['--no-white-glyph-check']
+        if task.white_glyph_check:
+            cmd += ['--white-glyph-check']
         cmd += ['--inpaint-mode', task.inpaint_mode]
         if not task.locate_stickers:
             cmd += ['--no-locate-stickers']
@@ -149,7 +149,7 @@ def _validate_region(region: str):
 @app.post('/tasks', status_code=202)
 async def create_task(file: UploadFile = File(...),
                       region: str = Form(''),
-                      white_glyph_check: bool = Form(True),
+                      white_glyph_check: bool = Form(False),
                       inpaint_mode: str = Form('lama'),
                       locate_stickers: bool = Form(True),
                       sticker_backend: str = Form('vlm')):

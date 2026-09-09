@@ -56,7 +56,8 @@ def test_completed_glyphs_reach_model_and_composition_even_from_empty_masks(tmp_
         return [np.full_like(frame, 80) for frame in frames]
 
     pipe.inpainter = SimpleNamespace(inpaint=inpaint)
-    stats = pipe.process_video(source, output, locate_stickers=False, white_glyph_check=False)
+    stats = pipe.process_video(source, output, locate_stickers=False,
+                               template_refine=True, white_glyph_check=False)
     json.dumps(stats)
     assert len(model_masks) == 4
     assert all(np.array_equal(mask, complete) for mask in model_masks)
@@ -65,6 +66,35 @@ def test_completed_glyphs_reach_model_and_composition_even_from_empty_masks(tmp_
         frames = [f.to_ndarray(format="rgb24") for f in container.decode(video=0)]
     assert len(frames) == 4
     assert all(np.abs(f[complete > 0].astype(float) - 80).mean() < 3 for f in frames)
+
+
+def test_template_refine_disabled_by_default_for_diagnosis(tmp_path):
+    """诊断开关:模板补全默认关闭,原始 OCR mask 原样进模型。
+
+    服务器验证 0-3 秒残留根因时需默认禁用 templates.refine 与白字自检;
+    本测试锁定默认禁用状态,后续若恢复默认开启需同步更新。
+    """
+    image, box = text_frame()
+    source, output = tmp_path / "source.mp4", tmp_path / "result.mp4"
+    write_frames(source, [image] * 4)
+    pipe = Pipeline.__new__(Pipeline)
+    pipe.inpaint_mode = "propainter"
+    pipe.detect = lambda *args: [box]
+    complete = pipe.propainter_boxes_to_mask([box], image, (0, 128, 0, 360))
+    provided = iter([complete] + [np.zeros_like(complete)] * 3)
+    pipe.propainter_boxes_to_mask = lambda *args, **kwargs: next(provided).copy()
+    model_masks = []
+
+    def inpaint(frames, masks):
+        model_masks.extend(m.copy() for m in masks)
+        return [np.full_like(frame, 80) for frame in frames]
+
+    pipe.inpainter = SimpleNamespace(inpaint=inpaint)
+    stats = pipe.process_video(source, output, locate_stickers=False,
+                               white_glyph_check=False)
+    assert stats["template_recovered"] == 0
+    assert np.array_equal(model_masks[0], complete)
+    assert all(not mask.any() for mask in model_masks[1:])
 
 
 def test_unresolved_after_bounded_retry_is_reported(tmp_path, capsys):
@@ -81,7 +111,8 @@ def test_unresolved_after_bounded_retry_is_reported(tmp_path, capsys):
         return [frame.copy() for frame in frames]
 
     pipe.inpainter = SimpleNamespace(inpaint=inpaint)
-    stats = pipe.process_video(source, output, locate_stickers=False)
+    stats = pipe.process_video(source, output, locate_stickers=False,
+                               template_refine=True, white_glyph_check=True)
     assert len(calls) == 2
     assert stats["unresolved"] == 4
     assert "疑似残留 4" in capsys.readouterr().out
@@ -96,7 +127,8 @@ def test_unrecoverable_empty_masks_do_not_load_model(tmp_path):
     pipe.detect = lambda *args: [box]
     pipe.propainter_boxes_to_mask = lambda *args, **kwargs: np.zeros(image.shape[:2], np.uint8)
     pipe._ensure_propainter = lambda: pytest.fail("empty masks loaded model")
-    stats = pipe.process_video(source, output, locate_stickers=False)
+    stats = pipe.process_video(source, output, locate_stickers=False,
+                               white_glyph_check=True)
     assert stats["frames"] == 4 and stats["inpainted"] == 0
     assert stats["unresolved"] == 4
 
@@ -114,7 +146,8 @@ def test_final_audit_failure_keeps_first_pass_and_reports_unchecked_frames(tmp_p
         raise cv2.error("test check failure")
 
     pipe._residual_mask = fail_check
-    stats = pipe.process_video(source, output, locate_stickers=False)
+    stats = pipe.process_video(source, output, locate_stickers=False,
+                               white_glyph_check=True)
     assert stats["residual_check_failed"] == 4
     assert "复核未完成 4" in capsys.readouterr().out
     with av.open(str(output)) as container:
@@ -147,7 +180,8 @@ def test_matching_subtitle_survives_scene_cut_without_mixing_model_frames(tmp_pa
 
     pipe.inpainter = SimpleNamespace(inpaint=inpaint)
     stats = pipe.process_video(source, output, region=region,
-                               locate_stickers=False, white_glyph_check=False)
+                               locate_stickers=False, template_refine=True,
+                               white_glyph_check=False)
     assert [len(frames) for frames, _ in calls] == [3, 3]
     for (frames, _), expected in zip(calls, [clear, bright]):
         assert all(np.array_equal(frame, expected) for frame in frames)
@@ -181,7 +215,8 @@ def test_scene_cut_cannot_copy_changed_or_disappeared_subtitles(tmp_path, source
 
     pipe.inpainter = SimpleNamespace(inpaint=inpaint)
     stats = pipe.process_video(source, output, region=region,
-                               locate_stickers=False, white_glyph_check=False)
+                               locate_stickers=False, template_refine=True,
+                               white_glyph_check=False)
     assert stats["frames"] == 6 and stats["template_recovered"] == 0
     if target_text:
         assert [len(masks) for masks in calls] == [3, 3]

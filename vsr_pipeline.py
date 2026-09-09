@@ -779,7 +779,8 @@ class Pipeline:
         return expanded
 
     def process_video(self, input_path, output_path, region=None,
-                      white_glyph_check=True, progress=None, locate_stickers=True,
+                      template_refine=False, white_glyph_check=False,
+                      progress=None, locate_stickers=True,
                       ocr_stride=OCR_STRIDE, ocr_refine_radius=OCR_REFINE_RADIUS,
                       vlm_max_calls=32, sticker_max_frames=None,
                       sticker_prompt=None, sticker_score=None,
@@ -789,8 +790,11 @@ class Pipeline:
         :param region: (ymin, ymax, xmin, xmax) 字幕区域;None 时自动推断字幕带,
                        推断失败回退全屏
         :param ocr_stride: 稳定检测时逐步增大的帧间隔上限，默认 5
-        :param white_glyph_check: 白字自检开关(白字幕场景必开;彩色字幕场景关闭,
-                                  避免把画面中的白色物体误当残留)
+        :param template_refine: 字幕模板补全开关。诊断期间默认关闭(疑似把正确
+                                mask 改坏导致 0-3 秒残留),定位后按结论调整
+        :param white_glyph_check: 白字自检复修开关。诊断期间默认关闭(复修同样
+                                  缺未来上下文,疑似固化段尾残留);白字幕场景
+                                  定位完成后需恢复开启
         :param progress: 回调 fn(done_frames, total_frames, stage)
         :param vlm_max_calls: 仅 vlm 后端生效，单视频最大请求次数
         :param sticker_max_frames: 仅 gdino 后端生效，最大采样帧数
@@ -893,10 +897,13 @@ class Pipeline:
                 nonlocal n_recovered, n_unresolved, n_check_failed
                 if not seg_frames or n_out <= 0:
                     return
-                effective_masks, effective_boxes = templates.refine(
-                    seg_frames, seg_masks, seg_boxes, seg_pts)
-                n_recovered += sum(np.any((new > 0) & (old == 0))
-                                   for new, old in zip(effective_masks[:n_out], seg_masks[:n_out]))
+                if template_refine:
+                    effective_masks, effective_boxes = templates.refine(
+                        seg_frames, seg_masks, seg_boxes, seg_pts)
+                    n_recovered += sum(np.any((new > 0) & (old == 0))
+                                       for new, old in zip(effective_masks[:n_out], seg_masks[:n_out]))
+                else:
+                    effective_masks, effective_boxes = seg_masks, seg_boxes
                 if any(mask.any() for mask in effective_masks):
                     self._ensure_propainter()
                     comps, repairs = self._repair_propainter_segment(
@@ -1048,8 +1055,10 @@ def main():
                     help='检测变化时向前补查的最大帧数,默认 15')
     ap.add_argument('--vlm-max-calls', type=int, default=32,
                     help='vlm 后端单视频最大请求次数(含失败),默认 32')
-    ap.add_argument('--no-white-glyph-check', action='store_true',
-                    help='关闭白字自检(彩色字幕场景)')
+    ap.add_argument('--white-glyph-check', action='store_true',
+                    help='开启白字自检复修(诊断期间默认关闭)')
+    ap.add_argument('--template-refine', action='store_true',
+                    help='开启字幕模板补全(诊断期间默认关闭)')
     ap.add_argument('--threads', type=int, default=None, help='torch CPU 线程数(多 worker 并发时调小)')
     ap.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'],
                     help="推理设备:auto=有 CUDA 用 GPU(默认)")
@@ -1084,7 +1093,8 @@ def main():
     stat = pipe.process_video(
         args.input, args.output,
         region=tuple(args.region) if args.region else None,
-        white_glyph_check=not args.no_white_glyph_check,
+        white_glyph_check=args.white_glyph_check,
+        template_refine=args.template_refine,
         locate_stickers=args.locate_stickers,
         ocr_stride=args.ocr_stride, ocr_refine_radius=args.ocr_refine_radius,
         vlm_max_calls=args.vlm_max_calls,
