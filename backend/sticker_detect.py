@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """本地开放词汇贴纸/emoji 检测（GroundingDINO）。
 
-与 DashScope VLM 路径（``vsr_pipeline.locate_stickers_vlm``）等价可换：
-两者都返回 ``{帧号: [(ymin, ymax, xmin, xmax), ...]}`` 的未外扩原始框，
-外扩与时序关联统一由 ``backend.subtitle_tracking`` 承担。
+兼容的 ``locate`` 返回采样原始框；生产流水线使用 ``detect_candidates``
+保留分数，由 ``backend.sticker_tracking`` 做逐帧外观核验和反馈补查。
+两条路径都输出未外扩框，遮罩外扩由流水线统一处理。
 
-相对 VLM 的取舍：无 API Key 依赖、无单视频调用预算上限、可密集采样；
+相对 VLM 的取舍：无 API Key 依赖、无 API 费用，模型调用仍受帧预算约束；
 代价是需本地权重（约 658MB）与一次显存占用。
 
 判据标定（720×560 crop）：
@@ -18,6 +18,8 @@
 两个阈值都随素材的 emoji 显示尺寸与样式变化，换素材需重新标定。
 """
 import os
+from dataclasses import dataclass
+from math import isfinite
 from typing import Dict, List, Sequence, Tuple
 
 Box = Tuple[int, int, int, int]
@@ -39,6 +41,14 @@ DEFAULT_MAX_AREA_PX = 1200       # 绝对像素上限；emoji 实测最大 898px
 DEFAULT_MAX_FRAMES = 200          # 本地推理无 API 成本，采样密度只受算力约束
 
 
+@dataclass(frozen=True)
+class StickerCandidate:
+    """未外扩的全帧整数框与原始检测置信度。"""
+
+    box: Box
+    score: float
+
+
 def filter_detections(
     detections: Sequence[dict],
     score_threshold: float = DEFAULT_SCORE_THRESHOLD,
@@ -51,17 +61,25 @@ def filter_detections(
     面积用绝对像素而非相对比例：ROI 自适应后裁剪尺寸变化较大，
     比例判据会漂移；绝对像素不随裁剪尺寸变化，判据一致性更好。
     """
+    return [box for _, box in _filter_scored_detections(
+        detections, score_threshold, max_area_px)]
+
+
+def _filter_scored_detections(detections, score_threshold, max_area_px):
     max_area = max(1.0, float(max_area_px))
     kept = []
     for det in detections:
-        if float(det['score']) < score_threshold:
+        score = float(det['score'])
+        if not isfinite(score) or score < score_threshold:
             continue
         x1, y1, x2, y2 = (float(v) for v in det['box'])
+        if not all(isfinite(v) for v in (x1, y1, x2, y2)):
+            continue
         if x1 >= x2 or y1 >= y2:
             continue
         if (x2 - x1) * (y2 - y1) > max_area:
             continue
-        kept.append((x1, y1, x2, y2))
+        kept.append((score, (x1, y1, x2, y2)))
     return kept
 
 
@@ -75,6 +93,37 @@ def to_frame_box(crop_box: Sequence[float], region: Sequence[int]) -> Box:
     ymin, ymax, xmin, xmax = region
     return (max(ymin, int(y1) + ymin), min(ymax, int(y2) + ymin),
             max(xmin, int(x1) + xmin), min(xmax, int(x2) + xmin))
+
+
+def filter_candidates(
+    detections: Sequence[dict],
+    region: Sequence[int],
+    score_threshold: float = DEFAULT_SCORE_THRESHOLD,
+    max_area_px: float = DEFAULT_MAX_AREA_PX,
+) -> List[StickerCandidate]:
+    """保留弱检测置信度，按分数降序去重后返回未外扩的全帧候选框。"""
+    candidates = []
+    for score, crop_box in _filter_scored_detections(
+            detections, min(0.15, score_threshold), max_area_px):
+        box = to_frame_box(crop_box, region)
+        if box[0] < box[1] and box[2] < box[3]:
+            candidates.append(StickerCandidate(box, score))
+    kept = []
+    for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
+        if not any(_box_iou(candidate.box, other.box) >= 0.6 for other in kept):
+            kept.append(candidate)
+    return kept
+
+
+def _box_iou(first: Box, second: Box) -> float:
+    top = max(first[0], second[0])
+    bottom = min(first[1], second[1])
+    left = max(first[2], second[2])
+    right = min(first[3], second[3])
+    intersection = max(0, bottom - top) * max(0, right - left)
+    first_area = (first[1] - first[0]) * (first[3] - first[2])
+    second_area = (second[1] - second[0]) * (second[3] - second[2])
+    return intersection / (first_area + second_area - intersection)
 
 
 class GroundingDinoStickerDetector:
@@ -92,9 +141,7 @@ class GroundingDinoStickerDetector:
         self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id)
         self.model = self.model.to(self.device).eval()
 
-    def detect_crop(self, crop, prompt: str, score_threshold: float,
-                    max_area_px: float) -> List[Tuple[float, float, float, float]]:
-        """对单张 RGB crop 推理，返回已过滤的 crop 坐标框。"""
+    def _infer_detections(self, crop, prompt: str, score_threshold: float) -> List[dict]:
         import torch
         from PIL import Image
 
@@ -103,17 +150,30 @@ class GroundingDinoStickerDetector:
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.inference_mode():
             outputs = self.model(**inputs)
-        # 后处理阈值取得比判据低，细筛统一交给 filter_detections，
-        # 便于离线复算判据时无需重跑推理。
+        # 后处理保留弱检测，由调用接口选择候选筛选或强阈值筛选。
         results = self.processor.post_process_grounded_object_detection(
             outputs, inputs['input_ids'],
             box_threshold=min(0.15, score_threshold),
             text_threshold=min(0.15, score_threshold),
             target_sizes=[pil.size[::-1]],
         )[0]
-        detections = [{'score': float(s), 'box': [float(v) for v in b]}
-                      for s, b in zip(results['scores'], results['boxes'])]
-        return filter_detections(detections, score_threshold, max_area_px)
+        return [{'score': float(s), 'box': [float(v) for v in b]}
+                for s, b in zip(results['scores'], results['boxes'])]
+
+    def detect_crop(self, crop, prompt: str, score_threshold: float,
+                    max_area_px: float) -> List[Tuple[float, float, float, float]]:
+        """对单张 RGB crop 推理，返回已过滤的 crop 坐标框。"""
+        return filter_detections(
+            self._infer_detections(crop, prompt, score_threshold),
+            score_threshold, max_area_px)
+
+    def detect_candidates(self, crop, region: Sequence[int], prompt: str,
+                          score_threshold: float,
+                          max_area_px: float) -> List[StickerCandidate]:
+        """对单张 RGB crop 推理一次，返回保留置信度的全帧候选框。"""
+        return filter_candidates(
+            self._infer_detections(crop, prompt, score_threshold),
+            region, score_threshold, max_area_px)
 
     def locate(self, video_path, region: Sequence[int], sample_frames: Sequence[int],
                prompt: str = DEFAULT_PROMPT,
@@ -121,9 +181,8 @@ class GroundingDinoStickerDetector:
                max_area_px: float = DEFAULT_MAX_AREA_PX) -> Dict[int, List[Box]]:
         """按采样帧定位贴纸，返回 ``{帧号: [未外扩全帧框]}``。
 
-        本地推理不会像 API 那样失败，因此每个采样帧都会留下条目（无贴纸即空列表）。
-        ``associate_sticker_hits`` 依赖"成功但为空"的采样来终止轨迹，
-        条目齐全反而让时序关联比 VLM 路径更准。
+        兼容旧接口，成功但无贴纸留下空列表，推理失败抛出异常。
+        此接口不做外观续跟；生产路径使用 ``detect_candidates``。
         """
         import av
         import numpy as np

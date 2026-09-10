@@ -76,6 +76,124 @@ def test_to_frame_box_clips_to_region_bounds():
                                        (450, 1010, 0, 720)) == (450, 1010, 0, 720)
 
 
+def test_candidates_keep_weak_scores_and_unpadded_frame_coordinates():
+    weak = {'score': 0.21, 'box': [10.4, 20.4, 30.8, 40.8]}
+    candidates = sticker_detect.filter_candidates([weak], (100, 200, 300, 400))
+
+    assert candidates == [sticker_detect.StickerCandidate((120, 140, 310, 330), 0.21)]
+    assert sticker_detect.filter_detections([weak]) == []
+
+
+def test_candidates_deduplicate_overlapping_labels_by_highest_score():
+    detections = [
+        {'score': 0.4, 'box': [0, 0, 20, 20], 'label': 'emoji'},
+        {'score': 0.8, 'box': [5, 0, 25, 20], 'label': 'sticker'},
+        {'score': 0.6, 'box': [26, 0, 46, 20], 'label': 'emoji'},
+    ]
+
+    assert sticker_detect.filter_candidates(detections, (100, 200, 300, 400)) == [
+        sticker_detect.StickerCandidate((100, 120, 305, 325), 0.8),
+        sticker_detect.StickerCandidate((100, 120, 326, 346), 0.6),
+    ]
+
+
+@pytest.mark.parametrize('invalid', [
+    {'score': float('nan'), 'box': [10, 10, 30, 30]},
+    {'score': float('inf'), 'box': [10, 10, 30, 30]},
+    {'score': float('-inf'), 'box': [10, 10, 30, 30]},
+    {'score': 0.9, 'box': [float('nan'), 10, 30, 30]},
+    {'score': 0.9, 'box': [10, float('inf'), 30, 30]},
+    {'score': 0.9, 'box': [10, 10, float('inf'), 30]},
+    {'score': 0.9, 'box': [10, 10, 30, float('nan')]},
+    {'score': 0.9, 'box': [10, 10, 10, 30]},
+    {'score': 0.9, 'box': [30, 10, 10, 30]},
+    {'score': 0.9, 'box': [10, 10, 30, 10]},
+    {'score': 0.9, 'box': [-30, 10, -10, 30]},
+    {'score': 0.9, 'box': [110, 10, 130, 30]},
+    {'score': 0.9, 'box': [10.1, 10.1, 10.9, 30.9]},
+])
+def test_candidates_reject_invalid_scores_and_crop_or_frame_boxes(invalid):
+    valid = {'score': 0.5, 'box': [10, 10, 30, 30]}
+
+    assert sticker_detect.filter_candidates([invalid, valid], (100, 200, 300, 400)) == [
+        sticker_detect.StickerCandidate((110, 130, 310, 330), 0.5),
+    ]
+
+
+@pytest.mark.parametrize(('score', 'threshold', 'kept'), [
+    (0.149, 0.25, False),
+    (0.15, 0.25, True),
+    (0.099, 0.1, False),
+    (0.1, 0.1, True),
+    (0.14, 0.1, True),
+])
+def test_candidate_score_floor_respects_lower_user_threshold(score, threshold, kept):
+    detections = [{'score': score, 'box': [10, 10, 30, 30]}]
+
+    candidates = sticker_detect.filter_candidates(
+        detections, (100, 200, 300, 400), score_threshold=threshold)
+
+    assert candidates == (
+        [sticker_detect.StickerCandidate((110, 130, 310, 330), score)] if kept else [])
+
+
+def test_candidate_area_limit_applies_before_rounding_and_clipping():
+    detections = [
+        {'score': 0.9, 'box': [0.1, 0.1, 30.2, 40.1]},
+        {'score': 0.9, 'box': [-100, 0, 10, 20]},
+        {'score': 0.5, 'box': [40, 0, 70, 40]},
+    ]
+
+    assert sticker_detect.filter_candidates(detections, (100, 200, 300, 400)) == [
+        sticker_detect.StickerCandidate((100, 140, 340, 370), 0.5),
+    ]
+
+
+def test_detect_candidates_preserves_weak_results_from_one_inference():
+    import numpy as np
+    import torch
+
+    calls = {'model': 0}
+
+    class FakeProcessor:
+        def __call__(self, images, text, return_tensors):
+            assert text == 'emoji. sticker.'
+            assert images.size == (100, 100)
+            return {'input_ids': torch.tensor([[1]])}
+
+        def post_process_grounded_object_detection(self, outputs, input_ids, **kwargs):
+            calls['postprocess'] = kwargs
+            return [{'scores': [0.8, 0.21], 'boxes': [[10, 10, 30, 30], [40, 10, 60, 30]]}]
+
+    class FakeModel:
+        def __call__(self, **inputs):
+            calls['model'] += 1
+            return object()
+
+    detector = sticker_detect.GroundingDinoStickerDetector.__new__(
+        sticker_detect.GroundingDinoStickerDetector)
+    detector.device = torch.device('cpu')
+    detector.processor = FakeProcessor()
+    detector.model = FakeModel()
+    crop = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    candidates = detector.detect_candidates(
+        crop, (100, 200, 300, 400), 'emoji. sticker.', 0.25, 1200)
+
+    assert candidates == [
+        sticker_detect.StickerCandidate((110, 130, 310, 330), 0.8),
+        sticker_detect.StickerCandidate((110, 130, 340, 360), 0.21),
+    ]
+    assert calls['model'] == 1
+    assert calls['postprocess'] == {
+        'box_threshold': 0.15, 'text_threshold': 0.15, 'target_sizes': [(100, 100)],
+    }
+    assert detector.detect_crop(crop, 'emoji. sticker.', 0.25, 1200) == [
+        (10.0, 10.0, 30.0, 30.0),
+    ]
+    assert calls['model'] == 2
+
+
 # ---- 后端分流 ----
 
 def test_unknown_sticker_backend_is_rejected():

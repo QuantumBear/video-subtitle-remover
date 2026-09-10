@@ -271,19 +271,26 @@ DEFAULT_STICKER_BACKEND = 'vlm'   # 保持默认行为不变；本地后端需�
 
 
 def locate_stickers_gdino(video_path, region, sample_frames, detector,
-                          prompt=None, score_threshold=None, max_area_px=None):
-    """用常驻的本地检测器定位贴纸原始框，语义与 locate_stickers_vlm 对齐。
-
-    与 VLM 路径的差异只在"哪来的框":本地推理无调用预算、无 Key 依赖，
-    可密集采样;关联与外扩仍由轨迹层统一承担。
-    """
-    return detector.locate(
-        video_path, region, sample_frames,
+                          prompt=None, score_threshold=None, max_area_px=None,
+                          *, text_timeline=None, total_frames=None, max_calls=None,
+                          scene_change_frames=(), max_gap=60, base_step=30):
+    """兼容采样框调用；提供时间线上下文时返回逐帧外观确认后的原始框。"""
+    options = dict(
         prompt=prompt or sticker_detect.DEFAULT_PROMPT,
         score_threshold=(sticker_detect.DEFAULT_SCORE_THRESHOLD
                          if score_threshold is None else score_threshold),
         max_area_px=(sticker_detect.DEFAULT_MAX_AREA_PX
                      if max_area_px is None else max_area_px))
+    if text_timeline is None:
+        return detector.locate(video_path, region, sample_frames, **options)
+    from backend.sticker_tracking import locate_tracked_stickers
+
+    boxes, _ = locate_tracked_stickers(
+        video_path, region, sample_frames, detector, text_timeline, total_frames,
+        max_calls=sticker_detect.DEFAULT_MAX_FRAMES if max_calls is None else max_calls,
+        scene_change_frames=scene_change_frames, max_gap=max_gap, base_step=base_step,
+        **options)
+    return boxes
 
 
 # ---------- 模型单例(worker 进程内 import 一次,处理多条视频复用) ----------
@@ -736,15 +743,14 @@ class Pipeline:
         :param ocr_stride: 稳定检测时逐步增大的帧间隔上限，默认 5
         :param template_refine: 字幕模板补全开关。诊断期间默认关闭(疑似把正确
                                 mask 改坏导致 0-3 秒残留),定位后按结论调整
-        :param white_glyph_check: 白字自检复修开关。诊断期间默认关闭(复修同样
-                                  缺未来上下文,疑似固化段尾残留);白字幕场景
-                                  定位完成后需恢复开启
+        :param white_glyph_check: 白字结构检查与局部复修开关，默认关闭；
+                                  不检测彩色贴纸，也不能补回遗漏的贴纸遮罩
         :param progress: 回调 fn(done_frames, total_frames, stage)
         :param vlm_max_calls: 仅 vlm 后端生效，单视频最大请求次数
-        :param sticker_max_frames: 仅 gdino 后端生效，最大采样帧数
+        :param sticker_max_frames: 仅 gdino 后端生效，模型调用上限，含优先采样、反馈补查和失败
         :param sticker_prompt: 仅 gdino 后端生效，开放词汇提示串。默认串按实测素材
                                标定，换素材若召回不足需针对性补充短语
-        :param sticker_score: 仅 gdino 后端生效，置信度下限
+        :param sticker_score: 仅 gdino 后端生效，新贴纸的置信度下限；低分候选只能经外观核验续跟
         :param sticker_max_area_px: 仅 gdino 后端生效，贴纸框绝对像素面积上限。
                                     这是区分 emoji 与整幅物体误检的关键判据,
                                     用绝对像素而非相对比例,避免 ROI 尺寸变化时判据漂移
@@ -783,22 +789,25 @@ class Pipeline:
         if locate_stickers:
             try:
                 if self.sticker_backend == 'gdino':
-                    # 本地推理无调用预算,采样密度只受算力约束;采样越密,
-                    # associate_sticker_hits 的"成功但为空"证据越多,轨迹越准
-                    budget = max(1, int(sticker_max_frames))
+                    # 先保留优先采样，剩余预算用于反馈补查；逐帧只做局部外观核验。
+                    budget = max(0, int(sticker_max_frames))
                     samples = plan_vlm_frames(total, all_boxes, budget, max(1, round(fps)),
                                               scene_change_frames=detection['scene_change_frames'])
-                    hits = locate_stickers_gdino(
-                        input_path, region, samples, self._ensure_sticker_detector(),
+                    detector = self._ensure_sticker_detector() if samples else None
+                    associated = locate_stickers_gdino(
+                        input_path, region, samples, detector,
                         prompt=sticker_prompt, score_threshold=sticker_score,
-                        max_area_px=sticker_max_area_px)
+                        max_area_px=sticker_max_area_px, text_timeline=all_boxes,
+                        total_frames=total, max_calls=budget,
+                        scene_change_frames=detection['scene_change_frames'],
+                        max_gap=max(1, round(fps * 2)), base_step=max(1, round(fps)))
                 else:
                     samples = plan_vlm_frames(total, all_boxes, vlm_max_calls, max(1, round(fps)),
                                               scene_change_frames=detection['scene_change_frames'])
                     hits = locate_stickers_vlm(input_path, region, sample_frames=samples,
                                                max_calls=vlm_max_calls)
-                associated = associate_sticker_hits(hits, all_boxes, total,
-                    max_gap=max(1, round(fps * 2)), scene_change_frames=detection['scene_change_frames'])
+                    associated = associate_sticker_hits(hits, all_boxes, total,
+                        max_gap=max(1, round(fps * 2)), scene_change_frames=detection['scene_change_frames'])
                 sticker_boxes = {i: [(max(ry1, y1 - STICKER_MASK_PAD), min(ry2, y2 + STICKER_MASK_PAD),
                                       max(rx1, x1 - STICKER_MASK_PAD), min(rx2, x2 + STICKER_MASK_PAD))
                                      for y1, y2, x1, x2 in boxes]
@@ -975,13 +984,15 @@ class Pipeline:
             os.replace(final, output_path)
         else:
             os.replace(tmp_out, output_path)
+        check_status = str(n_checked) if white_glyph_check else '未启用'
         print(f'[done] {n} 帧 | 修复 {n_fixed} | 字形补全 {n_recovered} | '
-              f'残留复核 {n_checked} | 补擦 {n_repair} | 疑似残留 {n_unresolved} | '
+              f'残留复核 {check_status} | 补擦 {n_repair} | 疑似残留 {n_unresolved} | '
               f'复核未完成 {n_check_failed} | '
               f'耗时 {time.time() - t0:.0f}s → {output_path}')
         return {'frames': n, 'inpainted': n_fixed, 'repaired': n_repair,
                 'template_recovered': int(n_recovered), 'unresolved': n_unresolved,
                 'residual_check_failed': n_check_failed,
+                'residual_check_enabled': bool(white_glyph_check),
                 'ocr_calls': detection['ocr_calls'], 'tracks': detection['tracks'],
                 'seconds': time.time() - t0}
 
@@ -1018,12 +1029,12 @@ def main():
     ap.add_argument('--sticker-model-id', default=None,
                     help=f'gdino 后端的模型 ID,默认 {sticker_detect.DEFAULT_MODEL_ID}')
     ap.add_argument('--sticker-max-frames', type=int, default=None,
-                    help=f'gdino 后端最大采样帧数,默认 {sticker_detect.DEFAULT_MAX_FRAMES}')
+                    help=f'gdino 模型调用上限(含反馈补查与失败),默认 {sticker_detect.DEFAULT_MAX_FRAMES}')
     ap.add_argument('--sticker-prompt', default=None,
                     help='gdino 后端的开放词汇提示串(短语以 . 分隔)。'
                          '默认串按实测素材标定,换素材召回不足时需补充对应短语')
     ap.add_argument('--sticker-score', type=float, default=None,
-                    help=f'gdino 后端置信度下限,默认 {sticker_detect.DEFAULT_SCORE_THRESHOLD}')
+                    help=f'gdino 新目标置信度下限,低分仅可续跟,默认 {sticker_detect.DEFAULT_SCORE_THRESHOLD}')
     ap.add_argument('--sticker-max-area-px', type=float, default=None,
                     help=f'gdino 后端贴纸框绝对像素面积上限,默认 '
                          f'{sticker_detect.DEFAULT_MAX_AREA_PX}。这是区分 emoji 与'
