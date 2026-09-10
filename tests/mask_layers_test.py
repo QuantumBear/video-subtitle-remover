@@ -72,6 +72,58 @@ def test_short_white_text_preserves_gap():
     assert mask[40, 42] == 0
 
 
+def test_default_light_enhancement_covers_one_extra_glyph_edge_pixel():
+    """默认轻度增强应多覆盖一圈字形边缘，但不填充字间空白。"""
+    pipe = Pipeline.__new__(Pipeline)
+    frame = np.zeros((80, 100, 3), dtype=np.uint8)
+    frame[30:50, 20:35] = 255
+    frame[30:50, 50:65] = 255
+    mask = pipe.propainter_boxes_to_mask([(25, 55, 15, 75)], frame, (0, 80, 0, 100))
+    assert mask[40, 16] == 255
+    assert mask[40, 42] == 0
+
+
+def test_conservative_strength_keeps_previous_glyph_boundary():
+    pipe = Pipeline.__new__(Pipeline)
+    frame = white_text_frame()
+    mask = pipe.propainter_boxes_to_mask(
+        [(24, 48, 15, 135)], frame, (0, 80, 0, 240), subtitle_strength="conservative")
+    assert mask[35, 17] == 255
+    assert mask[35, 16] == 0
+
+
+def test_light_strength_adds_at_most_one_pixel_and_stays_inside_text_boxes():
+    pipe = Pipeline.__new__(Pipeline)
+    frame = white_text_frame()
+    boxes, region = [(24, 48, 15, 135)], (0, 80, 0, 240)
+    conservative = pipe.propainter_boxes_to_mask(
+        boxes, frame, region, subtitle_strength="conservative")
+    light = pipe.propainter_boxes_to_mask(boxes, frame, region)
+    allowed = cv2.dilate(conservative, np.ones((3, 3), dtype=np.uint8))
+    allowed = cv2.bitwise_and(allowed, pipe.boxes_to_mask(boxes, *light.shape))
+    assert np.count_nonzero(light) > np.count_nonzero(conservative)
+    np.testing.assert_array_equal(light, allowed)
+
+
+def test_strength_does_not_expand_stickers_or_colored_text_rectangles():
+    pipe = Pipeline.__new__(Pipeline)
+    frame = np.zeros((80, 240, 3), dtype=np.uint8)
+    frame[30:42, 20:55] = (255, 0, 0)
+    box, sticker = (24, 48, 15, 60), (24, 48, 150, 185)
+    expected = pipe.boxes_to_mask([box, sticker], *frame.shape[:2])
+    for strength in ("light", "conservative"):
+        mask = pipe.propainter_boxes_to_mask(
+            [box], frame, (0, 80, 0, 240), sticker_boxes=[sticker], subtitle_strength=strength)
+        np.testing.assert_array_equal(mask, expected)
+
+
+def test_unknown_subtitle_strength_is_rejected():
+    pipe = Pipeline.__new__(Pipeline)
+    with pytest.raises(ValueError, match="subtitle_strength"):
+        pipe.propainter_boxes_to_mask([], white_text_frame(), (0, 80, 0, 240),
+                                      subtitle_strength="strong")
+
+
 def test_padded_short_ocr_line_keeps_glyph_mask():
     pipe = Pipeline.__new__(Pipeline)
     frame = np.zeros((60, 80, 3), dtype=np.uint8)

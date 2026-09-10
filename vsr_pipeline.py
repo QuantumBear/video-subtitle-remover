@@ -85,6 +85,8 @@ WHITE_EDGE_TH = 180
 WHITE_EDGE_RADIUS = 3
 WHITE_EDGE_DILATE = 3
 GLYPH_OUTLINE_RADIUS = 2  # 在亮字形外再覆盖窄暗描边，不填充整行背景
+DEFAULT_SUBTITLE_STRENGTH = 'light'
+SUBTITLE_STRENGTHS = ('light', 'conservative')
 WHITE_RB_MAX = 25        # |R-B| 上限:排除蓝裤腿等彩色亮物
 MIN_BOX_ASPECT = 1.8     # 检出框最小宽高比(w/h):字幕行是水平长条(实测≥2.7),
                          # 近方形框是动物/物体误检(实测狗被检出 1.1:1 的框),
@@ -425,11 +427,14 @@ class Pipeline:
                                  != bisect_right(scene_changes, frame_no))
                 if (0 < frame_no - last_no <= stride and crosses_scene
                         and last_boxes and boxes):
+                    # 擦除强度不能扩大跨切景字形核验的证据范围。
                     pairs = templates.match_observations(
                         cv2.cvtColor(last_img, cv2.COLOR_RGB2BGR),
-                        self.propainter_boxes_to_mask(last_boxes, last_img, region), last_boxes,
+                        self.propainter_boxes_to_mask(
+                            last_boxes, last_img, region, subtitle_strength='conservative'), last_boxes,
                         cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
-                        self.propainter_boxes_to_mask(boxes, img, region), boxes)
+                        self.propainter_boxes_to_mask(
+                            boxes, img, region, subtitle_strength='conservative'), boxes)
                     for previous_index, current_index in pairs:
                         confirmed.add((last_no, tuple(last_boxes[previous_index])))
                         confirmed.add((frame_no, tuple(boxes[current_index])))
@@ -508,15 +513,20 @@ class Pipeline:
                  max(0, xmin):min(w, xmax)] = 255
         return mask
 
-    def propainter_boxes_to_mask(self, boxes, frame_rgb, region, sticker_boxes=()):
+    def propainter_boxes_to_mask(self, boxes, frame_rgb, region, sticker_boxes=(),
+                                subtitle_strength=DEFAULT_SUBTITLE_STRENGTH):
         """为 ProPainter 生成精确遮罩,避免把字幕框内背景整体重绘。
 
         OCR 只返回文字行的外接矩形,而不是字形轮廓。矩形中未被文字
         覆盖的楼梯、裤腿等真实像素若一并送入 ProPainter,模型会重新生成
         它们,在 4–5 秒这类字幕压在物体上的场景尤其明显。对明显横向的
         白色字幕框,改用原帧白色字形作为遮罩;无白字框保留整框。
-        贴纸类型独立传入，保持矩形遮罩。
+        贴纸类型独立传入，保持矩形遮罩。light 默认在字形描边外再覆盖
+        1px，conservative 保留原 2px 描边；两者都受文字框和 ROI 限制。
         """
+        if subtitle_strength not in SUBTITLE_STRENGTHS:
+            raise ValueError(f'未知 subtitle_strength: {subtitle_strength}')
+        outline_radius = GLYPH_OUTLINE_RADIUS + (subtitle_strength == 'light')
         h, w = frame_rgb.shape[:2]
         if not boxes and not sticker_boxes:
             return np.zeros((h, w), dtype='uint8')
@@ -571,7 +581,7 @@ class Pipeline:
             edge = cv2.dilate(edge, np.ones((WHITE_EDGE_DILATE, WHITE_EDGE_DILATE), dtype='uint8'))
             text_mask = cv2.bitwise_or(glyph[y1:y2, x1:x2], edge)
             text_mask = cv2.dilate(text_mask, np.ones(
-                (2 * GLYPH_OUTLINE_RADIUS + 1, 2 * GLYPH_OUTLINE_RADIUS + 1), dtype='uint8'))
+                (2 * outline_radius + 1, 2 * outline_radius + 1), dtype='uint8'))
             mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], text_mask)
         for ymin, ymax, xmin, xmax in sticker_boxes:
             y1, y2 = max(0, ry1, ymin), min(h, ry2, ymax)
@@ -735,12 +745,14 @@ class Pipeline:
                       ocr_stride=OCR_STRIDE, ocr_refine_radius=OCR_REFINE_RADIUS,
                       vlm_max_calls=32, sticker_max_frames=None,
                       sticker_prompt=None, sticker_score=None,
-                      sticker_max_area_px=None):
+                      sticker_max_area_px=None, subtitle_strength=DEFAULT_SUBTITLE_STRENGTH):
         """处理单条视频：反馈式 OCR 和轨迹检测，然后按帧或分段修复。
 
         :param region: (ymin, ymax, xmin, xmax) 字幕区域;None 时自动推断字幕带,
                        推断失败回退全屏
         :param ocr_stride: 稳定检测时逐步增大的帧间隔上限，默认 5
+        :param subtitle_strength: 仅 ProPainter 生效；light 默认给字形描边加 1px，
+                                  conservative 保留原遮罩，不改变检测或复修开关
         :param template_refine: 字幕模板补全开关。诊断期间默认关闭(疑似把正确
                                 mask 改坏导致 0-3 秒残留),定位后按结论调整
         :param white_glyph_check: 白字结构检查与局部复修开关，默认关闭；
@@ -755,6 +767,8 @@ class Pipeline:
                                     这是区分 emoji 与整幅物体误检的关键判据,
                                     用绝对像素而非相对比例,避免 ROI 尺寸变化时判据漂移
         """
+        if subtitle_strength not in SUBTITLE_STRENGTHS:
+            raise ValueError(f'未知 subtitle_strength: {subtitle_strength}')
         input_path, output_path = os.fspath(input_path), os.fspath(output_path)
         with av.open(input_path) as metadata:
             vstream = metadata.streams.video[0]
@@ -831,6 +845,8 @@ class Pipeline:
 
         if self.inpaint_mode == 'propainter':
             # ---- ProPainter 分支:按连续字幕段批处理(时序模型,不可逐帧) ----
+            print(f'[propainter] subtitle_strength={subtitle_strength} '
+                  f'glyph_outline={GLYPH_OUTLINE_RADIUS + (subtitle_strength == "light")}px')
             SEG_LEN, OVERLAP = PROPAINTER_SEG_LEN, PROPAINTER_OVERLAP
                                         # 每段输出 40 帧,尾部 20 帧重叠给下一段当上下文
                                         # (24G 卡在实际服务器非 PyTorch 显存占用较高时,
@@ -900,7 +916,8 @@ class Pipeline:
                 img = np.asarray(frame.to_image())  # RGB
                 boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
                 stickers = sticker_boxes.get(n - 1, [])
-                mask = self.propainter_boxes_to_mask(boxes, img, region, sticker_boxes=stickers)
+                mask = self.propainter_boxes_to_mask(
+                    boxes, img, region, sticker_boxes=stickers, subtitle_strength=subtitle_strength)
                 if boxes or mask.any():
                     # 文字框只遮白色字形,保留字间的楼梯/裤腿等真实像素;
                     # VLM 贴纸和有色字幕仍由精确矩形覆盖。
@@ -1014,6 +1031,10 @@ def main():
                     help='开启白字自检复修(诊断期间默认关闭)')
     ap.add_argument('--template-refine', action='store_true',
                     help='开启字幕模板补全(诊断期间默认关闭)')
+    ap.add_argument('--subtitle-strength', choices=SUBTITLE_STRENGTHS,
+                    default=DEFAULT_SUBTITLE_STRENGTH,
+                    help='仅 ProPainter:light=轻度增强(默认,字形描边多覆盖 1px);'
+                         'conservative=原保真遮罩;不自动开启模板补全或复修')
     ap.add_argument('--threads', type=int, default=None, help='torch CPU 线程数(多 worker 并发时调小)')
     ap.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'],
                     help="推理设备:auto=有 CUDA 用 GPU(默认)")
@@ -1050,6 +1071,7 @@ def main():
         region=tuple(args.region) if args.region else None,
         white_glyph_check=args.white_glyph_check,
         template_refine=args.template_refine,
+        subtitle_strength=args.subtitle_strength,
         locate_stickers=args.locate_stickers,
         ocr_stride=args.ocr_stride, ocr_refine_radius=args.ocr_refine_radius,
         vlm_max_calls=args.vlm_max_calls,
