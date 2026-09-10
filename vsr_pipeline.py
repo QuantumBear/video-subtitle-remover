@@ -35,6 +35,7 @@ import torch
 
 from backend import sticker_detect
 from backend.subtitle_templates import SubtitleTemplates
+from backend.temporal_glyphs import TemporalGlyphs
 from backend.subtitle_tracking import (
     associate_sticker_hits,
     fill_single_frame_gaps,
@@ -745,7 +746,8 @@ class Pipeline:
                       ocr_stride=OCR_STRIDE, ocr_refine_radius=OCR_REFINE_RADIUS,
                       vlm_max_calls=32, sticker_max_frames=None,
                       sticker_prompt=None, sticker_score=None,
-                      sticker_max_area_px=None, subtitle_strength=DEFAULT_SUBTITLE_STRENGTH):
+                      sticker_max_area_px=None, subtitle_strength=DEFAULT_SUBTITLE_STRENGTH,
+                      temporal_glyphs=False):
         """处理单条视频：反馈式 OCR 和轨迹检测，然后按帧或分段修复。
 
         :param region: (ymin, ymax, xmin, xmax) 字幕区域;None 时自动推断字幕带,
@@ -755,6 +757,8 @@ class Pipeline:
                                   conservative 保留原遮罩，不改变检测或复修开关
         :param template_refine: 字幕模板补全开关。诊断期间默认关闭(疑似把正确
                                 mask 改坏导致 0-3 秒残留),定位后按结论调整
+        :param temporal_glyphs: 试验性跨帧白字补全，仅 ProPainter；默认关闭，
+                                与 template_refine 互斥，不增加检测调用
         :param white_glyph_check: 白字结构检查与局部复修开关，默认关闭；
                                   不检测彩色贴纸，也不能补回遗漏的贴纸遮罩
         :param progress: 回调 fn(done_frames, total_frames, stage)
@@ -769,6 +773,10 @@ class Pipeline:
         """
         if subtitle_strength not in SUBTITLE_STRENGTHS:
             raise ValueError(f'未知 subtitle_strength: {subtitle_strength}')
+        if template_refine and temporal_glyphs:
+            raise ValueError('template_refine 与 temporal_glyphs 不能同时开启')
+        if temporal_glyphs and self.inpaint_mode != 'propainter':
+            raise ValueError('temporal_glyphs 仅支持 propainter')
         input_path, output_path = os.fspath(input_path), os.fspath(output_path)
         with av.open(input_path) as metadata:
             vstream = metadata.streams.video[0]
@@ -840,6 +848,7 @@ class Pipeline:
         src = av.open(input_path)
         n_fixed = n_repair = n_checked = n = 0
         n_recovered = n_unresolved = n_check_failed = 0
+        n_temporal_recovered = n_temporal_pixels = 0
         roi_mask = self.boxes_to_mask([region], h, w)
         scene_changes = set(detection['scene_change_frames'])
 
@@ -851,8 +860,12 @@ class Pipeline:
                                         # 每段输出 40 帧,尾部 20 帧重叠给下一段当上下文
                                         # (24G 卡在实际服务器非 PyTorch 显存占用较高时,
                                         #  80 帧窗口仍会 OOM;60 帧输入优先保证稳定运行)
-            seg_frames, seg_masks, seg_pts, seg_boxes = [], [], [], []
+            seg_frames, seg_masks, seg_pts, seg_boxes, seg_stickers = [], [], [], [], []
             templates = SubtitleTemplates(region, max_age=PROPAINTER_SUB_VIDEO_LENGTH)
+            temporal = TemporalGlyphs(
+                region, outline_radius=GLYPH_OUTLINE_RADIUS + (subtitle_strength == 'light')
+            ) if temporal_glyphs else None
+            print(f'[propainter] temporal_glyphs={"enabled" if temporal else "disabled"}')
 
             def flush_segment(n_out):
                 """处理当前缓冲:送入全部帧(含尾部重叠上下文),只输出前 n_out 帧。
@@ -864,6 +877,7 @@ class Pipeline:
                 """
                 nonlocal seg_frames, seg_masks, seg_pts, seg_boxes, n_fixed, n_repair, n_checked
                 nonlocal n_recovered, n_unresolved, n_check_failed
+                nonlocal seg_stickers, n_temporal_recovered, n_temporal_pixels
                 if not seg_frames or n_out <= 0:
                     return
                 if template_refine:
@@ -871,6 +885,13 @@ class Pipeline:
                         seg_frames, seg_masks, seg_boxes, seg_pts)
                     n_recovered += sum(np.any((new > 0) & (old == 0))
                                        for new, old in zip(effective_masks[:n_out], seg_masks[:n_out]))
+                elif temporal is not None:
+                    effective_masks, effective_boxes = temporal.refine(
+                        seg_frames, seg_masks, seg_boxes, seg_pts, excluded_boxes=seg_stickers)
+                    added = [int(np.count_nonzero((new > 0) & (old == 0)))
+                             for new, old in zip(effective_masks[:n_out], seg_masks[:n_out])]
+                    n_temporal_recovered += sum(pixels > 0 for pixels in added)
+                    n_temporal_pixels += sum(added)
                 else:
                     effective_masks, effective_boxes = seg_masks, seg_boxes
                 if any(mask.any() for mask in effective_masks):
@@ -908,6 +929,7 @@ class Pipeline:
                 seg_masks = seg_masks[n_out:]
                 seg_pts = seg_pts[n_out:]
                 seg_boxes = seg_boxes[n_out:]
+                seg_stickers = seg_stickers[n_out:]
 
             for frame in src.decode(video=0):
                 n += 1
@@ -925,6 +947,7 @@ class Pipeline:
                     seg_frames.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
                     seg_pts.append(n - 1)
                     seg_boxes.append(boxes)
+                    seg_stickers.append(stickers)
                     if len(seg_frames) >= SEG_LEN + OVERLAP:
                         flush_segment(SEG_LEN)
                 else:
@@ -1002,7 +1025,9 @@ class Pipeline:
         else:
             os.replace(tmp_out, output_path)
         check_status = str(n_checked) if white_glyph_check else '未启用'
+        temporal_status = f'{n_temporal_recovered}帧/+{n_temporal_pixels}px' if temporal_glyphs else '未启用'
         print(f'[done] {n} 帧 | 修复 {n_fixed} | 字形补全 {n_recovered} | '
+              f'跨帧字形 {temporal_status} | '
               f'残留复核 {check_status} | 补擦 {n_repair} | 疑似残留 {n_unresolved} | '
               f'复核未完成 {n_check_failed} | '
               f'耗时 {time.time() - t0:.0f}s → {output_path}')
@@ -1010,6 +1035,9 @@ class Pipeline:
                 'template_recovered': int(n_recovered), 'unresolved': n_unresolved,
                 'residual_check_failed': n_check_failed,
                 'residual_check_enabled': bool(white_glyph_check),
+                'temporal_glyphs_enabled': bool(temporal_glyphs),
+                'temporal_glyph_recovered': n_temporal_recovered,
+                'temporal_glyph_added_pixels': n_temporal_pixels,
                 'ocr_calls': detection['ocr_calls'], 'tracks': detection['tracks'],
                 'seconds': time.time() - t0}
 
@@ -1031,6 +1059,8 @@ def main():
                     help='开启白字自检复修(诊断期间默认关闭)')
     ap.add_argument('--template-refine', action='store_true',
                     help='开启字幕模板补全(诊断期间默认关闭)')
+    ap.add_argument('--temporal-glyphs', action='store_true',
+                    help='试验性跨帧白字补全(仅 ProPainter,默认关闭,与 --template-refine 互斥)')
     ap.add_argument('--subtitle-strength', choices=SUBTITLE_STRENGTHS,
                     default=DEFAULT_SUBTITLE_STRENGTH,
                     help='仅 ProPainter:light=轻度增强(默认,字形描边多覆盖 1px);'
@@ -1062,6 +1092,10 @@ def main():
                          '整幅物体误检的关键判据;用绝对像素而非相对比例,避免 ROI '
                          '尺寸变化时判据漂移')
     args = ap.parse_args()
+    if args.template_refine and args.temporal_glyphs:
+        ap.error('--template-refine 与 --temporal-glyphs 不能同时开启')
+    if args.temporal_glyphs and args.inpaint_mode != 'propainter':
+        ap.error('--temporal-glyphs 仅支持 --inpaint-mode propainter')
 
     pipe = Pipeline(threads=args.threads, device=args.device, inpaint_mode=args.inpaint_mode,
                     sticker_backend=args.sticker_backend,
@@ -1071,6 +1105,7 @@ def main():
         region=tuple(args.region) if args.region else None,
         white_glyph_check=args.white_glyph_check,
         template_refine=args.template_refine,
+        temporal_glyphs=args.temporal_glyphs,
         subtitle_strength=args.subtitle_strength,
         locate_stickers=args.locate_stickers,
         ocr_stride=args.ocr_stride, ocr_refine_radius=args.ocr_refine_radius,
