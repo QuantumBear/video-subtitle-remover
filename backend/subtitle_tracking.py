@@ -166,6 +166,30 @@ def materialize_tracks(
     return timeline
 
 
+def fill_single_frame_gaps(timeline: List[List[Box]], min_overlap_ratio: float = 0.5) -> List[List[Box]]:
+    """填补孤立的单帧检测空洞。
+
+    轨迹插值要求同一轨迹内有前后观测，场景切换帧会把切换前最后一帧的
+    OCR 漏检留成空洞(实测 f58:主循环对无框帧原帧直通，字幕整帧保留)。
+    若空洞前后帧存在水平方向重叠的框，说明同一行字幕在两侧均被检出，
+    用前帧框延拓一帧即可安全填补；其余空洞证据不足，保持为空。
+    """
+    out = [list(frame) for frame in timeline]
+    for i in range(1, len(out) - 1):
+        if out[i] or not out[i - 1] or not out[i + 1]:
+            continue
+        filled: List[Box] = []
+        for prev_box in out[i - 1]:
+            for next_box in out[i + 1]:
+                overlap = min(prev_box[3], next_box[3]) - max(prev_box[2], next_box[2])
+                narrowest = min(prev_box[3] - prev_box[2], next_box[3] - next_box[2])
+                if overlap >= narrowest * min_overlap_ratio:
+                    filled.append(tuple(int(v) for v in prev_box))
+                    break
+        out[i] = filled
+    return out
+
+
 def _timeline_mapping(text_timeline, total_frames: int) -> Dict[int, List[Box]]:
     items = text_timeline.items() if isinstance(text_timeline, Mapping) else enumerate(text_timeline)
     return {

@@ -37,6 +37,7 @@ from backend import sticker_detect
 from backend.subtitle_templates import SubtitleTemplates
 from backend.subtitle_tracking import (
     associate_sticker_hits,
+    fill_single_frame_gaps,
     group_sticker_boxes as _group_sticker_boxes,
     materialize_tracks,
     merge_residual_runs,
@@ -75,6 +76,10 @@ PROP_TEXT_MIN_GLYPH_PIXELS = 80
                          # 框内至少有这么多白色字形像素才启用精确遮罩;
                          # 抗压缩噪声或亮色物体不会触发
 WHITE_ORIG_TH = 228      # 原帧白字判据:三通道下限(经 f165 残留/f180 干净校准)
+WHITE_RETRY_DELTAS = (0, 7, 17)  # 明亮场景字形与亮背景连通被误杀时逐级提高阈值
+                                 # 重算(f70 标定:228 保留率 10%→245 时 100% 分离;
+                                 # 暗背景/白毛衣场景在各阈值下均 100% 保留不受影响)
+GLYPH_KEEP_RATIO = 0.5   # 框内字形过滤后保留率低于此值视为"与背景连通被误杀"
 WHITE_FIXED_TH = 210     # 修复帧"仍白"判据:放宽以抗重编码灰度漂移
 WHITE_EDGE_TH = 180
 WHITE_EDGE_RADIUS = 3
@@ -473,12 +478,17 @@ class Pipeline:
                                   scene_change_frames=scene_changes,
                                   confirmed_observations=confirmed)
         timeline = materialize_tracks(tracks, total, max_interpolation_gap=max_gap)
+        # 场景切换帧会把切换前最后一帧的 OCR 漏检留成空洞,主循环对无框帧
+        # 原帧直通(实测 f58 字幕整帧保留),这里用前后重叠框延拓填补。
+        n_empty = sum(not frames for frames in timeline)
+        timeline = fill_single_frame_gaps(timeline)
+        gap_filled = n_empty - sum(not frames for frames in timeline)
         accepted = sum(len(track.frames) for track in tracks)
         detected = sum(map(len, sampled.values()))
         return timeline, {
             'ocr_calls': len(sampled), 'sampled': len(sample_frames), 'refined': refined,
             'tracks': len(tracks), 'detected': detected, 'accepted': accepted,
-            'discarded': detected - accepted,
+            'discarded': detected - accepted, 'gap_filled': gap_filled,
             'sampled_frames': sample_frames,
             'scene_change_frames': scene_changes,
         }
@@ -503,9 +513,19 @@ class Pipeline:
         h, w = frame_rgb.shape[:2]
         if not boxes and not sticker_boxes:
             return np.zeros((h, w), dtype='uint8')
-        raw = self.white_glyph(frame_rgb, region)
-        glyph = self.filter_glyph_by_height(raw)
-        loose = self.filter_glyph_by_height(self.white_glyph(frame_rgb, region, WHITE_EDGE_TH))
+        candidates = {}
+
+        def glyph_candidate(delta):
+            """按需计算并缓存某阈值档的 (raw 原图, 高度过滤后字形, 宽松边缘层)。"""
+            if delta not in candidates:
+                th = WHITE_ORIG_TH + delta
+                raw = self.white_glyph(frame_rgb, region, th)
+                glyph = self.filter_glyph_by_height(raw)
+                loose = self.filter_glyph_by_height(
+                    self.white_glyph(frame_rgb, region, WHITE_EDGE_TH + delta))
+                candidates[delta] = (raw, glyph, loose)
+            return candidates[delta]
+
         mask = np.zeros((h, w), dtype='uint8')
         ry1, ry2, rx1, rx2 = region
         for ymin, ymax, xmin, xmax in boxes:
@@ -513,22 +533,39 @@ class Pipeline:
             x1, x2 = max(0, rx1, xmin), min(w, rx2, xmax)
             if y2 <= y1 or x2 <= x1:
                 continue
-            local_glyph = glyph[y1:y2, x1:x2]
-            # OCR 已完成文字形态过滤，外扩后的宽高比不能再排除短字幕。
-            if int((local_glyph > 0).sum()) >= PROP_TEXT_MIN_GLYPH_PIXELS:
-                near_core = cv2.dilate(local_glyph, np.ones(
-                    (2 * WHITE_EDGE_RADIUS + 1, 2 * WHITE_EDGE_RADIUS + 1), dtype='uint8'))
-                edge = cv2.bitwise_and(loose[y1:y2, x1:x2], near_core)
-                edge = cv2.dilate(edge, np.ones((WHITE_EDGE_DILATE, WHITE_EDGE_DILATE), dtype='uint8'))
-                text_mask = cv2.bitwise_or(local_glyph, edge)
-                text_mask = cv2.dilate(text_mask, np.ones(
-                    (2 * GLYPH_OUTLINE_RADIUS + 1, 2 * GLYPH_OUTLINE_RADIUS + 1), dtype='uint8'))
-                mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], text_mask)
-            elif np.count_nonzero(raw[y1:y2, x1:x2]) >= PROP_TEXT_MIN_GLYPH_PIXELS:
-                # 白色大物体被连通域过滤后不能退回整行矩形擦除。
-                mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], local_glyph)
-            else:
+            raw0 = glyph_candidate(0)[0]
+            raw_cnt = int(np.count_nonzero(raw0[y1:y2, x1:x2]))
+            if raw_cnt < PROP_TEXT_MIN_GLYPH_PIXELS:
+                # 框内几乎没有白:OCR 框本身即证据(有色字幕/emoji),
+                # 退回整框矩形擦除。
                 mask[y1:y2, x1:x2] = 255
+                continue
+            chosen = None
+            for delta in WHITE_RETRY_DELTAS:
+                raw, glyph, loose = glyph_candidate(delta)
+                total = int(np.count_nonzero(raw[y1:y2, x1:x2]))
+                kept = int((glyph[y1:y2, x1:x2] > 0).sum())
+                if kept >= PROP_TEXT_MIN_GLYPH_PIXELS:
+                    if kept >= total * GLYPH_KEEP_RATIO:
+                        chosen = (glyph, loose)
+                        break
+                    if chosen is None:
+                        # 最低阈值的部分字形先记为兜底,后续阈值能分离则取代它
+                        chosen = (glyph, loose)
+            if chosen is None:
+                # 白色大物体在所有阈值下都无法与背景分离:
+                # 不能退回整行矩形擦除,保持不擦。
+                continue
+            glyph, loose = chosen
+            # OCR 已完成文字形态过滤，外扩后的宽高比不能再排除短字幕。
+            near_core = cv2.dilate(glyph[y1:y2, x1:x2], np.ones(
+                (2 * WHITE_EDGE_RADIUS + 1, 2 * WHITE_EDGE_RADIUS + 1), dtype='uint8'))
+            edge = cv2.bitwise_and(loose[y1:y2, x1:x2], near_core)
+            edge = cv2.dilate(edge, np.ones((WHITE_EDGE_DILATE, WHITE_EDGE_DILATE), dtype='uint8'))
+            text_mask = cv2.bitwise_or(glyph[y1:y2, x1:x2], edge)
+            text_mask = cv2.dilate(text_mask, np.ones(
+                (2 * GLYPH_OUTLINE_RADIUS + 1, 2 * GLYPH_OUTLINE_RADIUS + 1), dtype='uint8'))
+            mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], text_mask)
         for ymin, ymax, xmin, xmax in sticker_boxes:
             y1, y2 = max(0, ry1, ymin), min(h, ry2, ymax)
             x1, x2 = max(0, rx1, xmin), min(w, rx2, xmax)
@@ -684,99 +721,6 @@ class Pipeline:
         xmax = min(w, max(b[3] for b in boxes_all) + 20)
         print(f'[auto-region] 采样检出 {len(boxes_all)} 框 → region: {(ymin, ymax, xmin, xmax)}')
         return (ymin, ymax, xmin, xmax)
-
-    @staticmethod
-    def _boxes_overlap(b1, b2, pad=60):
-        """两框(外扩 pad)是否重叠:字幕随镜头轻微移动仍视为同一字幕。"""
-        return not (b1[3] < b2[2] - pad or b1[2] > b2[3] + pad
-                    or b1[1] < b2[0] - pad or b1[0] > b2[1] + pad)
-
-    @classmethod
-    def filter_boxes_by_continuity(cls, all_boxes, max_gap=5):
-        """检出框的位置连续性过滤:剔除孤立错位的误检框。
-
-        字幕在时间上连续,检出框应与前后检出帧的框位置衔接。一个框若与
-        前后(帧距 ≤max_gap)检出帧的所有框均不重叠,则是画面误检
-        (高光/动物被当文字),交给 ProPainter 会传播来错误内容
-        (实测 f271 雾块)。删除后该帧交由最近邻继承。
-        """
-        hits = [i for i, b in enumerate(all_boxes) if b]
-        out = [list(b) for b in all_boxes]
-
-        def overlap_any(b, others):
-            return any(cls._boxes_overlap(b, pb) for pb in others)
-
-        for i in hits:
-            prev = max((j for j in hits if j < i), default=None)
-            nxt = min((j for j in hits if j > i), default=None)
-            prev_ok = prev is not None and i - prev <= max_gap
-            nxt_ok = nxt is not None and nxt - i <= max_gap
-            if not prev_ok and not nxt_ok:
-                continue  # 邻居太远无法判定,保守保留
-            kept = []
-            for b in all_boxes[i]:
-                fail_prev = prev_ok and not overlap_any(b, all_boxes[prev])
-                fail_nxt = nxt_ok and not overlap_any(b, all_boxes[nxt])
-                if prev_ok and nxt_ok:
-                    if fail_prev and fail_nxt:
-                        continue  # 两侧都脱节:孤立误检,剔除
-                elif fail_prev or fail_nxt:
-                    continue  # 单侧可判定且脱节:剔除
-                kept.append(b)
-            out[i] = kept
-        return out
-
-    @classmethod
-    def expand_timeline(cls, all_boxes, merge_gap=10):
-        """字幕时间线区间化 + 最近邻传播。
-
-        目标是防字幕闪现(逐帧独立检测时字幕'忽检出忽漏检',擦与不擦交替):
-        帧号间隔 ≤merge_gap 的检出帧合并为同一区间,区间内无检出框的帧
-        继承时间上最近的检出帧的框。
-
-        注意不能用区间内全部检出框的并集:动态字幕(位置随镜头移动)的
-        并集会横跨整条移动带,把人物/背景大面积罩进 mask,LAMA 会把
-        画面重绘成模糊涂抹(实测灾难)。最近邻帧的框最贴近该帧字幕的
-        真实位置。
-        """
-        all_boxes = cls.filter_boxes_by_continuity(all_boxes)
-        n = len(all_boxes)
-        hits = [i for i, b in enumerate(all_boxes) if b]
-        if not hits:
-            return [[] for _ in range(n)]
-        # 按帧号聚类成区间
-        ranges = [[hits[0], hits[0]]]
-        for i in hits[1:]:
-            if i - ranges[-1][1] <= merge_gap:
-                ranges[-1][1] = i
-            else:
-                ranges.append([i, i])
-        expanded = [list(b) for b in all_boxes]
-        for lo, hi in ranges:
-            frames_with = [i for i in range(lo, hi + 1) if all_boxes[i]]
-            for i in range(lo, hi + 1):
-                # 局部窗口(±2帧)并集:补跨帧漏检(某帧漏检的字行,常被相邻帧
-                # 检出)。窗口小,字幕移动量有限,并集不会横跨移动带(对比:
-                # 全区间并集会把整条移动带罩住,无真值可抄→白雾)
-                near = [j for j in frames_with if abs(j - i) <= 2]
-                if near:
-                    union = []
-                    for j in near:
-                        for b in all_boxes[j]:
-                            if b not in union:
-                                union.append(b)
-                    expanded[i] = union
-                    continue
-                # 窗口内无检出(漏检串>5帧):继承最近检出帧的框
-                prev = max((j for j in frames_with if j < i), default=None)
-                nxt = min((j for j in frames_with if j > i), default=None)
-                if prev is None:
-                    expanded[i] = all_boxes[nxt]
-                elif nxt is None:
-                    expanded[i] = all_boxes[prev]
-                else:
-                    expanded[i] = all_boxes[prev if i - prev <= nxt - i else nxt]
-        return expanded
 
     def process_video(self, input_path, output_path, region=None,
                       template_refine=False, white_glyph_check=False,

@@ -34,6 +34,19 @@ def test_masks_never_escape_manual_roi():
     assert not mask[:, :15].any() and not mask[:, 135:].any()
 
 
+def test_glyph_merged_into_bright_background_recovers_with_higher_threshold():
+    # 明亮场景:背景本身超过白色阈值,字幕与背景在二值图上连成巨型块,
+    # 被连通域高度过滤整体剔除。必须在框内保留率过低时逐级提高阈值重算,
+    # 否则整框字形丢失只留淡残留(实测 f70:7123px 被剔剩 756px)。
+    pipe = Pipeline.__new__(Pipeline)
+    frame = np.full((120, 240, 3), 232, dtype=np.uint8)
+    frame[50:62, 20:55] = 255
+    frame[48:64, 55:58] = 240
+    mask = pipe.propainter_boxes_to_mask([(46, 66, 15, 135)], frame, (0, 120, 0, 240))
+    assert mask[55, 30] == 255
+    assert mask[55, 70] == 0
+
+
 def test_large_white_object_inside_box_does_not_trigger_rectangle_fallback():
     pipe = Pipeline.__new__(Pipeline)
     frame = np.zeros((160, 240, 3), dtype=np.uint8)

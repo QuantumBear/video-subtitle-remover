@@ -2,6 +2,7 @@ import pytest
 
 from backend.subtitle_tracking import (
     BoxTrack,
+    fill_single_frame_gaps,
     materialize_tracks,
     merge_closed_ranges,
     merge_residual_runs,
@@ -175,7 +176,30 @@ def test_long_gap_does_not_join_tracks():
     assert tracks == []
 
 
+def test_single_frame_gap_with_overlapping_neighbors_is_filled():
+    # 场景切换帧会把切换前最后一帧的 OCR 漏检留成空洞(实测 f58:
+    # 无框帧在主循环里原帧直通,字幕整帧保留)。前后帧均有水平重叠
+    # 的框说明同一行字幕在两侧都被检出,用前帧框延拓填补。
+    box = (100, 130, 80, 280)
+    timeline = [[box], [], [box]]
+    assert fill_single_frame_gaps(timeline) == [[box], [box], [box]]
+
+
+def test_single_frame_gap_without_horizontal_overlap_stays_empty():
+    timeline = [[(100, 130, 20, 50)], [], [(100, 130, 80, 280)]]
+    assert fill_single_frame_gaps(timeline) == [
+        [(100, 130, 20, 50)], [], [(100, 130, 80, 280)]]
+
+
+def test_multi_frame_gap_and_uncovered_holes_are_not_filled():
+    # 只补严格单帧且两侧都有检出的空洞;连续漏检和边界空洞证据不足。
+    box = (100, 130, 80, 280)
+    timeline = [[box], [], [], [box], [box], []]
+    assert fill_single_frame_gaps(timeline) == timeline
+
+
 def test_empty_video_has_no_sampling_or_tracks():
     assert plan_ocr_frames(0) == []
     assert track_text_boxes({0: [(1, 2, 3, 4)]}, 0) == []
     assert materialize_tracks([], 0) == []
+    assert fill_single_frame_gaps([]) == []

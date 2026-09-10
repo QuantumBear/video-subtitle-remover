@@ -169,7 +169,16 @@ def test_matching_subtitle_survives_scene_cut_without_mixing_model_frames(tmp_pa
     filtered = pipe.filter_glyph_by_height(raw)
     hidden_white = (complete > 0) & (raw > 0) & (filtered == 0)
     assert np.count_nonzero(hidden_white[:, 120:260]) > 200
-    assert not np.any(damaged[hidden_white])
+    # 亮背景(242)与白字(255)在 th228 连通被高度过滤整体剔除;阈值重试
+    # (245 挡住 242 背景、保留 255 字)直接分离出字形,不再依赖模板补全兜底。
+    merged_text = (bright[:, :, 0] >= 250) & hidden_white
+    assert np.all(damaged[merged_text] > 0)
+    # 亮带背景本身不是字幕:mask 只随字形外扩少量描边,不得吞掉整条亮带。
+    band = bright[:, :, 0] == 242
+    band_in_box = np.zeros_like(band)
+    band_in_box[48:94, 18:260] = True
+    band_in_box &= band
+    assert np.count_nonzero(damaged & band_in_box) < 0.5 * np.count_nonzero(band_in_box)
     _, detection = pipe._detect_timeline(source, region)
     assert detection["scene_change_frames"] == [3]
     calls = []
