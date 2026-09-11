@@ -35,20 +35,29 @@ class STTNDetInpaint:
         self.neighbor_stride = config.sttnNeighborStride.value
         self.ref_length = config.sttnReferenceLength.value
 
+    @staticmethod
+    def compute_split_h(frame_width, frame_height, model_width, model_height):
+        """计算修复带高度，使带的宽高比与模型输入一致。
+
+        修复带整条会被压到模型输入尺寸再放大回来。带宽固定为帧宽，
+        因此带高必须满足 frame_width / split_h == model_width / model_height，
+        否则纵横两轴缩放倍率不同，修复结果被各向异性拉伸。
+        帧高不足时夹到帧高，避免区域越界。
+        """
+        split_h = int(round(frame_width * model_height / model_width))
+        return max(1, min(split_h, frame_height))
+
     def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
         """
         :param input_frames: 原视频帧
-        :param mask: 字幕区域mask
+        :param input_mask: 字幕区域mask，0/255 二值。必须保持 255 量级：
+            inpaint() 内部经 ToTorchFormatTensor 的 div(255) 归一后再做 > 0.5 判定，
+            若在此处提前归一成 0/1，模型将收不到空洞信号而退化为恒等重建。
         """
         mask = input_mask[:, :, None]
         H_ori, W_ori = mask.shape[:2]
-        H_ori = int(H_ori + 0.5)
-        W_ori = int(W_ori + 0.5)
         # 确定去字幕的垂直高度部分
-        if H_ori > W_ori:
-            split_h = int(H_ori * 5 / 9)
-        else:
-            split_h = int(W_ori * 5 / 18)
+        split_h = self.compute_split_h(W_ori, H_ori, self.model_input_width, self.model_input_height)
         inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask)
         # 初始化帧存储变量
         # 高分辨率帧存储列表（浅拷贝 + 逐帧 copy，避免 deepcopy 开销）
@@ -85,12 +94,13 @@ class STTNDetInpaint:
                 frame = frames_hr[j]  # 取出原始帧
                 # 对于模式中的每一个段落
                 for k in range(len(inpaint_area)):
-                    comp = cv2.resize(comps[k][j], (W_ori, split_h))  # 将补全帧缩放回原大小
+                    ymin, ymax = inpaint_area[k][0], inpaint_area[k][1]
+                    comp = cv2.resize(comps[k][j], (W_ori, ymax - ymin))  # 将补全帧缩放回原大小
                     comp = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2RGB)  # 转换颜色空间
-                    # 获取遮罩区域并进行图像合成
-                    mask_area = mask[inpaint_area[k][0]:inpaint_area[k][1], :]  # 取出遮罩区域
-                    # 实现遮罩区域内的图像融合
-                    frame[inpaint_area[k][0]:inpaint_area[k][1], :, :] = comp
+                    # 只替换 mask 命中的像素：修复带整条都经过 432x240 往返缩放，
+                    # 无条件覆盖会把带内所有非字幕像素一并换成低分辨率结果
+                    mask_area = mask[ymin:ymax, :] > 0
+                    np.copyto(frame[ymin:ymax, :, :], comp, where=mask_area)
                 # 将最终帧添加到列表
                 inpainted_frames.append(frame)
                 # print(f'processing frame, {len(frames_hr) - j} left')
