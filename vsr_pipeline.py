@@ -310,7 +310,7 @@ class Pipeline:
         if sticker_backend not in STICKER_BACKENDS:
             raise ValueError(f'未知 sticker_backend: {sticker_backend}')
         self.sticker_backend = sticker_backend
-        self._sticker_device = 'cpu' if inpaint_mode == 'lama' else device
+        self._sticker_device = device
         self._sticker_model_id = sticker_model_id
         # 贴纸检测器惰性加载:关闭贴纸层或走 VLM 后端时不应付出权重加载成本
         self._sticker_detector = None
@@ -360,6 +360,24 @@ class Pipeline:
                 use_fp16=self._pp_device.type == 'cuda',
             )
             print('[init] ProPainter 已加载')
+
+    def _release_sticker_detector(self):
+        detector = self._sticker_detector
+        self._sticker_detector = None
+
+        if detector is not None:
+          # 尽可能先把模型移回 CPU，再删除引用
+            model = getattr(detector, 'model', None)
+            if model is not None and hasattr(model, 'to'):
+                model.to('cpu')
+
+            del detector
+
+        import gc
+        gc.collect()
+
+        if torch.cuda.is_available():
+           torch.cuda.empty_cache()
 
     # ---- OCR 检测:返回该帧在 region 内的文字框列表 [(ymin,ymax,xmin,xmax), ...] ----
     def detect(self, frame_rgb, region):
@@ -846,6 +864,7 @@ class Pipeline:
                                      for y1, y2, x1, x2 in boxes]
                                  for i, boxes in associated.items()}
                 print(f'[sticker-{self.sticker_backend}] associated_frames={len(sticker_boxes)}')
+                self._release_sticker_detector()
             except Exception as exc:
                 print(f'[sticker-{self.sticker_backend}] 跳过贴纸层: {type(exc).__name__}')
 
