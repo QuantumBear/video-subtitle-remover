@@ -53,16 +53,36 @@ class SubtitleDetect:
             enable_hpi=len(onnx_providers) > 0,
         )
 
+    @staticmethod
+    def is_plausible_text_box(xmin, xmax, ymin, ymax, frame_height):
+        """判断检测框的形状是否可能是一行字幕文字。
+
+        OCR 偶尔把画面内容（车辆、宠物、反光等）误检成文本，这类框远高于文字行。
+        它们进入 mask 后会让修复模型把整块区域换成低分辨率生成结果，形成块状模糊。
+        只用高度作判据：误检块的宽高比可能落在正常字幕范围内（实测方形块为 1.11，
+        而真实字幕的宽高比横跨 0.67~8.77），高度才是可分的维度。
+        """
+        width = xmax - xmin
+        height = ymax - ymin
+        if width <= 0 or height <= 0:
+            return False
+        return height * 1000 <= frame_height * config.subtitleMaxHeightPermille.value
+
     def detect_subtitle(self, img):
         temp_list = []
         results = self.text_detector.predict(img)
         sub_areas = self.sub_areas
         has_areas = sub_areas is not None and len(sub_areas) > 0
+        frame_height = img.shape[0]
         for res in results:
             dt_polys = res['dt_polys']
             if dt_polys is None or len(dt_polys) == 0:
                 continue
             coordinate_list = get_coordinates(dt_polys.tolist())
+            if not coordinate_list:
+                continue
+            # 先剔除形状不可能是文字行的框，避免误检块流入 mask
+            coordinate_list = [c for c in coordinate_list if self.is_plausible_text_box(*c, frame_height)]
             if not coordinate_list:
                 continue
             if not has_areas:

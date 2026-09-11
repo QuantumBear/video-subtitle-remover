@@ -134,6 +134,10 @@ class Config:
     # 【设置像素点偏差】
     # 用于判断是不是非字幕区域(一般认为字幕文本框的长度是要大于宽度的，如果字幕框的高大于宽，且大于的幅度超过指定像素点大小，则认为是错误检测)
     subtitleYXAxisDifferencePixel = ConfigItem("Main", "SubtitleYXAxisDifferencePixel", 10, RangeValidator(0, 300))
+    # 文字行高相对帧高的上限千分比，超过则认为 OCR 把画面内容误检成文本。
+    # 依据样片全片 OCR 实测：正常框高 p99 占帧高 2.8%，误检块占 13.9% 与 26.3%，
+    # 取 8% 对正常框留约 2.8 倍余量。误检块进入 mask 会造成大面积块状模糊。
+    subtitleMaxHeightPermille = ConfigItem("Main", "SubtitleMaxHeightPermille", 80, RangeValidator(1, 1000))
     # 用于放大mask大小，防止自动检测的文本框过小，inpaint阶段出现文字边，有残留
     subtitleAreaDeviationPixel = ConfigItem("Main", "SubtitleAreaDeviationPixel", 10, RangeValidator(1, 300))
     # 同于判断两个文本框是否为同一行字幕，高度差距指定像素点以内认为是同一行
