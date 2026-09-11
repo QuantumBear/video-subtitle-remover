@@ -198,6 +198,18 @@ def test_multi_frame_gap_and_uncovered_holes_are_not_filled():
     assert fill_single_frame_gaps(timeline) == timeline
 
 
+def test_materialize_tracks_tolerates_short_endpoint_ocr_holes_without_crossing_cut():
+    box = (100, 120, 20, 180)
+    tracks = track_text_boxes({3: [box], 4: [box]}, 10, max_gap=3)
+    result = materialize_tracks(tracks, 10, max_interpolation_gap=3,
+                                endpoint_gap=2, eligible_endpoint_frames=[1, 2, 5, 6])
+    assert result[:7] == [[], [box], [box], [box], [box], [box], [box]]
+    result = materialize_tracks(tracks, 10, max_interpolation_gap=3,
+                                endpoint_gap=2, scene_change_frames=[5],
+                                eligible_endpoint_frames=range(10))
+    assert result[5:] == [[], [], [], [], []]
+
+
 def test_empty_video_has_no_sampling_or_tracks():
     assert plan_ocr_frames(0) == []
     assert track_text_boxes({0: [(1, 2, 3, 4)]}, 0) == []

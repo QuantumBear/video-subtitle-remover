@@ -486,11 +486,16 @@ class Pipeline:
             # 最后一帧必须检测，但不能把它再作为跳过帧重复回查。
             pending.pop()
             observe(total - 1, last_img)
-        max_gap = max(10, 2 * stride)
+        # OCR 偶尔会在字幕刚出现/画面运动时连续漏掉几帧。短轨迹端点
+        # 向两侧容忍 3 帧，仍受场景切换限制，避免把已消失字幕长时间延拓。
+        max_gap = max(10, 3 * stride)
         tracks = track_text_boxes(sampled, total, max_gap=max_gap,
                                   scene_change_frames=scene_changes,
                                   confirmed_observations=confirmed)
-        timeline = materialize_tracks(tracks, total, max_interpolation_gap=max_gap)
+        timeline = materialize_tracks(
+            tracks, total, max_interpolation_gap=max_gap,
+            endpoint_gap=min(3, max_gap // 3), scene_change_frames=scene_changes,
+            eligible_endpoint_frames=[frame for frame, boxes in sampled.items() if boxes])
         # 场景切换帧会把切换前最后一帧的 OCR 漏检留成空洞,主循环对无框帧
         # 原帧直通(实测 f58 字幕整帧保留),这里用前后重叠框延拓填补。
         n_empty = sum(not frames for frames in timeline)

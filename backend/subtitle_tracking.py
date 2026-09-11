@@ -141,10 +141,22 @@ def materialize_tracks(
     tracks: Sequence[BoxTrack],
     total_frames: int,
     max_interpolation_gap: int = 10,
+    endpoint_gap: int = 0,
+    scene_change_frames: Sequence[int] = (),
+    eligible_endpoint_frames: Sequence[int] = (),
 ) -> List[List[Box]]:
-    """把轨迹线性插值为逐帧框；超过间隙上限的帧保持空列表。"""
+    """把轨迹线性插值为逐帧框；可容忍短暂的首尾 OCR 空洞。
+
+    ``endpoint_gap`` 只沿用轨迹端点的最后一个框，且不跨场景切换；
+    默认关闭以保持通用调用方的原有语义。
+    """
     total_frames = max(0, int(total_frames))
     max_interpolation_gap = max(0, int(max_interpolation_gap))
+    endpoint_gap = max(0, int(endpoint_gap))
+    scene_changes = sorted(set(int(f) for f in scene_change_frames))
+    eligible = set(int(f) for f in eligible_endpoint_frames)
+    def same_scene(a, b):
+        return bisect_right(scene_changes, a) == bisect_right(scene_changes, b)
     timeline: List[List[Box]] = [[] for _ in range(total_frames)]
     for track in tracks:
         for frame_no, box in zip(track.frames, track.boxes):
@@ -163,6 +175,18 @@ def materialize_tracks(
                 interpolated = tuple(round(a[i] + (b[i] - a[i]) * ratio) for i in range(4))
                 if 0 <= frame_no < total_frames:
                     timeline[frame_no].append(interpolated)
+        if endpoint_gap and len(track.frames) >= 2:
+            first, last = track.frames[0], track.frames[-1]
+            before = track.boxes[0]
+            after = track.boxes[-1]
+            for frame_no in range(max(0, first - endpoint_gap), first):
+                if (same_scene(frame_no, first) and frame_no in eligible
+                        and not timeline[frame_no]):
+                    timeline[frame_no].append(before)
+            for frame_no in range(last + 1, min(total_frames, last + endpoint_gap + 1)):
+                if (same_scene(last, frame_no) and frame_no in eligible
+                        and not timeline[frame_no]):
+                    timeline[frame_no].append(after)
     return timeline
 
 
