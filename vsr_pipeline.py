@@ -310,7 +310,7 @@ class Pipeline:
         if sticker_backend not in STICKER_BACKENDS:
             raise ValueError(f'未知 sticker_backend: {sticker_backend}')
         self.sticker_backend = sticker_backend
-        self._sticker_device = device
+        self._sticker_device = 'cpu' if inpaint_mode == 'lama' else device
         self._sticker_model_id = sticker_model_id
         # 贴纸检测器惰性加载:关闭贴纸层或走 VLM 后端时不应付出权重加载成本
         self._sticker_detector = None
@@ -325,7 +325,7 @@ class Pipeline:
         )
         if inpaint_mode == 'lama':
             print(f'[init] 加载 LAMA: {lama_pt}')
-            self.inpainter = LamaEngine(lama_pt, device=device)
+            self.inpainter = LamaEngine(lama_pt, device='cpu')
             print(f'[init] 模型就绪(LAMA device: {self.inpainter.device})')
         elif inpaint_mode == 'propainter':
             # ProPainter 时序修复:被字幕遮挡的真实像素可从相邻帧沿光流传播
