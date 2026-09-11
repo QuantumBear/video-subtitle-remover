@@ -492,10 +492,16 @@ class Pipeline:
         tracks = track_text_boxes(sampled, total, max_gap=max_gap,
                                   scene_change_frames=scene_changes,
                                   confirmed_observations=confirmed)
+        # 先建立基础逐帧轨迹；端点空洞的候选应包含已由其它字幕轨迹
+        # 插值得到的帧，而不只是 OCR 直接采样帧（例如 f90/f93-95）。
+        timeline = materialize_tracks(
+            tracks, total, max_interpolation_gap=max_gap,
+            scene_change_frames=scene_changes)
+        eligible_endpoint_frames = [frame for frame, boxes in enumerate(timeline) if boxes]
         timeline = materialize_tracks(
             tracks, total, max_interpolation_gap=max_gap,
             endpoint_gap=min(3, max_gap // 3), scene_change_frames=scene_changes,
-            eligible_endpoint_frames=[frame for frame, boxes in sampled.items() if boxes])
+            eligible_endpoint_frames=eligible_endpoint_frames)
         # 场景切换帧会把切换前最后一帧的 OCR 漏检留成空洞,主循环对无框帧
         # 原帧直通(实测 f58 字幕整帧保留),这里用前后重叠框延拓填补。
         n_empty = sum(not frames for frames in timeline)
