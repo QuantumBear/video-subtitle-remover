@@ -107,6 +107,38 @@ PROPAINTER_SUB_VIDEO_LENGTH = PROPAINTER_SEG_LEN + PROPAINTER_OVERLAP
 FFMPEG = shutil.which('ffmpeg') or os.path.join(BASE_DIR, 'backend', 'ffmpeg', 'macos', 'ffmpeg')
 
 
+def cuda_memory_snapshot(label, reset_peak=False):
+    """打印 PyTorch CUDA 显存快照并返回字节数；CPU/无 CUDA 时安全跳过。
+
+    ``nvidia-smi`` 同时包含 CUDA 上下文和非 PyTorch 分配，这里专门记录
+    PyTorch 的 allocated/reserved 及峰值，便于定位哪个阶段真正占用显存。
+    """
+    if not torch.cuda.is_available():
+        print(f'[vram] {label}: unavailable (cuda=false)')
+        return None
+    if reset_peak:
+        torch.cuda.reset_peak_memory_stats()
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    peak_allocated = torch.cuda.max_memory_allocated()
+    peak_reserved = torch.cuda.max_memory_reserved()
+    free, total = torch.cuda.mem_get_info()
+    gib = 1024 ** 3
+    print(f'[vram] {label}: allocated={allocated / gib:.2f}GiB '
+          f'reserved={reserved / gib:.2f}GiB '
+          f'peak_allocated={peak_allocated / gib:.2f}GiB '
+          f'peak_reserved={peak_reserved / gib:.2f}GiB '
+          f'free={free / gib:.2f}GiB total={total / gib:.2f}GiB')
+    return {
+        'allocated': allocated,
+        'reserved': reserved,
+        'peak_allocated': peak_allocated,
+        'peak_reserved': peak_reserved,
+        'free': free,
+        'total': total,
+    }
+
+
 # ---------- LAMA 引擎(自包含,不依赖 backend 包/任何 GUI 栈) ----------
 class LamaEngine:
     """big-lama TorchScript 推理封装。
@@ -323,10 +355,12 @@ class Pipeline:
             device='cpu',
             enable_hpi=False,
         )
+        cuda_memory_snapshot('after OCR init')
         if inpaint_mode == 'lama':
             print(f'[init] 加载 LAMA: {lama_pt}')
             self.inpainter = LamaEngine(lama_pt, device='cpu')
             print(f'[init] 模型就绪(LAMA device: {self.inpainter.device})')
+            cuda_memory_snapshot('after LAMA init')
         elif inpaint_mode == 'propainter':
             # ProPainter 时序修复:被字幕遮挡的真实像素可从相邻帧沿光流传播
             # 回来,重建质量远超单帧 LAMA(对照 kaipai 目标效果);显存大,
@@ -334,6 +368,7 @@ class Pipeline:
             self._pp_device = torch.device('cuda' if (device == 'auto' and torch.cuda.is_available()) or device == 'cuda' else 'cpu')
             self.inpainter = None
             print(f'[init] ProPainter 模式(引擎将在首次修复时加载,device: {self._pp_device})')
+            cuda_memory_snapshot('after Pipeline init')
         else:
             raise ValueError(f'未知 inpaint_mode: {inpaint_mode}')
 
@@ -346,6 +381,7 @@ class Pipeline:
             self._sticker_detector = sticker_detect.GroundingDinoStickerDetector(
                 model_id=model_id, device=self._sticker_device)
             print(f'[init] 贴纸检测器就绪(device: {self._sticker_detector.device})')
+            cuda_memory_snapshot('after GroundingDINO init')
         return self._sticker_detector
 
     def _ensure_propainter(self):
@@ -360,9 +396,10 @@ class Pipeline:
                 use_fp16=self._pp_device.type == 'cuda',
             )
             print('[init] ProPainter 已加载')
+            cuda_memory_snapshot('after ProPainter init', reset_peak=True)
 
     def _release_sticker_detector(self):
-        detector = self._sticker_detector
+        detector = getattr(self, '_sticker_detector', None)
         self._sticker_detector = None
 
         if detector is not None:
@@ -377,7 +414,8 @@ class Pipeline:
         gc.collect()
 
         if torch.cuda.is_available():
-           torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
+        cuda_memory_snapshot('after GroundingDINO release')
 
     # ---- OCR 检测:返回该帧在 region 内的文字框列表 [(ymin,ymax,xmin,xmax), ...] ----
     def detect(self, frame_rgb, region):
@@ -832,12 +870,14 @@ class Pipeline:
         print(f'[detect] mode={mode} roi={region} stride={ocr_stride} adaptive=feedback')
         all_boxes, detection = self._detect_timeline(
             input_path, region, ocr_stride, ocr_refine_radius, progress)
+        cuda_memory_snapshot('after OCR timeline')
         total = len(all_boxes)
         print(f'[detect] sampled={detection["sampled"]} refined={detection["refined"]} '
               f'ocr_calls={detection["ocr_calls"]} tracks={detection["tracks"]} '
               f'discarded={detection["discarded"]}')
         sticker_boxes = {}
         if locate_stickers:
+            detector = None
             try:
                 if self.sticker_backend == 'gdino':
                     # 先保留优先采样，剩余预算用于反馈补查；逐帧只做局部外观核验。
@@ -864,9 +904,13 @@ class Pipeline:
                                      for y1, y2, x1, x2 in boxes]
                                  for i, boxes in associated.items()}
                 print(f'[sticker-{self.sticker_backend}] associated_frames={len(sticker_boxes)}')
-                self._release_sticker_detector()
+                cuda_memory_snapshot(f'after {self.sticker_backend} detection')
             except Exception as exc:
                 print(f'[sticker-{self.sticker_backend}] 跳过贴纸层: {type(exc).__name__}')
+            finally:
+                # 检测结果已经物化为普通 numpy 框；释放 DINO 后再加载 ProPainter。
+                detector = None
+                self._release_sticker_detector()
 
         # 第二遍:修复 + 写出
         frame_tb = 1 / rate
@@ -896,6 +940,7 @@ class Pipeline:
                 region, outline_radius=GLYPH_OUTLINE_RADIUS + (subtitle_strength == 'light')
             ) if temporal_glyphs else None
             print(f'[propainter] temporal_glyphs={"enabled" if temporal else "disabled"}')
+            cuda_memory_snapshot('before ProPainter segments', reset_peak=True)
 
             def flush_segment(n_out):
                 """处理当前缓冲:送入全部帧(含尾部重叠上下文),只输出前 n_out 帧。
@@ -926,8 +971,10 @@ class Pipeline:
                     effective_masks, effective_boxes = seg_masks, seg_boxes
                 if any(mask.any() for mask in effective_masks):
                     self._ensure_propainter()
+                    cuda_memory_snapshot(f'ProPainter segment {seg_pts[0]}-{seg_pts[n_out - 1]} before')
                     comps, repairs = self._repair_propainter_segment(
                         seg_frames, effective_masks, effective_boxes, white_glyph_check)
+                    cuda_memory_snapshot(f'ProPainter segment {seg_pts[0]}-{seg_pts[n_out - 1]} after')
                 else:
                     comps, repairs = seg_frames, 0
                 n_repair += repairs
@@ -1061,6 +1108,7 @@ class Pipeline:
               f'残留复核 {check_status} | 补擦 {n_repair} | 疑似残留 {n_unresolved} | '
               f'复核未完成 {n_check_failed} | '
               f'耗时 {time.time() - t0:.0f}s → {output_path}')
+        cuda_memory_snapshot('after process_video')
         return {'frames': n, 'inpainted': n_fixed, 'repaired': n_repair,
                 'template_recovered': int(n_recovered), 'unresolved': n_unresolved,
                 'residual_check_failed': n_check_failed,
