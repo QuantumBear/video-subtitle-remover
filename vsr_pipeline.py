@@ -18,6 +18,7 @@
   库:   Pipeline(...).process_video(input_path, output_path)
 """
 import argparse
+import gc
 import json
 import math
 import os
@@ -1133,6 +1134,14 @@ class Pipeline:
                     for pkt in ov.encode(out_frame):
                         dst.mux(pkt)
                 seg_frames, seg_pts, seg_boxes = [], [], []
+                # 释放本段张量与 CUDA 缓存池:reserved 只增不减(allocator 缓存
+                # 复用),687 帧实测能爬到 11+GiB 而 allocated 全程 0.07GiB。
+                # 不清理在长视频/高并发场景下会耗尽 free 显存触发 OOM，即使
+                # 实际占用很小。sttn_auto_inpaint.py 与 _release_sticker_detector
+                # 都在同等位置做这一步，此前本分支和 ProPainter 分支都遗漏了
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             for frame in src.decode(video=0):
                 n += 1

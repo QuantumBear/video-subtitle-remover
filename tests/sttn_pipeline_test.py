@@ -145,6 +145,45 @@ def test_segments_respect_max_load_and_never_exceed_it(tmp_path):
     assert sum(sizes) == STTN_SEG_LEN * 2 + 7
 
 
+def test_segment_flush_releases_cuda_cache(tmp_path, monkeypatch):
+    """每段处理完必须清理 CUDA 缓存池，否则 reserved 单调爬升不释放。
+
+    实测：687 帧(~23秒)视频跑完后 reserved 涨到 11+GiB，而 allocated
+    全程稳定在 0.07GiB——PyTorch 的缓存池从未归还给驱动。这不是内存
+    泄漏(allocated 没有增长)，但长视频/高并发场景下会耗尽 free 显存
+    触发 OOM。backend/inpaint/sttn_auto_inpaint.py 的既有实现和
+    _release_sticker_detector 都在这个位置做 gc.collect+empty_cache，
+    ProPainter 分支和本模式改动前的 sttn 分支都遗漏了这一步。
+    """
+    import vsr_pipeline
+
+    source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    make_video(source, [90] * (STTN_SEG_LEN + 5))
+    pipe = make_pipe()
+    record_calls(pipe)
+
+    # cuda_memory_snapshot 在 is_available()=True 时还会调 reset_peak_memory_stats/
+    # memory_allocated/memory_reserved/max_memory_*/mem_get_info；CPU-only 的
+    # torch 构建里这些真实调用会触发 _lazy_init 断言，逐一打桩避免误报
+    cuda = vsr_pipeline.torch.cuda
+    monkeypatch.setattr(cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cuda, "reset_peak_memory_stats", lambda: None)
+    monkeypatch.setattr(cuda, "memory_allocated", lambda: 0)
+    monkeypatch.setattr(cuda, "memory_reserved", lambda: 0)
+    monkeypatch.setattr(cuda, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(cuda, "max_memory_reserved", lambda: 0)
+    monkeypatch.setattr(cuda, "mem_get_info", lambda: (0, 1))
+    calls = []
+    monkeypatch.setattr(cuda, "empty_cache", lambda: calls.append("empty_cache"))
+    monkeypatch.setattr(vsr_pipeline.gc, "collect", lambda: calls.append("gc.collect"))
+
+    pipe.process_video(source, output, region=REGION, locate_stickers=False)
+
+    # 两段(STTN_SEG_LEN+5 帧按 STTN_SEG_LEN 切分产生 2 段)，每段各清理一次
+    assert calls.count("empty_cache") == 2
+    assert calls.count("gc.collect") == 2
+
+
 def test_segments_do_not_cross_scene_changes(tmp_path):
     source, output = tmp_path / "scenes.mp4", tmp_path / "out.mp4"
     make_video(source, [0] * 23 + [120] * 20)
