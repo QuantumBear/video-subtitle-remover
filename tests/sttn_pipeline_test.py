@@ -213,3 +213,118 @@ def test_stats_report_sttn_mode(tmp_path):
     assert stats["inpainted"] == 12
     assert stats["residual_check_enabled"] is False
     assert stats["temporal_glyphs_enabled"] is False
+
+
+# ---- 残留检测(仅标记,不自动修复) ----
+#
+# 实测证明 STTN 在已覆盖区域内的生成质量本身不稳定(偶发发白/发糊)，
+# 不是遮罩形状问题：真实素材上两种独立的后处理修复尝试都不能稳定改善
+# ——cv2.inpaint 空间补反而更白，用相邻干净帧做时间复制在一个案例上改善
+# 却在另一个案例上变差，找不出决定成败的变量。因此 sttn 分支只做检测和
+# 计数，不尝试自动修复：把有缺陷的段交给使用者复核或换 propainter 重跑，
+# 而不是无声地把缺陷结果当成功交付。
+
+def test_residual_probe_checks_every_frame_with_a_box(tmp_path):
+    """探测行为本身:逐帧调用探测，用真实原帧/输出帧作证据。
+
+    _residual_mask 判据本身（同极性笔画重合、抗新增白背景误报等）已由
+    tests/glyph_residual_test.py 独立覆盖，这里只验证 flush_sttn 是否
+    正确接入了探测——每个有检出框的帧都应被探测一次，参数顺序与
+    ProPainter 分支一致：(引擎输出, 原帧, 该帧检出框)。
+    """
+    source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    make_video(source, [90] * 6)
+    pipe = make_pipe()
+    pipe.inpainter = lambda frames, mask: [f.copy() for f in frames]
+    pipe._ensure_sttn = lambda: None
+
+    probed = []
+    original_probe = Pipeline._residual_mask
+
+    def spy_probe(self, fixed_bgr, original_bgr, boxes):
+        probed.append((np.array_equal(fixed_bgr, original_bgr), boxes))
+        return original_probe(self, fixed_bgr, original_bgr, boxes)
+
+    pipe._residual_mask = spy_probe.__get__(pipe, Pipeline)
+    pipe.process_video(source, output, region=REGION, locate_stickers=False)
+
+    assert len(probed) == 6, "应对每个有检出框的帧都调用探测"
+    assert all(is_identity for is_identity, _ in probed), "引擎原样返回时不应报告缺陷"
+    assert all(boxes == [BOX] for _, boxes in probed), "探测须用该帧自己的框，不是段级并集"
+
+
+def test_residual_probe_flags_frame_with_visible_defect(tmp_path):
+    """复用 _residual_mask（已验证对发白/发糊两类真实缺陷都敏感）逐帧探测。"""
+    source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    make_video(source, [90] * 6)
+    pipe = make_pipe()
+
+    def engine(frames, mask):
+        # 制造 _residual_mask 能识别的结构性缺陷:原帧笔画状高对比条纹在
+        # 输出中被铣平——这正是 glyph_residual_test.py 里验证过的判据形态
+        out = []
+        for f in frames:
+            comp = f.copy()
+            comp[mask > 0] = 160
+            out.append(comp)
+        return out
+
+    def stub_residual(self, fixed_bgr, original_bgr, boxes):
+        # 只验证计数/累加逻辑，不重复验证 _residual_mask 内部像素判据
+        return np.full(fixed_bgr.shape[:2], 255, dtype='uint8')
+
+    pipe.inpainter = engine
+    pipe._ensure_sttn = lambda: None
+    pipe._residual_mask = stub_residual.__get__(pipe, Pipeline)
+    stats = pipe.process_video(source, output, region=REGION, locate_stickers=False)
+    assert stats["unresolved"] == 6
+
+
+def test_residual_probe_does_not_alter_output_pixels(tmp_path):
+    """检测只计数，不修改任何输出像素——这是本次范围的核心约束。"""
+    source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    make_video(source, [90] * 6)
+    pipe = make_pipe()
+
+    def engine(frames, mask):
+        out = []
+        for f in frames:
+            comp = f.copy()
+            comp[BOX[0]:BOX[1], BOX[2]:BOX[3]] = 250  # 明显异常，理应被探测到但不应被改写
+            out.append(comp)
+        return out
+
+    def stub_residual(self, fixed_bgr, original_bgr, boxes):
+        return np.full(fixed_bgr.shape[:2], 255, dtype='uint8')  # 强制判定为缺陷
+
+    pipe.inpainter = engine
+    pipe._ensure_sttn = lambda: None
+    pipe._residual_mask = stub_residual.__get__(pipe, Pipeline)
+    stats = pipe.process_video(source, output, region=REGION, locate_stickers=False)
+    assert stats["unresolved"] == 6  # 确认探测确实判定了缺陷，不是没触发就通过
+    with av.open(str(output)) as result:
+        frame = next(result.decode(video=0))
+        img = np.asarray(frame.to_image())
+    ymin, ymax, xmin, xmax = BOX
+    # H.264 有损编码会引入个位数噪声，不能断言精确相等
+    assert img[ymin:ymax, xmin:xmax].mean() > 235
+
+
+def test_residual_probe_runs_without_white_glyph_check_flag(tmp_path):
+    """探测在 sttn 分支内置生效，不依赖被本分支拒绝的 white_glyph_check 开关。"""
+    source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    make_video(source, [90] * 6)
+    pipe = make_pipe()
+    record_calls(pipe)
+    stats = pipe.process_video(source, output, region=REGION, locate_stickers=False)
+    assert "unresolved" in stats
+    assert stats["residual_check_enabled"] is False  # 开关本身仍是字形专属，标记不属于它
+
+
+def test_residual_probe_skipped_when_no_detection(tmp_path):
+    source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    make_video(source, [90] * 8)
+    pipe = make_pipe(lambda img, region: [])
+    pipe._ensure_sttn = lambda: pytest.fail("无字幕视频不应加载 STTN 权重")
+    stats = pipe.process_video(source, output, region=REGION, locate_stickers=False)
+    assert stats["unresolved"] == 0

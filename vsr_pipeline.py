@@ -1102,7 +1102,7 @@ class Pipeline:
             seg_frames, seg_pts, seg_boxes = [], [], []
 
             def flush_sttn():
-                nonlocal seg_frames, seg_pts, seg_boxes, n, n_fixed
+                nonlocal seg_frames, seg_pts, seg_boxes, n, n_fixed, n_unresolved
                 if not seg_frames:
                     return
                 union = [b for boxes in seg_boxes for b in boxes]
@@ -1118,6 +1118,14 @@ class Pipeline:
                 for idx, (comp, pts) in enumerate(zip(comps, seg_pts)):
                     # ROI 之外严格保留原帧,与 ProPainter 分支同一约定
                     out_bgr = np.where(roi_mask[:, :, None] > 0, comp, seg_frames[idx])
+                    # 残留探测(检测+计数，不修复):实测证明 STTN 在已覆盖区域内
+                    # 生成质量本身不稳定(偶发发白/发糊)，是引擎能力问题而非遮罩
+                    # 形状问题——两种独立的后处理修复尝试都不能稳定改善，因此
+                    # 不做自动补像素，只用 ProPainter 分支同款判据标记疑似残留，
+                    # 交给调用方复核或换 propainter 重跑
+                    if np.count_nonzero(
+                            self._residual_mask(out_bgr, seg_frames[idx], seg_boxes[idx])) >= RESID_MIN_PX:
+                        n_unresolved += 1
                     out_frame = av.VideoFrame.from_ndarray(
                         cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB), format='rgb24')
                     out_frame.pts = pts
