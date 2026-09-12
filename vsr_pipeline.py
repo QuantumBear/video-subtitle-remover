@@ -92,6 +92,14 @@ WHITE_RB_MAX = 25        # |R-B| 上限:排除蓝裤腿等彩色亮物
 MIN_BOX_ASPECT = 1.8     # 检出框最小宽高比(w/h):字幕行是水平长条(实测≥2.7),
                          # 近方形框是动物/物体误检(实测狗被检出 1.1:1 的框),
                          # 贴纸通过独立的贴纸定位后端处理，不依赖 OCR 框下扩
+MAX_BOX_HEIGHT_PERMILLE = 80  # 检出框高度上限(占帧高千分比)。宽高比判据挡不住
+                         # "宽且高"的误检块(600x300 的比值 2.0 即可通过);这类框
+                         # 若框内白字不足会走整框矩形擦除，把整块画面重绘。
+                         # 标定自样片全片 OCR:正常框高 p99 占帧高 2.8%,
+                         # 误检块占 13.9% 与 26.3%,取 8% 留约 2.8 倍余量
+MAX_BOX_HEIGHT_FLOOR = 90  # 高度上限的绝对下限(px)。纯相对阈值在小分辨率下会
+                         # 收得比真实文字行还紧(360p 时 8% 仅 28px),必须与该
+                         # 下限取大。取值对齐 filter_glyph_by_height 的 max_h
 RESID_MIN_PX = 50        # 帧内残留像素超过该值才触发补擦(抗压缩噪声)
 OCR_STRIDE = 5          # 稳定时的最大间隔；有变化立即回到逐帧检测
 OCR_REFINE_RADIUS = 15  # 变化时向前补查的最大帧数
@@ -435,6 +443,11 @@ class Pipeline:
                 bw, bh = x2 - x1, y2 - y1
                 # 宽高比过滤:字幕行是水平长条;近方形框是动物/物体误检
                 if bw < MIN_BOX_ASPECT * bh:
+                    continue
+                # 高度过滤:宽高比放过的"宽且高"误检块由此拦下,
+                # 否则框内白字不足时会走整框矩形擦除重绘整块画面
+                if bh > max(frame_rgb.shape[0] * MAX_BOX_HEIGHT_PERMILLE / 1000,
+                            MAX_BOX_HEIGHT_FLOOR):
                     continue
                 # 坐标平移回全帧,外扩后输出
                 box = (max(ymin, int(y1) + ymin - MASK_PAD),
