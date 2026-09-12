@@ -4,7 +4,8 @@
 流程:
   1. PaddleOCR 按检测反馈调整采样间隔，物化独立的逐帧字幕轨迹
   2. 可选贴纸定位(DashScope VLM 或本地 GroundingDINO)，经时间/空间关联后生成独立遮罩
-  3. LAMA 单帧或 ProPainter 分段修复，受限白字残留复核
+  3. LAMA 单帧、ProPainter 分段或 STTN 带级修复，受限白字残留复核
+     (字形级遮罩与残留复核仅 ProPainter/LAMA 适用;STTN 走整框矩形遮罩)
   4. 合回源音频；最终画质仍需关键帧验收
 
 与 backend/main.py 的区别:
@@ -111,6 +112,10 @@ SCENE_MEAN_DIFF = 18.0
 PROPAINTER_SEG_LEN = 40
 PROPAINTER_OVERLAP = 20
 PROPAINTER_SUB_VIDEO_LENGTH = PROPAINTER_SEG_LEN + PROPAINTER_OVERLAP
+# STTN 段长。取值须 >= neighbor_stride * ref_length(5*10),否则参考帧采样
+# 覆盖不到整段;STTN 显存占用远低于 ProPainter,50 帧在 24G 卡上余量充足。
+# 不设重叠:STTN 的参考帧机制已在段内提供全局上下文
+STTN_SEG_LEN = 50
 # ffmpeg:优先用系统 PATH 里的(服务器/Linux 场景),否则回退仓库自带的平台二进制
 FFMPEG = shutil.which('ffmpeg') or os.path.join(BASE_DIR, 'backend', 'ffmpeg', 'macos', 'ffmpeg')
 
@@ -377,6 +382,15 @@ class Pipeline:
             self.inpainter = None
             print(f'[init] ProPainter 模式(引擎将在首次修复时加载,device: {self._pp_device})')
             cuda_memory_snapshot('after Pipeline init')
+        elif inpaint_mode == 'sttn':
+            # STTN 带级时序修复:速度与显存远优于 ProPainter(实测同片
+            # ProPainter 逾 15 分钟),代价是擦除区纹理偏平坦——它在遮罩区
+            # 生成低频内容,且整条修复带被压到 432x240。适合吞吐优先的场景,
+            # 画质优先仍用 propainter
+            self._sttn_device = torch.device('cuda' if (device == 'auto' and torch.cuda.is_available()) or device == 'cuda' else 'cpu')
+            self.inpainter = None
+            print(f'[init] STTN 模式(引擎将在首次修复时加载,device: {self._sttn_device})')
+            cuda_memory_snapshot('after Pipeline init')
         else:
             raise ValueError(f'未知 inpaint_mode: {inpaint_mode}')
 
@@ -391,6 +405,18 @@ class Pipeline:
             print(f'[init] 贴纸检测器就绪(device: {self._sticker_detector.device})')
             cuda_memory_snapshot('after GroundingDINO init')
         return self._sticker_detector
+
+    def _ensure_sttn(self):
+        """STTN 惰性加载(首次修复时)。"""
+        if self.inpainter is None:
+            from backend.inpaint.sttn_det_inpaint import STTNDetInpaint
+            from backend.tools.model_config import ModelConfig
+            self.inpainter = STTNDetInpaint(
+                device=self._sttn_device,
+                model_path=ModelConfig().STTN_DET_MODEL_PATH,
+            )
+            print('[init] STTN 已加载')
+            cuda_memory_snapshot('after STTN init', reset_peak=True)
 
     def _ensure_propainter(self):
         """ProPainter 惰性加载(首次修复时)。"""
@@ -857,6 +883,21 @@ class Pipeline:
             raise ValueError('template_refine 与 temporal_glyphs 不能同时开启')
         if temporal_glyphs and self.inpaint_mode != 'propainter':
             raise ValueError('temporal_glyphs 仅支持 propainter')
+        if self.inpaint_mode == 'sttn':
+            # STTN 走整框矩形遮罩:笔画级精度在 432x240 的横向压缩中必然丢失。
+            # 字形相关能力一律显式报错而非静默忽略——静默降级会让调用方
+            # 误以为字形保护仍然生效
+            # temporal_glyphs 已由上面的通用守卫覆盖(它只允许 propainter)
+            for name, enabled in (('white_glyph_check', white_glyph_check),
+                                  ('template_refine', template_refine)):
+                if enabled:
+                    raise ValueError(
+                        f'{name} 依赖字形级遮罩，sttn 模式不支持;'
+                        '需要字形保护请改用 --inpaint-mode propainter')
+            if subtitle_strength != DEFAULT_SUBTITLE_STRENGTH:
+                raise ValueError(
+                    f'subtitle_strength={subtitle_strength} 仅对字形遮罩生效，'
+                    'sttn 模式不支持;需要该能力请改用 --inpaint-mode propainter')
         input_path, output_path = os.fspath(input_path), os.fspath(output_path)
         with av.open(input_path) as metadata:
             vstream = metadata.streams.video[0]
@@ -1052,6 +1093,64 @@ class Pipeline:
             for pkt in ov.encode():
                 dst.mux(pkt)
             dst.close()
+        elif self.inpaint_mode == 'sttn':
+            # ---- STTN 分支:按连续字幕段批处理,整框矩形遮罩 ----
+            # 与 ProPainter 分支的两点差异:
+            #   1. 遮罩是整框矩形而非字形级——笔画宽度只有数像素,在
+            #      432x240 的横向 1.67 倍压缩中必然与相邻背景混入同一像素
+            #   2. STTN.__call__ 只接单张遮罩,故整段共用段内检出框的并集
+            seg_frames, seg_pts, seg_boxes = [], [], []
+
+            def flush_sttn():
+                nonlocal seg_frames, seg_pts, seg_boxes, n, n_fixed
+                if not seg_frames:
+                    return
+                union = [b for boxes in seg_boxes for b in boxes]
+                if union:
+                    self._ensure_sttn()
+                    cuda_memory_snapshot(f'STTN segment {seg_pts[0]}-{seg_pts[-1]} before')
+                    mask = self.boxes_to_mask(union, h, w)
+                    comps = self.inpainter(seg_frames, mask)
+                    cuda_memory_snapshot(f'STTN segment {seg_pts[0]}-{seg_pts[-1]} after')
+                    n_fixed += len(seg_frames)
+                else:
+                    comps = seg_frames
+                for idx, (comp, pts) in enumerate(zip(comps, seg_pts)):
+                    # ROI 之外严格保留原帧,与 ProPainter 分支同一约定
+                    out_bgr = np.where(roi_mask[:, :, None] > 0, comp, seg_frames[idx])
+                    out_frame = av.VideoFrame.from_ndarray(
+                        cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB), format='rgb24')
+                    out_frame.pts = pts
+                    out_frame.time_base = frame_tb
+                    for pkt in ov.encode(out_frame):
+                        dst.mux(pkt)
+                seg_frames, seg_pts, seg_boxes = [], [], []
+
+            for frame in src.decode(video=0):
+                n += 1
+                if n - 1 in scene_changes:
+                    flush_sttn()
+                boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
+                boxes = boxes + sticker_boxes.get(n - 1, [])
+                if boxes:
+                    img = np.asarray(frame.to_image())  # RGB
+                    seg_frames.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                    seg_pts.append(n - 1)
+                    seg_boxes.append(boxes)
+                    if len(seg_frames) >= STTN_SEG_LEN:
+                        flush_sttn()
+                else:
+                    flush_sttn()   # 段结束:无字幕帧原样写出
+                    frame.pts = n - 1
+                    frame.time_base = frame_tb
+                    for pkt in ov.encode(frame):
+                        dst.mux(pkt)
+                if progress and (n % 30 == 0 or n == total):
+                    progress(n, total, f'STTN 修复 {n_fixed}')
+            flush_sttn()
+            for pkt in ov.encode():
+                dst.mux(pkt)
+            dst.close()
         else:
             # ---- LAMA 分支:逐帧修复 + 白字自检 + 补擦 + 防闪混合 ----
             for frame in src.decode(video=0):
@@ -1159,8 +1258,10 @@ def main():
     ap.add_argument('--threads', type=int, default=None, help='torch CPU 线程数(多 worker 并发时调小)')
     ap.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'],
                     help="推理设备:auto=有 CUDA 用 GPU(默认)")
-    ap.add_argument('--inpaint-mode', default='lama', choices=['lama', 'propainter'],
-                    help='lama=单帧快速;propainter=时序修复(质量高,需 GPU,显存大)')
+    ap.add_argument('--inpaint-mode', default='lama', choices=['lama', 'propainter', 'sttn'],
+                    help='lama=单帧快速;propainter=时序修复(质量最高,需 GPU,显存大,耗时长);'
+                         'sttn=带级时序修复(快且省显存,擦除区纹理偏平坦,'
+                         '整框矩形遮罩,不支持字形相关开关)')
     ap.add_argument('--no-locate-stickers', dest='locate_stickers', action='store_false',
                     help='关闭贴纸/emoji 定位(默认开启)')
     ap.add_argument('--sticker-backend', default=DEFAULT_STICKER_BACKEND,
@@ -1187,6 +1288,14 @@ def main():
         ap.error('--template-refine 与 --temporal-glyphs 不能同时开启')
     if args.temporal_glyphs and args.inpaint_mode != 'propainter':
         ap.error('--temporal-glyphs 仅支持 --inpaint-mode propainter')
+    if args.inpaint_mode == 'sttn':
+        # sttn 走整框矩形遮罩,字形相关开关一律显式拒绝(与 process_video 同一口径)
+        if args.white_glyph_check:
+            ap.error('--white-glyph-check 依赖字形级遮罩，不支持 --inpaint-mode sttn')
+        if args.template_refine:
+            ap.error('--template-refine 依赖字形级遮罩，不支持 --inpaint-mode sttn')
+        if args.subtitle_strength != DEFAULT_SUBTITLE_STRENGTH:
+            ap.error('--subtitle-strength 仅对字形遮罩生效，不支持 --inpaint-mode sttn')
 
     pipe = Pipeline(threads=args.threads, device=args.device, inpaint_mode=args.inpaint_mode,
                     sticker_backend=args.sticker_backend,
