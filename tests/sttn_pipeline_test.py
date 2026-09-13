@@ -424,6 +424,48 @@ def test_residual_probe_runs_without_white_glyph_check_flag(tmp_path):
     assert stats["residual_check_enabled"] is False  # 开关本身仍是字形专属，标记不属于它
 
 
+def test_sttn_residual_can_be_delegated_to_propainter(tmp_path):
+    source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    make_video(source, [90] * 6)
+    pipe = make_pipe()
+    pp_calls = []
+
+    def sttn_engine(frames, mask, x_bounds=None):
+        return [f.copy() for f in frames]
+
+    class FakePropainter:
+        def inpaint(self, frames, masks):
+            pp_calls.append((len(frames), [int(np.count_nonzero(m)) for m in masks]))
+            return [np.full_like(frame, 33) for frame in frames]
+
+    pipe.inpainter = sttn_engine
+    pipe._ensure_sttn = lambda: None
+    pipe._ensure_propainter = lambda: setattr(pipe, '_propainter_inpainter', FakePropainter())
+    pipe._residual_mask = lambda fixed, original, boxes: np.full(
+        fixed.shape[:2], 255, dtype=np.uint8)
+
+    stats = pipe.process_video(source, output, region=REGION,
+                               locate_stickers=False,
+                               sttn_residual_propainter=True)
+
+    assert stats['unresolved'] == 6
+    assert pp_calls, '残留段开启转交后应调用 ProPainter'
+    assert pp_calls[0][0] >= 6, 'ProPainter 输入应包含残留段上下文'
+    assert any(count > 0 for count in pp_calls[0][1])
+
+
+def test_sttn_residual_propainter_is_opt_in(tmp_path):
+    source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    make_video(source, [90] * 6)
+    pipe = make_pipe()
+    pipe.inpainter = lambda frames, mask, x_bounds=None: [f.copy() for f in frames]
+    pipe._ensure_sttn = lambda: None
+    pipe._ensure_propainter = lambda: pytest.fail('默认不应加载 ProPainter')
+    pipe._residual_mask = lambda fixed, original, boxes: np.full(
+        fixed.shape[:2], 255, dtype=np.uint8)
+    pipe.process_video(source, output, region=REGION, locate_stickers=False)
+
+
 def test_residual_probe_skipped_when_no_detection(tmp_path):
     source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
     make_video(source, [90] * 8)

@@ -388,6 +388,7 @@ class Pipeline:
             # 回来,重建质量远超单帧 LAMA(对照 kaipai 目标效果);显存大,
             # 必须 GPU,首次用到时才加载
             self._pp_device = torch.device('cuda' if (device == 'auto' and torch.cuda.is_available()) or device == 'cuda' else 'cpu')
+            self._propainter_inpainter = None
             self.inpainter = None
             print(f'[init] ProPainter 模式(引擎将在首次修复时加载,device: {self._pp_device})')
             cuda_memory_snapshot('after Pipeline init')
@@ -397,6 +398,8 @@ class Pipeline:
             # 生成低频内容,且整条修复带被压到 432x240。适合吞吐优先的场景,
             # 画质优先仍用 propainter
             self._sttn_device = torch.device('cuda' if (device == 'auto' and torch.cuda.is_available()) or device == 'cuda' else 'cpu')
+            self._pp_device = self._sttn_device
+            self._propainter_inpainter = None
             self.inpainter = None
             print(f'[init] STTN 模式(引擎将在首次修复时加载,device: {self._sttn_device})')
             cuda_memory_snapshot('after Pipeline init')
@@ -429,15 +432,25 @@ class Pipeline:
 
     def _ensure_propainter(self):
         """ProPainter 惰性加载(首次修复时)。"""
-        if self.inpainter is None:
+        # 兼容测试替身和旧调用方：ProPainter 模式下若调用方已经注入
+        # self.inpainter，就直接复用，不重复加载模型。
+        if (getattr(self, '_propainter_inpainter', None) is None
+                and self.inpaint_mode == 'propainter'
+                and getattr(self, 'inpainter', None) is not None):
+            self._propainter_inpainter = self.inpainter
+            return
+        if getattr(self, '_propainter_inpainter', None) is None:
             from backend.inpaint.propainter_inpaint import PropainterInpaint
             from backend.tools.model_config import ModelConfig
-            self.inpainter = PropainterInpaint(
+            engine = PropainterInpaint(
                 device=self._pp_device,
                 model_dir=ModelConfig().PROPAINTER_MODEL_DIR,
                 sub_video_length=PROPAINTER_SUB_VIDEO_LENGTH,
                 use_fp16=self._pp_device.type == 'cuda',
             )
+            self._propainter_inpainter = engine
+            if self.inpaint_mode == 'propainter':
+                self.inpainter = engine
             print('[init] ProPainter 已加载')
             cuda_memory_snapshot('after ProPainter init', reset_peak=True)
 
@@ -761,13 +774,20 @@ class Pipeline:
             residual = cv2.bitwise_or(residual, matched)
         return cv2.bitwise_and(residual, self.boxes_to_mask(boxes, h, w))
 
-    def _repair_propainter_segment(self, frames_bgr, masks, boxes, white_glyph_check=True):
+    def _repair_propainter_segment(self, frames_bgr, masks, boxes, white_glyph_check=True,
+                                   engine=None):
+        engine = engine or self.inpainter
         if len(frames_bgr) == 1:
             # RAFT 需要帧对；复制末帧只补上下文，不增加输出帧数。
-            result, repairs = self._repair_propainter_segment(
-                frames_bgr * 2, masks * 2, boxes * 2, white_glyph_check)
+            if engine is self.inpainter:
+                result, repairs = self._repair_propainter_segment(
+                    frames_bgr * 2, masks * 2, boxes * 2, white_glyph_check)
+            else:
+                result, repairs = self._repair_propainter_segment(
+                    frames_bgr * 2, masks * 2, boxes * 2,
+                    white_glyph_check, engine=engine)
             return result[:1], repairs
-        raw = self.inpainter.inpaint(frames_bgr, masks)
+        raw = engine.inpaint(frames_bgr, masks)
         # 模型内部膨胀仅用于推理，输出严格限制在调用方的精确遮罩内。
         first = [np.where(mask[:, :, None] > 0, fixed, original)
                  for fixed, original, mask in zip(raw, frames_bgr, masks)]
@@ -790,7 +810,7 @@ class Pipeline:
                     cv2.bitwise_and(masks[i], self.boxes_to_mask(boxes[i], *residual[i].shape)))
                     for i in range(lo, hi + 1)]
                 # 二次修复以首轮结果为输入，避免把已擦掉的文字重新传播回来。
-                second = self.inpainter.inpaint([f.copy() for f in first[lo:hi + 1]], local_masks)
+                second = engine.inpaint([f.copy() for f in first[lo:hi + 1]], local_masks)
                 if len(second) != hi - lo + 1:
                     raise ValueError('unexpected repair frame count')
                 repaired_frames = [np.where(mask[:, :, None] > 0, repaired, first[i])
@@ -862,7 +882,7 @@ class Pipeline:
                       vlm_max_calls=32, sticker_max_frames=None,
                       sticker_prompt=None, sticker_score=None,
                       sticker_max_area_px=None, subtitle_strength=DEFAULT_SUBTITLE_STRENGTH,
-                      temporal_glyphs=False):
+                      temporal_glyphs=False, sttn_residual_propainter=False):
         """处理单条视频：反馈式 OCR 和轨迹检测，然后按帧或分段修复。
 
         :param region: (ymin, ymax, xmin, xmax) 字幕区域;None 时自动推断字幕带,
@@ -885,6 +905,7 @@ class Pipeline:
         :param sticker_max_area_px: 仅 gdino 后端生效，贴纸框绝对像素面积上限。
                                     这是区分 emoji 与整幅物体误检的关键判据,
                                     用绝对像素而非相对比例,避免 ROI 尺寸变化时判据漂移
+        :param sttn_residual_propainter: STTN 模式下将疑似残留帧段交给 ProPainter；默认关闭。
         """
         if subtitle_strength not in SUBTITLE_STRENGTHS:
             raise ValueError(f'未知 subtitle_strength: {subtitle_strength}')
@@ -1155,6 +1176,32 @@ class Pipeline:
                     n_fixed += sum(seg_core)
                 else:
                     comps = seg_frames
+                if sttn_residual_propainter and any(seg_boxes):
+                    residual_indices = []
+                    for idx, (comp, boxes) in enumerate(zip(comps, seg_boxes)):
+                        if not seg_core[idx] or not boxes:
+                            continue
+                        residual = self._residual_mask(comp, seg_frames[idx], boxes)
+                        if np.count_nonzero(residual) >= RESID_MIN_PX:
+                            residual_indices.append(idx)
+                    runs = merge_residual_runs(
+                        residual_indices, total=len(comps), context=5, max_runs=3)
+                    if runs:
+                        self._ensure_propainter()
+                        pp_engine = self._propainter_inpainter
+                        for lo, hi in runs:
+                            pp_frames = [comps[i].copy() for i in range(lo, hi + 1)]
+                            pp_masks = [
+                                self.boxes_to_mask(seg_boxes[i], h, w)
+                                if i in residual_indices else np.zeros((h, w), dtype='uint8')
+                                for i in range(lo, hi + 1)]
+                            pp_boxes = [seg_boxes[i] for i in range(lo, hi + 1)]
+                            repaired, _ = self._repair_propainter_segment(
+                                pp_frames, pp_masks, pp_boxes,
+                                white_glyph_check=False, engine=pp_engine)
+                            for i in residual_indices:
+                                if lo <= i <= hi:
+                                    comps[i] = repaired[i - lo]
                 for idx, (comp, pts) in enumerate(zip(comps, seg_pts)):
                     if not seg_core[idx]:
                         # 上下文帧只参与 STTN 参考，输出时保留原始像素。
@@ -1332,6 +1379,8 @@ def main():
                     help='开启字幕模板补全(诊断期间默认关闭)')
     ap.add_argument('--temporal-glyphs', action='store_true',
                     help='试验性跨帧白字补全(仅 ProPainter,默认关闭,与 --template-refine 互斥)')
+    ap.add_argument('--sttn-residual-propaint', action='store_true',
+                    help='STTN 模式下将疑似残留帧段交给 ProPainter(默认关闭,会增加耗时)')
     ap.add_argument('--subtitle-strength', choices=SUBTITLE_STRENGTHS,
                     default=DEFAULT_SUBTITLE_STRENGTH,
                     help='仅 ProPainter:light=轻度增强(默认,字形描边多覆盖 1px);'
@@ -1387,6 +1436,7 @@ def main():
         white_glyph_check=args.white_glyph_check,
         template_refine=args.template_refine,
         temporal_glyphs=args.temporal_glyphs,
+        sttn_residual_propainter=args.sttn_residual_propaint,
         subtitle_strength=args.subtitle_strength,
         locate_stickers=args.locate_stickers,
         ocr_stride=args.ocr_stride, ocr_refine_radius=args.ocr_refine_radius,
