@@ -48,8 +48,7 @@ class STTNDetInpaint:
         return max(1, min(split_h, frame_height))
 
     def __call__(self, input_frames: List[np.ndarray],
-                 input_mask: Union[np.ndarray, List[np.ndarray]], x_bounds=None,
-                 composite_mask=None):
+                 input_mask: Union[np.ndarray, List[np.ndarray]], x_bounds=None):
         """
         :param input_frames: 原视频帧
         :param input_mask: 字幕区域 mask，0/255 二值；可以是单张 ndarray
@@ -58,8 +57,6 @@ class STTNDetInpaint:
             若在此处提前归一成 0/1，模型将收不到空洞信号而退化为恒等重建。
         :param x_bounds: 可选的原图横向 ROI `(xmin, xmax)`；ROI 必须完整覆盖
             所有帧的 mask，模型在裁剪区域内推理后再贴回原图。
-        :param composite_mask: 可选的最终合成 mask；模型仍使用 input_mask
-            推理，但只把结果写回 composite_mask 命中的像素。
         """
         if not input_frames:
             return []
@@ -70,13 +67,9 @@ class STTNDetInpaint:
             masks_hr = list(input_mask)
             if len(masks_hr) != len(input_frames):
                 raise ValueError("逐帧 STTN mask 数量必须与输入帧数一致")
-        if len(masks_hr) != len(input_frames):
-            raise ValueError("逐帧 STTN mask 数量必须与输入帧数一致")
         first_mask = np.asarray(masks_hr[0])
         if first_mask.ndim == 3 and first_mask.shape[-1] == 1:
             first_mask = first_mask[:, :, 0]
-        if first_mask.ndim != 2:
-            raise ValueError("STTN mask 必须是二维图像")
         H_ori, W_ori = first_mask.shape[:2]
         # 修复带的几何范围需要覆盖这一批中所有帧的字幕，但模型和合成
         # 使用每帧自己的 mask，不能把这个并集当成模型 mask。
@@ -91,25 +84,6 @@ class STTNDetInpaint:
             current = np.where(current > 0, 255, 0).astype(np.uint8)
             normalized_masks.append(current[:, :, None])
             union_mask = np.maximum(union_mask, current)
-        if composite_mask is None:
-            composite_hr = normalized_masks
-        elif isinstance(composite_mask, np.ndarray):
-            composite_hr = [composite_mask] * len(input_frames)
-        else:
-            composite_hr = list(composite_mask)
-            if len(composite_hr) != len(input_frames):
-                raise ValueError("逐帧合成 mask 数量必须与输入帧数一致")
-        normalized_composite_masks = []
-        for index, frame_mask in enumerate(composite_hr):
-            current = np.asarray(frame_mask)
-            if current.ndim == 3 and current.shape[-1] == 1:
-                current = current[:, :, 0]
-            if current.ndim != 2 or current.shape != (H_ori, W_ori):
-                raise ValueError("逐帧合成 mask 的尺寸必须一致")
-            current = np.where(
-                (current > 0) & (normalized_masks[index][:, :, 0] > 0),
-                255, 0).astype(np.uint8)
-            normalized_composite_masks.append(current[:, :, None])
         if x_bounds is not None:
             x0, x1 = map(int, x_bounds)
             if not (0 <= x0 < x1 <= W_ori):
@@ -133,9 +107,7 @@ class STTNDetInpaint:
                     return self.__call__(input_frames, input_mask)
                 cropped = self.__call__(
                     [frame[:, x0:x1, :] for frame in input_frames],
-                    [mask[:, x0:x1, :] for mask in normalized_masks],
-                    composite_mask=[mask[:, x0:x1, :]
-                                    for mask in normalized_composite_masks])
+                    [mask[:, x0:x1, :] for mask in normalized_masks])
                 output = [frame.copy() for frame in input_frames]
                 for dst, src in zip(output, cropped):
                     dst[:, x0:x1, :] = src
@@ -183,7 +155,7 @@ class STTNDetInpaint:
                     comp = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2RGB)  # 转换颜色空间
                     # 只替换 mask 命中的像素：修复带整条都经过 432x240 往返缩放，
                     # 无条件覆盖会把带内所有非字幕像素一并换成低分辨率结果
-                    mask_area = normalized_composite_masks[j][ymin:ymax, :] > 0
+                    mask_area = normalized_masks[j][ymin:ymax, :] > 0
                     np.copyto(frame[ymin:ymax, :, :], comp, where=mask_area)
                 # 将最终帧添加到列表
                 inpainted_frames.append(frame)
