@@ -1007,6 +1007,12 @@ class Pipeline:
         n_fixed = n_repair = n_checked = n = 0
         n_recovered = n_unresolved = n_check_failed = 0
         n_temporal_recovered = n_temporal_pixels = 0
+        # STTN 残留转交 ProPainter 的运行统计；默认关闭时保持全为 0。
+        n_sttn_residual_frames = n_sttn_residual_runs = 0
+        n_sttn_propainter_calls = n_sttn_propainter_frames = 0
+        n_sttn_propainter_core_frames = 0
+        n_sttn_propainter_seconds = 0.0
+        n_sttn_propainter_peak_allocated = n_sttn_propainter_peak_reserved = 0
         roi_mask = self.boxes_to_mask([region], h, w)
         scene_changes = set(detection['scene_change_frames'])
 
@@ -1150,6 +1156,10 @@ class Pipeline:
             def flush_sttn():
                 nonlocal seg_frames, seg_pts, seg_boxes, seg_core
                 nonlocal trailing_clean, core_count, n_fixed, n_unresolved
+                nonlocal n_sttn_residual_frames, n_sttn_residual_runs
+                nonlocal n_sttn_propainter_calls, n_sttn_propainter_frames
+                nonlocal n_sttn_propainter_core_frames, n_sttn_propainter_seconds
+                nonlocal n_sttn_propainter_peak_allocated, n_sttn_propainter_peak_reserved
                 if not seg_frames:
                     return
                 if any(seg_boxes):
@@ -1184,8 +1194,10 @@ class Pipeline:
                         residual = self._residual_mask(comp, seg_frames[idx], boxes)
                         if np.count_nonzero(residual) >= RESID_MIN_PX:
                             residual_indices.append(idx)
+                    n_sttn_residual_frames += len(residual_indices)
                     runs = merge_residual_runs(
                         residual_indices, total=len(comps), context=5, max_runs=3)
+                    n_sttn_residual_runs += len(runs)
                     if runs:
                         self._ensure_propainter()
                         pp_engine = self._propainter_inpainter
@@ -1196,9 +1208,37 @@ class Pipeline:
                                 if i in residual_indices else np.zeros((h, w), dtype='uint8')
                                 for i in range(lo, hi + 1)]
                             pp_boxes = [seg_boxes[i] for i in range(lo, hi + 1)]
+                            core_frames = sum(lo <= i <= hi for i in residual_indices)
+                            n_sttn_propainter_calls += 1
+                            n_sttn_propainter_frames += len(pp_frames)
+                            n_sttn_propainter_core_frames += core_frames
+                            started = time.time()
+                            cuda_memory_snapshot(
+                                f'STTN->ProPainter window {seg_pts[lo]}-{seg_pts[hi]} before',
+                                reset_peak=True)
                             repaired, _ = self._repair_propainter_segment(
                                 pp_frames, pp_masks, pp_boxes,
                                 white_glyph_check=False, engine=pp_engine)
+                            elapsed = time.time() - started
+                            window_vram = cuda_memory_snapshot(
+                                f'STTN->ProPainter window {seg_pts[lo]}-{seg_pts[hi]} after')
+                            n_sttn_propainter_seconds += elapsed
+                            if window_vram:
+                                n_sttn_propainter_peak_allocated = max(
+                                    n_sttn_propainter_peak_allocated,
+                                    window_vram['peak_allocated'])
+                                n_sttn_propainter_peak_reserved = max(
+                                    n_sttn_propainter_peak_reserved,
+                                    window_vram['peak_reserved'])
+                            gib = 1024 ** 3
+                            peak_allocated = ((window_vram or {}).get('peak_allocated', 0) / gib)
+                            peak_reserved = ((window_vram or {}).get('peak_reserved', 0) / gib)
+                            print(f'[sttn->propainter] segment={seg_pts[0]}-{seg_pts[-1]} '
+                                  f'window={seg_pts[lo]}-{seg_pts[hi]} '
+                                  f'residual_frames={core_frames} input_frames={len(pp_frames)} '
+                                  f'elapsed={elapsed:.1f}s '
+                                  f'peak_allocated={peak_allocated:.2f}GiB '
+                                  f'peak_reserved={peak_reserved:.2f}GiB')
                             for i in residual_indices:
                                 if lo <= i <= hi:
                                     comps[i] = repaired[i - lo]
@@ -1347,6 +1387,11 @@ class Pipeline:
               f'跨帧字形 {temporal_status} | '
               f'残留复核 {check_status} | 补擦 {n_repair} | 疑似残留 {n_unresolved} | '
               f'复核未完成 {n_check_failed} | '
+              f'STTN残留候选 {n_sttn_residual_frames}帧/{n_sttn_residual_runs}段 | '
+              f'转交ProPainter {n_sttn_propainter_calls}次/{n_sttn_propainter_frames}帧 '
+              f'核心 {n_sttn_propainter_core_frames}帧/{n_sttn_propainter_seconds:.1f}s '
+              f'峰值 {n_sttn_propainter_peak_allocated / (1024 ** 3):.2f}/'
+              f'{n_sttn_propainter_peak_reserved / (1024 ** 3):.2f}GiB | '
               f'耗时 {time.time() - t0:.0f}s → {output_path}')
         cuda_memory_snapshot('after process_video')
         return {'frames': n, 'inpainted': n_fixed, 'repaired': n_repair,
@@ -1356,6 +1401,15 @@ class Pipeline:
                 'temporal_glyphs_enabled': bool(temporal_glyphs),
                 'temporal_glyph_recovered': n_temporal_recovered,
                 'temporal_glyph_added_pixels': n_temporal_pixels,
+                'sttn_residual_propainter_enabled': bool(sttn_residual_propainter),
+                'sttn_residual_frames': n_sttn_residual_frames,
+                'sttn_residual_runs': n_sttn_residual_runs,
+                'sttn_propainter_calls': n_sttn_propainter_calls,
+                'sttn_propainter_frames': n_sttn_propainter_frames,
+                'sttn_propainter_core_frames': n_sttn_propainter_core_frames,
+                'sttn_propainter_seconds': n_sttn_propainter_seconds,
+                'sttn_propainter_peak_allocated_gib': n_sttn_propainter_peak_allocated / (1024 ** 3),
+                'sttn_propainter_peak_reserved_gib': n_sttn_propainter_peak_reserved / (1024 ** 3),
                 'ocr_calls': detection['ocr_calls'], 'tracks': detection['tracks'],
                 'seconds': time.time() - t0}
 

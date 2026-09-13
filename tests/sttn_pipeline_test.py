@@ -452,6 +452,14 @@ def test_sttn_residual_can_be_delegated_to_propainter(tmp_path):
     assert pp_calls, '残留段开启转交后应调用 ProPainter'
     assert pp_calls[0][0] >= 6, 'ProPainter 输入应包含残留段上下文'
     assert any(count > 0 for count in pp_calls[0][1])
+    assert stats['sttn_residual_frames'] == 6
+    assert stats['sttn_residual_runs'] == 1
+    assert stats['sttn_propainter_calls'] == 1
+    assert stats['sttn_propainter_frames'] == pp_calls[0][0]
+    assert stats['sttn_propainter_core_frames'] == 6
+    assert stats['sttn_propainter_seconds'] >= 0
+    assert stats['sttn_propainter_peak_allocated_gib'] >= 0
+    assert stats['sttn_propainter_peak_reserved_gib'] >= 0
 
 
 def test_sttn_residual_propainter_is_opt_in(tmp_path):
