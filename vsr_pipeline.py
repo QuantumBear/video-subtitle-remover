@@ -119,8 +119,9 @@ PROPAINTER_SUB_VIDEO_LENGTH = PROPAINTER_SEG_LEN + PROPAINTER_OVERLAP
 STTN_SEG_LEN = 50
 # 每个字幕段两侧加入的干净参考帧数量；只参与 STTN 推理，不单独使用模型结果输出。
 STTN_CONTEXT_FRAMES = 8
-# STTN 横向修复带在字幕框两侧保留的上下文像素。
-STTN_ROI_PAD = 48
+# STTN 横向修复带在字幕框两侧保留的上下文像素。适当增大横向上下文，
+# 避免裁剪过窄导致 STTN 在物体边缘产生拖影。
+STTN_ROI_PAD = 128
 # STTN 逐帧遮罩的局部时序稳定范围。只吸收邻近帧的检测框，覆盖 OCR
 # 短暂抖动/漏检；不能扩大到整个字幕段，否则会重新引入段内并集的拖影。
 STTN_MASK_TEMPORAL_RADIUS = 2
