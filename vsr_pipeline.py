@@ -1146,11 +1146,27 @@ class Pipeline:
                                        for boxes in seg_boxes[max(0, i - radius):i + radius + 1]
                                        for box in boxes]
                         masks.append(self.boxes_to_mask(local_boxes, h, w))
+                    # 模型输入使用较宽的矩形 mask 保留上下文；最终写回优先使用
+                    # 字形+描边 mask，无法可靠分离时回退到当前帧矩形证据。
+                    composite_masks = []
+                    for i, boxes in enumerate(seg_boxes):
+                        if not seg_core[i]:
+                            composite_masks.append(np.zeros((h, w), dtype='uint8'))
+                            continue
+                        frame_rgb = cv2.cvtColor(seg_frames[i], cv2.COLOR_BGR2RGB)
+                        narrow = self.propainter_boxes_to_mask(
+                            boxes, frame_rgb, region,
+                            subtitle_strength=subtitle_strength)
+                        if boxes and not np.any(narrow):
+                            narrow = self.boxes_to_mask(boxes, h, w)
+                        composite_masks.append(cv2.bitwise_and(narrow, masks[i]))
                     x_min = max(0, min(box[2] for boxes in seg_boxes for box in boxes)
                                 - STTN_ROI_PAD)
                     x_max = min(w, max(box[3] for boxes in seg_boxes for box in boxes)
                                 + STTN_ROI_PAD)
-                    comps = self.inpainter(seg_frames, masks, x_bounds=(x_min, x_max))
+                    comps = self.inpainter(
+                        seg_frames, masks, x_bounds=(x_min, x_max),
+                        composite_mask=composite_masks)
                     cuda_memory_snapshot(f'STTN segment {seg_pts[0]}-{seg_pts[-1]} after')
                     n_fixed += sum(seg_core)
                 else:

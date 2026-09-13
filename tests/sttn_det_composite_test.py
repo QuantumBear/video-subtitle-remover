@@ -116,6 +116,43 @@ def test_zero_mask_returns_frames_unchanged():
     assert np.array_equal(out, frame)
 
 
+def test_composite_mask_limits_final_writeback_to_narrow_region():
+    frame = textured_frame()
+    model_mask = subtitle_mask(xmin=100, xmax=600)
+    composite_mask = subtitle_mask(xmin=260, xmax=440)
+    recorder = {}
+    out = make_inpainter(recorder)([frame], [model_mask],
+                                   composite_mask=[composite_mask])[0]
+
+    assert recorder['masks'][0].max() == 255
+    assert np.count_nonzero(recorder['masks'][0]) > 0
+    assert np.all(out[composite_mask > 0] == COMP_VALUE)
+    assert np.array_equal(out[(model_mask > 0) & (composite_mask == 0)],
+                          frame[(model_mask > 0) & (composite_mask == 0)])
+    assert np.array_equal(out[model_mask == 0], frame[model_mask == 0])
+
+
+def test_composite_mask_is_intersected_with_model_mask():
+    frame = textured_frame()
+    model_mask = subtitle_mask(xmin=200, xmax=400)
+    composite_mask = subtitle_mask(xmin=100, xmax=500)
+    out = make_inpainter()([frame], [model_mask],
+                           composite_mask=[composite_mask])[0]
+    assert np.all(out[model_mask > 0] == COMP_VALUE)
+    assert np.array_equal(out[(composite_mask > 0) & (model_mask == 0)],
+                          frame[(composite_mask > 0) & (model_mask == 0)])
+
+
+def test_composite_mask_length_and_shape_are_validated():
+    frame = textured_frame()
+    model_mask = subtitle_mask()
+    with pytest.raises(ValueError, match='合成 mask'):
+        make_inpainter()([frame], [model_mask], composite_mask=[])
+    with pytest.raises(ValueError, match='合成 mask'):
+        make_inpainter()([frame], [model_mask],
+                         composite_mask=[np.zeros((FRAME_H - 1, FRAME_W), np.uint8)])
+
+
 @pytest.mark.parametrize('x_bounds', [(72, 360), (0, 288), (432, 720)])
 def test_horizontal_roi_increases_mask_resolution_and_preserves_pixels(x_bounds):
     frame = textured_frame()
