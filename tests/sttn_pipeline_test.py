@@ -17,7 +17,8 @@ import pytest
 av = pytest.importorskip("av")
 pytest.importorskip("cv2")
 
-from vsr_pipeline import STTN_MASK_TEMPORAL_RADIUS, STTN_SEG_LEN, Pipeline
+from vsr_pipeline import (STTN_CONTEXT_FRAMES, STTN_MASK_TEMPORAL_RADIUS,
+                          STTN_SEG_LEN, Pipeline)
 
 REGION = (10, 40, 5, 60)
 BOX = (20, 30, 10, 50)
@@ -117,7 +118,7 @@ def test_mask_handed_to_sttn_keeps_255_scale(tmp_path):
     make_video(source, [90] * 8)
     pipe = make_pipe()
     calls = record_calls(pipe)
-    pipe.process_video(source, output, region=REGION, locate_stickers=False)
+    stats = pipe.process_video(source, output, region=REGION, locate_stickers=False)
     assert max(mask.max() for mask in calls[0][1]) == 255
 
 
@@ -152,6 +153,33 @@ def test_segments_respect_max_load_and_never_exceed_it(tmp_path):
     sizes = [n for n, _ in calls]
     assert sizes and max(sizes) <= STTN_SEG_LEN
     assert sum(sizes) == STTN_SEG_LEN * 2 + 7
+
+
+def test_sttn_adds_clean_context_frames(tmp_path):
+    """字幕段前后的干净帧参与模型，但使用全黑 mask。"""
+    source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    values = [90] * 3 + [91] * 4 + [90] * 3
+    make_video(source, values)
+    pipe = make_pipe()
+    timeline = [[] for _ in values]
+    for i in range(3, 7):
+        timeline[i] = [BOX]
+    pipe._detect_timeline = lambda *args, **kwargs: (
+        timeline, {'scene_change_frames': [], 'sampled': 0, 'refined': 0,
+                   'ocr_calls': 0, 'tracks': 0, 'discarded': 0})
+    calls = record_calls(pipe)
+    stats = pipe.process_video(source, output, region=REGION, locate_stickers=False)
+
+    assert len(calls) == 1
+    _, masks = calls[0]
+    assert len(masks) == len(values)
+    assert all(mask.max() == 0 for mask in masks[:3])
+    assert all(mask.max() == 255 for mask in masks[3:7])
+    assert all(mask.max() == 0 for mask in masks[7:])
+    assert len(masks) <= 2 * STTN_CONTEXT_FRAMES + STTN_SEG_LEN
+    assert stats["frames"] == len(values)
+    with av.open(str(output)) as result:
+        assert len(list(result.decode(video=0))) == len(values)
 
 
 def test_segment_flush_releases_cuda_cache(tmp_path, monkeypatch):

@@ -117,6 +117,8 @@ PROPAINTER_SUB_VIDEO_LENGTH = PROPAINTER_SEG_LEN + PROPAINTER_OVERLAP
 # 覆盖不到整段;STTN 显存占用远低于 ProPainter,50 帧在 24G 卡上余量充足。
 # 不设重叠:STTN 的参考帧机制已在段内提供全局上下文
 STTN_SEG_LEN = 50
+# 每个字幕段两侧加入的干净参考帧数量；只参与 STTN 推理，不单独使用模型结果输出。
+STTN_CONTEXT_FRAMES = 8
 # STTN 逐帧遮罩的局部时序稳定范围。只吸收邻近帧的检测框，覆盖 OCR
 # 短暂抖动/漏检；不能扩大到整个字幕段，否则会重新引入段内并集的拖影。
 STTN_MASK_TEMPORAL_RADIUS = 2
@@ -1103,10 +1105,27 @@ class Pipeline:
             #   1. 遮罩是整框矩形而非字形级——笔画宽度只有数像素,在
             #      432x240 的横向 1.67 倍压缩中必然与相邻背景混入同一像素
             #   2. STTN 使用整段时序上下文，但每帧传入自己的矩形遮罩
-            seg_frames, seg_pts, seg_boxes = [], [], []
+            seg_frames, seg_pts, seg_boxes, seg_core = [], [], [], []
+            pending_clean = deque()
+            trailing_clean = 0
+            core_count = 0
+
+            def write_sttn_frame(img_bgr, pts):
+                out_frame = av.VideoFrame.from_ndarray(
+                    cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), format='rgb24')
+                out_frame.pts = pts
+                out_frame.time_base = frame_tb
+                for pkt in ov.encode(out_frame):
+                    dst.mux(pkt)
+
+            def flush_pending_clean():
+                while pending_clean:
+                    clean_img, clean_pts = pending_clean.popleft()
+                    write_sttn_frame(clean_img, clean_pts)
 
             def flush_sttn():
-                nonlocal seg_frames, seg_pts, seg_boxes, n, n_fixed, n_unresolved
+                nonlocal seg_frames, seg_pts, seg_boxes, seg_core
+                nonlocal trailing_clean, core_count, n_fixed, n_unresolved
                 if not seg_frames:
                     return
                 if any(seg_boxes):
@@ -1117,16 +1136,23 @@ class Pipeline:
                     masks = []
                     radius = STTN_MASK_TEMPORAL_RADIUS
                     for i in range(len(seg_boxes)):
+                        if not seg_core[i]:
+                            masks.append(np.zeros((h, w), dtype='uint8'))
+                            continue
                         local_boxes = [box
                                        for boxes in seg_boxes[max(0, i - radius):i + radius + 1]
                                        for box in boxes]
                         masks.append(self.boxes_to_mask(local_boxes, h, w))
                     comps = self.inpainter(seg_frames, masks)
                     cuda_memory_snapshot(f'STTN segment {seg_pts[0]}-{seg_pts[-1]} after')
-                    n_fixed += len(seg_frames)
+                    n_fixed += sum(seg_core)
                 else:
                     comps = seg_frames
                 for idx, (comp, pts) in enumerate(zip(comps, seg_pts)):
+                    if not seg_core[idx]:
+                        # 上下文帧只参与 STTN 参考，输出时保留原始像素。
+                        write_sttn_frame(seg_frames[idx], pts)
+                        continue
                     # ROI 之外严格保留原帧,与 ProPainter 分支同一约定
                     out_bgr = np.where(roi_mask[:, :, None] > 0, comp, seg_frames[idx])
                     # 残留探测(检测+计数，不修复):实测证明 STTN 在已覆盖区域内
@@ -1137,13 +1163,10 @@ class Pipeline:
                     if np.count_nonzero(
                             self._residual_mask(out_bgr, seg_frames[idx], seg_boxes[idx])) >= RESID_MIN_PX:
                         n_unresolved += 1
-                    out_frame = av.VideoFrame.from_ndarray(
-                        cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB), format='rgb24')
-                    out_frame.pts = pts
-                    out_frame.time_base = frame_tb
-                    for pkt in ov.encode(out_frame):
-                        dst.mux(pkt)
-                seg_frames, seg_pts, seg_boxes = [], [], []
+                    write_sttn_frame(out_bgr, pts)
+                seg_frames, seg_pts, seg_boxes, seg_core = [], [], [], []
+                trailing_clean = 0
+                core_count = 0
                 # 释放本段张量与 CUDA 缓存池:reserved 只增不减(allocator 缓存
                 # 复用),687 帧实测能爬到 11+GiB 而 allocated 全程 0.07GiB。
                 # 不清理在长视频/高并发场景下会耗尽 free 显存触发 OOM，即使
@@ -1157,24 +1180,48 @@ class Pipeline:
                 n += 1
                 if n - 1 in scene_changes:
                     flush_sttn()
+                    flush_pending_clean()
                 boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
                 boxes = boxes + sticker_boxes.get(n - 1, [])
+                img = np.asarray(frame.to_image())  # RGB
+                img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                 if boxes:
-                    img = np.asarray(frame.to_image())  # RGB
-                    seg_frames.append(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                    if not seg_frames:
+                        # 延迟写出的干净帧作为字幕段前置上下文。
+                        while pending_clean:
+                            clean_img, clean_pts = pending_clean.popleft()
+                            seg_frames.append(clean_img)
+                            seg_pts.append(clean_pts)
+                            seg_boxes.append([])
+                            seg_core.append(False)
+                    seg_frames.append(img_bgr)
                     seg_pts.append(n - 1)
                     seg_boxes.append(boxes)
-                    if len(seg_frames) >= STTN_SEG_LEN:
+                    seg_core.append(True)
+                    core_count += 1
+                    trailing_clean = 0
+                    if core_count >= STTN_SEG_LEN:
                         flush_sttn()
                 else:
-                    flush_sttn()   # 段结束:无字幕帧原样写出
-                    frame.pts = n - 1
-                    frame.time_base = frame_tb
-                    for pkt in ov.encode(frame):
-                        dst.mux(pkt)
+                    if seg_frames:
+                        # 暂存字幕段尾部的干净上下文。
+                        seg_frames.append(img_bgr)
+                        seg_pts.append(n - 1)
+                        seg_boxes.append([])
+                        seg_core.append(False)
+                        trailing_clean += 1
+                        if trailing_clean >= STTN_CONTEXT_FRAMES:
+                            flush_sttn()
+                    else:
+                        # 尚未遇到字幕段时，延迟最近 N 帧以便作为前置上下文。
+                        pending_clean.append((img_bgr, n - 1))
+                        if len(pending_clean) > STTN_CONTEXT_FRAMES:
+                            clean_img, clean_pts = pending_clean.popleft()
+                            write_sttn_frame(clean_img, clean_pts)
                 if progress and (n % 30 == 0 or n == total):
                     progress(n, total, f'STTN 修复 {n_fixed}')
             flush_sttn()
+            flush_pending_clean()
             for pkt in ov.encode():
                 dst.mux(pkt)
             dst.close()
