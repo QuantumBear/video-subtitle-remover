@@ -88,6 +88,13 @@ def test_sttn_residual_propainter_window_limit_rejects_negative(tmp_path):
                            sttn_residual_propainter_max_windows=-1)
 
 
+def test_sttn_residual_propainter_min_core_frames_rejects_negative(tmp_path):
+    pipe = make_pipe()
+    with pytest.raises(ValueError, match="非负整数"):
+        pipe.process_video(tmp_path / "missing.mp4", tmp_path / "out.mp4",
+                           sttn_residual_propainter_min_core_frames=-1)
+
+
 def test_glyph_options_still_allowed_for_propainter(tmp_path):
     """报错只针对 STTN，不能连带收紧 ProPainter 的既有能力。"""
     pipe = make_pipe()

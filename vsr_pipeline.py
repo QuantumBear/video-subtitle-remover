@@ -883,7 +883,8 @@ class Pipeline:
                       sticker_prompt=None, sticker_score=None,
                       sticker_max_area_px=None, subtitle_strength=DEFAULT_SUBTITLE_STRENGTH,
                       temporal_glyphs=False, sttn_residual_propainter=False,
-                      sttn_residual_propainter_max_windows=0):
+                      sttn_residual_propainter_max_windows=0,
+                      sttn_residual_propainter_min_core_frames=0):
         """处理单条视频：反馈式 OCR 和轨迹检测，然后按帧或分段修复。
 
         :param region: (ymin, ymax, xmin, xmax) 字幕区域;None 时自动推断字幕带,
@@ -909,6 +910,8 @@ class Pipeline:
         :param sttn_residual_propainter: STTN 模式下将疑似残留帧段交给 ProPainter；默认关闭。
         :param sttn_residual_propainter_max_windows: 整条视频最多转交的 ProPainter 窗口数；
                                                      0 表示不设全局上限，默认 0。
+        :param sttn_residual_propainter_min_core_frames: 窗口内至少需要包含的残留核心帧数；
+                                                         0 表示不做长度过滤，默认 0。
         """
         try:
             sttn_residual_propainter_max_windows = int(sttn_residual_propainter_max_windows)
@@ -916,6 +919,12 @@ class Pipeline:
             raise ValueError('sttn_residual_propainter_max_windows 必须是非负整数') from exc
         if sttn_residual_propainter_max_windows < 0:
             raise ValueError('sttn_residual_propainter_max_windows 必须是非负整数')
+        try:
+            sttn_residual_propainter_min_core_frames = int(sttn_residual_propainter_min_core_frames)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('sttn_residual_propainter_min_core_frames 必须是非负整数') from exc
+        if sttn_residual_propainter_min_core_frames < 0:
+            raise ValueError('sttn_residual_propainter_min_core_frames 必须是非负整数')
         if subtitle_strength not in SUBTITLE_STRENGTHS:
             raise ValueError(f'未知 subtitle_strength: {subtitle_strength}')
         if template_refine and temporal_glyphs:
@@ -1022,6 +1031,7 @@ class Pipeline:
         n_sttn_propainter_core_frames = 0
         n_sttn_propainter_seconds = 0.0
         n_sttn_propainter_peak_allocated = n_sttn_propainter_peak_reserved = 0
+        n_sttn_residual_runs_filtered = n_sttn_residual_frames_filtered = 0
         roi_mask = self.boxes_to_mask([region], h, w)
         scene_changes = set(detection['scene_change_frames'])
 
@@ -1169,6 +1179,7 @@ class Pipeline:
                 nonlocal n_sttn_propainter_calls, n_sttn_propainter_frames
                 nonlocal n_sttn_propainter_core_frames, n_sttn_propainter_seconds
                 nonlocal n_sttn_propainter_peak_allocated, n_sttn_propainter_peak_reserved
+                nonlocal n_sttn_residual_runs_filtered, n_sttn_residual_frames_filtered
                 if not seg_frames:
                     return
                 if any(seg_boxes):
@@ -1207,6 +1218,16 @@ class Pipeline:
                     candidate_runs = merge_residual_runs(
                         residual_indices, total=len(comps), context=5, max_runs=3)
                     n_sttn_residual_runs += len(candidate_runs)
+                    if sttn_residual_propainter_min_core_frames:
+                        eligible_runs = []
+                        for lo, hi in candidate_runs:
+                            core_frames = sum(lo <= i <= hi for i in residual_indices)
+                            if core_frames >= sttn_residual_propainter_min_core_frames:
+                                eligible_runs.append((lo, hi))
+                            else:
+                                n_sttn_residual_runs_filtered += 1
+                                n_sttn_residual_frames_filtered += core_frames
+                        candidate_runs = eligible_runs
                     if sttn_residual_propainter_max_windows:
                         remaining = (sttn_residual_propainter_max_windows
                                      - n_sttn_propainter_calls)
@@ -1402,9 +1423,11 @@ class Pipeline:
               f'跨帧字形 {temporal_status} | '
               f'残留复核 {check_status} | 补擦 {n_repair} | 疑似残留 {n_unresolved} | '
               f'复核未完成 {n_check_failed} | '
-              f'STTN残留候选 {n_sttn_residual_frames}帧/{n_sttn_residual_runs}段 | '
+              f'STTN残留候选 {n_sttn_residual_frames}帧/{n_sttn_residual_runs}段 '
+              f'(过滤小段 {n_sttn_residual_runs_filtered}段/{n_sttn_residual_frames_filtered}帧) | '
               f'转交ProPainter {n_sttn_propainter_calls}次/{n_sttn_propainter_frames}帧 '
-              f'(上限 {sttn_residual_propainter_max_windows or "不限"}) '
+              f'(上限 {sttn_residual_propainter_max_windows or "不限"}, '
+              f'最小核心 {sttn_residual_propainter_min_core_frames or "不限"}帧) '
               f'核心 {n_sttn_propainter_core_frames}帧/{n_sttn_propainter_seconds:.1f}s '
               f'峰值 {n_sttn_propainter_peak_allocated / (1024 ** 3):.2f}/'
               f'{n_sttn_propainter_peak_reserved / (1024 ** 3):.2f}GiB | '
@@ -1420,6 +1443,8 @@ class Pipeline:
                 'sttn_residual_propainter_enabled': bool(sttn_residual_propainter),
                 'sttn_residual_frames': n_sttn_residual_frames,
                 'sttn_residual_runs': n_sttn_residual_runs,
+                'sttn_residual_runs_filtered': n_sttn_residual_runs_filtered,
+                'sttn_residual_frames_filtered': n_sttn_residual_frames_filtered,
                 'sttn_propainter_calls': n_sttn_propainter_calls,
                 'sttn_propainter_frames': n_sttn_propainter_frames,
                 'sttn_propainter_core_frames': n_sttn_propainter_core_frames,
@@ -1453,6 +1478,8 @@ def main():
                     help='STTN 模式下将疑似残留帧段交给 ProPainter(默认关闭,会增加耗时)')
     ap.add_argument('--sttn-residual-propaint-max-windows', type=int, default=0,
                     help='STTN 残留转交 ProPainter 的整条视频窗口上限;0=不限(默认)')
+    ap.add_argument('--sttn-residual-propaint-min-core-frames', type=int, default=0,
+                    help='STTN 残留窗口至少包含的核心残留帧数;0=不限(默认)')
     ap.add_argument('--subtitle-strength', choices=SUBTITLE_STRENGTHS,
                     default=DEFAULT_SUBTITLE_STRENGTH,
                     help='仅 ProPainter:light=轻度增强(默认,字形描边多覆盖 1px);'
@@ -1510,6 +1537,7 @@ def main():
         temporal_glyphs=args.temporal_glyphs,
         sttn_residual_propainter=args.sttn_residual_propaint,
         sttn_residual_propainter_max_windows=args.sttn_residual_propaint_max_windows,
+        sttn_residual_propainter_min_core_frames=args.sttn_residual_propaint_min_core_frames,
         subtitle_strength=args.subtitle_strength,
         locate_stickers=args.locate_stickers,
         ocr_stride=args.ocr_stride, ocr_refine_radius=args.ocr_refine_radius,
