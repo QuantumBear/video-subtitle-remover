@@ -17,7 +17,7 @@ import pytest
 av = pytest.importorskip("av")
 pytest.importorskip("cv2")
 
-from vsr_pipeline import STTN_SEG_LEN, Pipeline
+from vsr_pipeline import STTN_MASK_TEMPORAL_RADIUS, STTN_SEG_LEN, Pipeline
 
 REGION = (10, 40, 5, 60)
 BOX = (20, 30, 10, 50)
@@ -122,23 +122,24 @@ def test_mask_handed_to_sttn_keeps_255_scale(tmp_path):
 
 
 def test_sttn_receives_per_frame_masks_without_segment_union(tmp_path):
-    """每帧只接收自己的矩形 mask，不能把段内框并集传播给其他帧。"""
+    """每帧只接收邻近帧的矩形 mask，不能把整段框并集传播到远端。"""
     source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
-    # 帧值需逐帧变化才能让检测在两个框之间交替；相邻差 1 远低于场景切换阈值
+    # 前半段和后半段位置不同，切换边界允许局部时序半径范围内重叠。
     make_video(source, list(range(10)))
-    moving = [(20, 30, 10, 30), (20, 30, 35, 55)]
-    pipe = make_pipe(lambda img, region: [moving[int(img[0, 0, 0]) % 2]])
+    moving = [(20, 30, 10, 30)] * 5 + [(20, 30, 35, 55)] * 5
+    pipe = make_pipe(lambda img, region: [moving[int(img[0, 0, 0])]])
     calls = record_calls(pipe)
     pipe.process_video(source, output, region=REGION, locate_stickers=False)
 
     _, masks = calls[0]
     assert len(masks) == 10
-    for i, (ymin, ymax, xmin, xmax) in enumerate(moving * 5):
+    for i, (ymin, ymax, xmin, xmax) in enumerate(moving):
         mask = masks[i]
         assert mask[ymin:ymax, xmin:xmax].min() == 255
-        other = moving[(i + 1) % 2]
+        other = moving[-1] if i < 5 else moving[0]
         oy1, oy2, ox1, ox2 = other
-        assert mask[oy1:oy2, ox1:ox2].max() == 0
+        if i < 5 - STTN_MASK_TEMPORAL_RADIUS or i >= 5 + STTN_MASK_TEMPORAL_RADIUS:
+            assert mask[oy1:oy2, ox1:ox2].max() == 0
 
 
 def test_segments_respect_max_load_and_never_exceed_it(tmp_path):

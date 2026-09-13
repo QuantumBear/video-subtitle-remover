@@ -117,6 +117,9 @@ PROPAINTER_SUB_VIDEO_LENGTH = PROPAINTER_SEG_LEN + PROPAINTER_OVERLAP
 # 覆盖不到整段;STTN 显存占用远低于 ProPainter,50 帧在 24G 卡上余量充足。
 # 不设重叠:STTN 的参考帧机制已在段内提供全局上下文
 STTN_SEG_LEN = 50
+# STTN 逐帧遮罩的局部时序稳定范围。只吸收邻近帧的检测框，覆盖 OCR
+# 短暂抖动/漏检；不能扩大到整个字幕段，否则会重新引入段内并集的拖影。
+STTN_MASK_TEMPORAL_RADIUS = 2
 # ffmpeg:优先用系统 PATH 里的(服务器/Linux 场景),否则回退仓库自带的平台二进制
 FFMPEG = shutil.which('ffmpeg') or os.path.join(BASE_DIR, 'backend', 'ffmpeg', 'macos', 'ffmpeg')
 
@@ -1111,7 +1114,13 @@ class Pipeline:
                     cuda_memory_snapshot(f'STTN segment {seg_pts[0]}-{seg_pts[-1]} before')
                     # STTN 使用逐帧矩形 mask，避免某一帧出现的字幕位置
                     # 被段内并集传播到其他帧，造成运动物体拖影。
-                    masks = [self.boxes_to_mask(boxes, h, w) for boxes in seg_boxes]
+                    masks = []
+                    radius = STTN_MASK_TEMPORAL_RADIUS
+                    for i in range(len(seg_boxes)):
+                        local_boxes = [box
+                                       for boxes in seg_boxes[max(0, i - radius):i + radius + 1]
+                                       for box in boxes]
+                        masks.append(self.boxes_to_mask(local_boxes, h, w))
                     comps = self.inpainter(seg_frames, masks)
                     cuda_memory_snapshot(f'STTN segment {seg_pts[0]}-{seg_pts[-1]} after')
                     n_fixed += len(seg_frames)
