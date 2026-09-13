@@ -105,8 +105,8 @@ def test_per_frame_masks_are_forwarded_independently():
     assert len(handed) == 2
     assert not np.array_equal(handed[0], handed[1])
     assert np.count_nonzero((handed[0] > 0) & (handed[1] > 0)) == 0
-    assert np.array_equal(out[0][right == 0], frames[0][right == 0])
-    assert np.array_equal(out[1][left == 0], frames[1][left == 0])
+    assert np.array_equal(out[0][left == 0], frames[0][left == 0])
+    assert np.array_equal(out[1][right == 0], frames[1][right == 0])
 
 
 def test_zero_mask_returns_frames_unchanged():
@@ -114,3 +114,80 @@ def test_zero_mask_returns_frames_unchanged():
     empty = np.zeros((FRAME_H, FRAME_W), dtype=np.uint8)
     out = make_inpainter()([frame], empty)[0]
     assert np.array_equal(out, frame)
+
+
+@pytest.mark.parametrize('x_bounds', [(72, 360), (0, 288), (432, 720)])
+def test_horizontal_roi_increases_mask_resolution_and_preserves_pixels(x_bounds):
+    frame = textured_frame()
+    x0, x1 = x_bounds
+    mask = subtitle_mask(xmin=x0 + 48, xmax=x1 - 48)
+    full, cropped = {}, {}
+    make_inpainter(full)([frame], mask)
+    out = make_inpainter(cropped)([frame], mask, x_bounds=x_bounds)[0]
+
+    # 同一字幕在固定模型输入中占更多像素，同时逐像素保留所有非 mask 区域。
+    assert np.count_nonzero(cropped['masks'][0]) > np.count_nonzero(full['masks'][0])
+    assert out.shape == frame.shape
+    assert np.all(out[mask > 0] == COMP_VALUE)
+    assert np.array_equal(out[mask == 0], frame[mask == 0])
+
+
+def test_horizontal_roi_uses_same_crop_for_clean_context_and_core(monkeypatch):
+    from backend.inpaint import sttn_det_inpaint
+
+    calls = []
+    original = sttn_det_inpaint.get_inpaint_area_by_mask
+
+    def record_areas(width, height, split_h, mask):
+        areas = original(width, height, split_h, mask)
+        calls.append((width, height, split_h, areas))
+        return areas
+
+    monkeypatch.setattr(sttn_det_inpaint, 'get_inpaint_area_by_mask', record_areas)
+    frames = [textured_frame() for _ in range(3)]
+    masks = [np.zeros((FRAME_H, FRAME_W), dtype=np.uint8),
+             subtitle_mask(xmin=280, xmax=400),
+             subtitle_mask(xmin=320, xmax=460)]
+    recorder = {}
+    out = make_inpainter(recorder)(frames, masks, x_bounds=(240, 528))
+
+    width, height, split_h, areas = calls[-1]
+    assert (width, height, split_h) == (288, FRAME_H, 160)
+    y0, y1 = areas[0][:2]
+    expected = cv2.resize(frames[0][y0:y1, 240:528], (MODEL_W, MODEL_H))
+    assert np.array_equal(recorder['frames'][0], expected)
+    assert not recorder['masks'][0].any()
+    assert not np.array_equal(recorder['masks'][1], recorder['masks'][2])
+    for i, mask in enumerate(masks):
+        assert np.array_equal(out[i][mask == 0], frames[i][mask == 0])
+        assert np.all(out[i][mask > 0] == COMP_VALUE)
+
+
+def test_narrow_roi_never_clips_top_or_bottom_of_tall_mask():
+    frame = textured_frame()
+    mask = subtitle_mask(ymin=600, ymax=900, xmin=250, xmax=350)
+    out = make_inpainter()([frame], mask, x_bounds=(202, 398))[0]
+    assert np.all(out[mask > 0] == COMP_VALUE)
+    assert np.array_equal(out[mask == 0], frame[mask == 0])
+
+
+def test_multiple_vertical_regions_are_all_repaired_in_horizontal_roi():
+    frame = textured_frame()
+    mask = subtitle_mask(ymin=20, ymax=80, xmin=250, xmax=350)
+    mask |= subtitle_mask(ymin=1200, ymax=1260, xmin=300, xmax=400)
+    out = make_inpainter()([frame], mask, x_bounds=(202, 448))[0]
+    assert np.all(out[mask > 0] == COMP_VALUE)
+    assert np.array_equal(out[mask == 0], frame[mask == 0])
+
+
+def test_full_width_roi_matches_legacy_call():
+    frame, mask = textured_frame(), subtitle_mask()
+    engine = make_inpainter()
+    assert np.array_equal(engine([frame], mask)[0],
+                          engine([frame], mask, x_bounds=(0, FRAME_W))[0])
+
+
+@pytest.mark.parametrize('bounds', [(300, 200), (FRAME_W, FRAME_W + 20), (200, 250)])
+def test_horizontal_roi_rejects_invalid_or_mask_clipping_bounds(bounds):
+    with pytest.raises(ValueError, match='ROI'):
+        make_inpainter()([textured_frame()], subtitle_mask(), x_bounds=bounds)

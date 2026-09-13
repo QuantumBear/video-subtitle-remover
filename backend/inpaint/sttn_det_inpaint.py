@@ -48,14 +48,18 @@ class STTNDetInpaint:
         return max(1, min(split_h, frame_height))
 
     def __call__(self, input_frames: List[np.ndarray],
-                 input_mask: Union[np.ndarray, List[np.ndarray]]):
+                 input_mask: Union[np.ndarray, List[np.ndarray]], x_bounds=None):
         """
         :param input_frames: 原视频帧
         :param input_mask: 字幕区域 mask，0/255 二值；可以是单张 ndarray
             （向后兼容）或与 input_frames 等长的逐帧 mask 列表。必须保持 255 量级：
             inpaint() 内部经 ToTorchFormatTensor 的 div(255) 归一后再做 > 0.5 判定，
             若在此处提前归一成 0/1，模型将收不到空洞信号而退化为恒等重建。
+        :param x_bounds: 可选的原图横向 ROI `(xmin, xmax)`；ROI 必须完整覆盖
+            所有帧的 mask，模型在裁剪区域内推理后再贴回原图。
         """
+        if not input_frames:
+            return []
         if isinstance(input_mask, np.ndarray):
             # 保留旧调用方的单张 mask 语义：整段每帧共用同一张 mask。
             masks_hr = [input_mask] * len(input_frames)
@@ -63,9 +67,6 @@ class STTNDetInpaint:
             masks_hr = list(input_mask)
             if len(masks_hr) != len(input_frames):
                 raise ValueError("逐帧 STTN mask 数量必须与输入帧数一致")
-        if not input_frames:
-            return []
-
         first_mask = np.asarray(masks_hr[0])
         if first_mask.ndim == 3 and first_mask.shape[-1] == 1:
             first_mask = first_mask[:, :, 0]
@@ -83,6 +84,34 @@ class STTNDetInpaint:
             current = np.where(current > 0, 255, 0).astype(np.uint8)
             normalized_masks.append(current[:, :, None])
             union_mask = np.maximum(union_mask, current)
+        if x_bounds is not None:
+            x0, x1 = map(int, x_bounds)
+            if not (0 <= x0 < x1 <= W_ori):
+                raise ValueError("STTN 横向 ROI 边界无效")
+            active_x = np.flatnonzero(np.any(union_mask > 0, axis=0))
+            if active_x.size and (active_x[0] < x0 or active_x[-1] >= x1):
+                raise ValueError("STTN 横向 ROI 不能裁剪字幕 mask")
+            if x0 > 0 or x1 < W_ori:
+                crop_width = x1 - x0
+                crop_split_h = self.compute_split_h(
+                    crop_width, H_ori, self.model_input_width, self.model_input_height)
+                crop_areas = get_inpaint_area_by_mask(
+                    crop_width, H_ori, crop_split_h, union_mask[:, x0:x1])
+                covered_rows = np.zeros(H_ori, dtype=bool)
+                for ymin, ymax, _, _ in crop_areas:
+                    covered_rows[max(0, ymin):min(H_ori, ymax)] = True
+                active_rows = np.any(union_mask > 0, axis=1)
+                if np.any(active_rows & ~covered_rows):
+                    # 变窄后的修复带无法覆盖整段垂直跨度时回退整幅宽度，
+                    # 避免多行/异常高字幕被 ROI 裁掉。
+                    return self.__call__(input_frames, input_mask)
+                cropped = self.__call__(
+                    [frame[:, x0:x1, :] for frame in input_frames],
+                    [mask[:, x0:x1, :] for mask in normalized_masks])
+                output = [frame.copy() for frame in input_frames]
+                for dst, src in zip(output, cropped):
+                    dst[:, x0:x1, :] = src
+                return output
         # 确定去字幕的垂直高度部分
         split_h = self.compute_split_h(W_ori, H_ori, self.model_input_width, self.model_input_height)
         inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, union_mask)

@@ -119,6 +119,8 @@ PROPAINTER_SUB_VIDEO_LENGTH = PROPAINTER_SEG_LEN + PROPAINTER_OVERLAP
 STTN_SEG_LEN = 50
 # 每个字幕段两侧加入的干净参考帧数量；只参与 STTN 推理，不单独使用模型结果输出。
 STTN_CONTEXT_FRAMES = 8
+# STTN 横向修复带在字幕框两侧保留的上下文像素。
+STTN_ROI_PAD = 48
 # STTN 逐帧遮罩的局部时序稳定范围。只吸收邻近帧的检测框，覆盖 OCR
 # 短暂抖动/漏检；不能扩大到整个字幕段，否则会重新引入段内并集的拖影。
 STTN_MASK_TEMPORAL_RADIUS = 2
@@ -1143,7 +1145,11 @@ class Pipeline:
                                        for boxes in seg_boxes[max(0, i - radius):i + radius + 1]
                                        for box in boxes]
                         masks.append(self.boxes_to_mask(local_boxes, h, w))
-                    comps = self.inpainter(seg_frames, masks)
+                    x_min = max(0, min(box[2] for boxes in seg_boxes for box in boxes)
+                                - STTN_ROI_PAD)
+                    x_max = min(w, max(box[3] for boxes in seg_boxes for box in boxes)
+                                + STTN_ROI_PAD)
+                    comps = self.inpainter(seg_frames, masks, x_bounds=(x_min, x_max))
                     cuda_memory_snapshot(f'STTN segment {seg_pts[0]}-{seg_pts[-1]} after')
                     n_fixed += sum(seg_core)
                 else:

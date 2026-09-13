@@ -50,7 +50,7 @@ def record_calls(pipe):
     """把 STTN 引擎替换成记录器，返回 (帧数, 逐帧 mask) 调用列表。"""
     calls = []
 
-    def engine(frames, mask):
+    def engine(frames, mask, x_bounds=None):
         if isinstance(mask, np.ndarray):
             saved_mask = mask.copy()
         else:
@@ -128,7 +128,11 @@ def test_sttn_receives_per_frame_masks_without_segment_union(tmp_path):
     # 前半段和后半段位置不同，切换边界允许局部时序半径范围内重叠。
     make_video(source, list(range(10)))
     moving = [(20, 30, 10, 30)] * 5 + [(20, 30, 35, 55)] * 5
-    pipe = make_pipe(lambda img, region: [moving[int(img[0, 0, 0])]])
+    pipe = make_pipe()
+    timeline = [[box] for box in moving]
+    pipe._detect_timeline = lambda *args, **kwargs: (
+        timeline, {'scene_change_frames': [], 'sampled': 0, 'refined': 0,
+                   'ocr_calls': 0, 'tracks': 0, 'discarded': 0})
     calls = record_calls(pipe)
     pipe.process_video(source, output, region=REGION, locate_stickers=False)
 
@@ -140,7 +144,7 @@ def test_sttn_receives_per_frame_masks_without_segment_union(tmp_path):
         other = moving[-1] if i < 5 else moving[0]
         oy1, oy2, ox1, ox2 = other
         if i < 5 - STTN_MASK_TEMPORAL_RADIUS or i >= 5 + STTN_MASK_TEMPORAL_RADIUS:
-            assert mask[oy1:oy2, ox1:ox2].max() == 0
+            assert mask[oy1:oy2, ox1:ox2].max() == 0, f'frame {i} inherited remote box'
 
 
 def test_segments_respect_max_load_and_never_exceed_it(tmp_path):
@@ -180,6 +184,28 @@ def test_sttn_adds_clean_context_frames(tmp_path):
     assert stats["frames"] == len(values)
     with av.open(str(output)) as result:
         assert len(list(result.decode(video=0))) == len(values)
+
+
+def test_pipeline_passes_horizontal_roi_around_segment_boxes(tmp_path, monkeypatch):
+    source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
+    make_video(source, [90] * 6)
+    pipe = make_pipe()
+    pipe._detect_timeline = lambda *args, **kwargs: (
+        [[BOX] for _ in range(6)],
+        {'scene_change_frames': [], 'sampled': 0, 'refined': 0,
+         'ocr_calls': 0, 'tracks': 0, 'discarded': 0})
+    seen = []
+
+    def engine(frames, masks, x_bounds=None):
+        seen.append((len(frames), x_bounds))
+        return [f.copy() for f in frames]
+
+    pipe.inpainter = engine
+    pipe._ensure_sttn = lambda: None
+    monkeypatch.setattr('vsr_pipeline.STTN_ROI_PAD', 4)
+    pipe.process_video(source, output, region=REGION, locate_stickers=False)
+
+    assert seen == [(6, (6, 54))]
 
 
 def test_segment_flush_releases_cuda_cache(tmp_path, monkeypatch):
@@ -227,7 +253,7 @@ def test_segments_do_not_cross_scene_changes(tmp_path):
     pipe = make_pipe()
     seen = []
 
-    def engine(frames, mask):
+    def engine(frames, mask, x_bounds=None):
         values = {int(f[0, 0, 0]) for f in frames}
         assert len(values) == 1, "批次跨越了场景边界"
         seen.append(len(frames))
@@ -260,7 +286,7 @@ def test_pixels_outside_roi_are_untouched(tmp_path):
     source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
     make_video(source, [90] * 6)
     pipe = make_pipe()
-    pipe.inpainter = lambda frames, mask: [np.full_like(f, 255) for f in frames]
+    pipe.inpainter = lambda frames, mask, x_bounds=None: [np.full_like(f, 255) for f in frames]
     pipe._ensure_sttn = lambda: None
     pipe.process_video(source, output, region=REGION, locate_stickers=False)
 
@@ -311,7 +337,7 @@ def test_residual_probe_checks_every_frame_with_a_box(tmp_path):
     source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
     make_video(source, [90] * 6)
     pipe = make_pipe()
-    pipe.inpainter = lambda frames, mask: [f.copy() for f in frames]
+    pipe.inpainter = lambda frames, mask, x_bounds=None: [f.copy() for f in frames]
     pipe._ensure_sttn = lambda: None
 
     probed = []
@@ -335,13 +361,14 @@ def test_residual_probe_flags_frame_with_visible_defect(tmp_path):
     make_video(source, [90] * 6)
     pipe = make_pipe()
 
-    def engine(frames, mask):
+    def engine(frames, mask, x_bounds=None):
         # 制造 _residual_mask 能识别的结构性缺陷:原帧笔画状高对比条纹在
         # 输出中被铣平——这正是 glyph_residual_test.py 里验证过的判据形态
         out = []
         for f in frames:
             comp = f.copy()
-            comp[mask > 0] = 160
+            frame_mask = mask[len(out)] if not isinstance(mask, np.ndarray) else mask
+            comp[frame_mask > 0] = 160
             out.append(comp)
         return out
 
@@ -362,7 +389,7 @@ def test_residual_probe_does_not_alter_output_pixels(tmp_path):
     make_video(source, [90] * 6)
     pipe = make_pipe()
 
-    def engine(frames, mask):
+    def engine(frames, mask, x_bounds=None):
         out = []
         for f in frames:
             comp = f.copy()
