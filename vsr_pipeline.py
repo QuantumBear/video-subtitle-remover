@@ -882,7 +882,8 @@ class Pipeline:
                       vlm_max_calls=32, sticker_max_frames=None,
                       sticker_prompt=None, sticker_score=None,
                       sticker_max_area_px=None, subtitle_strength=DEFAULT_SUBTITLE_STRENGTH,
-                      temporal_glyphs=False, sttn_residual_propainter=False):
+                      temporal_glyphs=False, sttn_residual_propainter=False,
+                      sttn_residual_propainter_max_windows=0):
         """处理单条视频：反馈式 OCR 和轨迹检测，然后按帧或分段修复。
 
         :param region: (ymin, ymax, xmin, xmax) 字幕区域;None 时自动推断字幕带,
@@ -906,7 +907,15 @@ class Pipeline:
                                     这是区分 emoji 与整幅物体误检的关键判据,
                                     用绝对像素而非相对比例,避免 ROI 尺寸变化时判据漂移
         :param sttn_residual_propainter: STTN 模式下将疑似残留帧段交给 ProPainter；默认关闭。
+        :param sttn_residual_propainter_max_windows: 整条视频最多转交的 ProPainter 窗口数；
+                                                     0 表示不设全局上限，默认 0。
         """
+        try:
+            sttn_residual_propainter_max_windows = int(sttn_residual_propainter_max_windows)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('sttn_residual_propainter_max_windows 必须是非负整数') from exc
+        if sttn_residual_propainter_max_windows < 0:
+            raise ValueError('sttn_residual_propainter_max_windows 必须是非负整数')
         if subtitle_strength not in SUBTITLE_STRENGTHS:
             raise ValueError(f'未知 subtitle_strength: {subtitle_strength}')
         if template_refine and temporal_glyphs:
@@ -1195,9 +1204,15 @@ class Pipeline:
                         if np.count_nonzero(residual) >= RESID_MIN_PX:
                             residual_indices.append(idx)
                     n_sttn_residual_frames += len(residual_indices)
-                    runs = merge_residual_runs(
+                    candidate_runs = merge_residual_runs(
                         residual_indices, total=len(comps), context=5, max_runs=3)
-                    n_sttn_residual_runs += len(runs)
+                    n_sttn_residual_runs += len(candidate_runs)
+                    if sttn_residual_propainter_max_windows:
+                        remaining = (sttn_residual_propainter_max_windows
+                                     - n_sttn_propainter_calls)
+                        runs = candidate_runs[:max(0, remaining)]
+                    else:
+                        runs = candidate_runs
                     if runs:
                         self._ensure_propainter()
                         pp_engine = self._propainter_inpainter
@@ -1389,6 +1404,7 @@ class Pipeline:
               f'复核未完成 {n_check_failed} | '
               f'STTN残留候选 {n_sttn_residual_frames}帧/{n_sttn_residual_runs}段 | '
               f'转交ProPainter {n_sttn_propainter_calls}次/{n_sttn_propainter_frames}帧 '
+              f'(上限 {sttn_residual_propainter_max_windows or "不限"}) '
               f'核心 {n_sttn_propainter_core_frames}帧/{n_sttn_propainter_seconds:.1f}s '
               f'峰值 {n_sttn_propainter_peak_allocated / (1024 ** 3):.2f}/'
               f'{n_sttn_propainter_peak_reserved / (1024 ** 3):.2f}GiB | '
@@ -1435,6 +1451,8 @@ def main():
                     help='试验性跨帧白字补全(仅 ProPainter,默认关闭,与 --template-refine 互斥)')
     ap.add_argument('--sttn-residual-propaint', action='store_true',
                     help='STTN 模式下将疑似残留帧段交给 ProPainter(默认关闭,会增加耗时)')
+    ap.add_argument('--sttn-residual-propaint-max-windows', type=int, default=0,
+                    help='STTN 残留转交 ProPainter 的整条视频窗口上限;0=不限(默认)')
     ap.add_argument('--subtitle-strength', choices=SUBTITLE_STRENGTHS,
                     default=DEFAULT_SUBTITLE_STRENGTH,
                     help='仅 ProPainter:light=轻度增强(默认,字形描边多覆盖 1px);'
@@ -1491,6 +1509,7 @@ def main():
         template_refine=args.template_refine,
         temporal_glyphs=args.temporal_glyphs,
         sttn_residual_propainter=args.sttn_residual_propaint,
+        sttn_residual_propainter_max_windows=args.sttn_residual_propaint_max_windows,
         subtitle_strength=args.subtitle_strength,
         locate_stickers=args.locate_stickers,
         ocr_stride=args.ocr_stride, ocr_refine_radius=args.ocr_refine_radius,
