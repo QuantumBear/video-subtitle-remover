@@ -1099,19 +1099,20 @@ class Pipeline:
             # 与 ProPainter 分支的两点差异:
             #   1. 遮罩是整框矩形而非字形级——笔画宽度只有数像素,在
             #      432x240 的横向 1.67 倍压缩中必然与相邻背景混入同一像素
-            #   2. STTN.__call__ 只接单张遮罩,故整段共用段内检出框的并集
+            #   2. STTN 使用整段时序上下文，但每帧传入自己的矩形遮罩
             seg_frames, seg_pts, seg_boxes = [], [], []
 
             def flush_sttn():
                 nonlocal seg_frames, seg_pts, seg_boxes, n, n_fixed, n_unresolved
                 if not seg_frames:
                     return
-                union = [b for boxes in seg_boxes for b in boxes]
-                if union:
+                if any(seg_boxes):
                     self._ensure_sttn()
                     cuda_memory_snapshot(f'STTN segment {seg_pts[0]}-{seg_pts[-1]} before')
-                    mask = self.boxes_to_mask(union, h, w)
-                    comps = self.inpainter(seg_frames, mask)
+                    # STTN 使用逐帧矩形 mask，避免某一帧出现的字幕位置
+                    # 被段内并集传播到其他帧，造成运动物体拖影。
+                    masks = [self.boxes_to_mask(boxes, h, w) for boxes in seg_boxes]
+                    comps = self.inpainter(seg_frames, masks)
                     cuda_memory_snapshot(f'STTN segment {seg_pts[0]}-{seg_pts[-1]} after')
                     n_fixed += len(seg_frames)
                 else:

@@ -93,6 +93,22 @@ def test_mask_handed_to_model_keeps_255_scale():
     assert recorder["masks"][0].max() == 255
 
 
+def test_per_frame_masks_are_forwarded_independently():
+    """同一批次内不同帧的字幕位置不能被并集成一张模型 mask。"""
+    recorder = {}
+    frames = [textured_frame(), textured_frame()]
+    left = subtitle_mask(xmin=80, xmax=260)
+    right = subtitle_mask(xmin=360, xmax=540)
+    out = make_inpainter(recorder)(frames, [left, right])
+
+    handed = recorder["masks"]
+    assert len(handed) == 2
+    assert not np.array_equal(handed[0], handed[1])
+    assert np.count_nonzero((handed[0] > 0) & (handed[1] > 0)) == 0
+    assert np.array_equal(out[0][right == 0], frames[0][right == 0])
+    assert np.array_equal(out[1][left == 0], frames[1][left == 0])
+
+
 def test_zero_mask_returns_frames_unchanged():
     frame = textured_frame()
     empty = np.zeros((FRAME_H, FRAME_W), dtype=np.uint8)

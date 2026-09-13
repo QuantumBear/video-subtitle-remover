@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import torch
 from torchvision import transforms
-from typing import List
+from typing import List, Union
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -47,18 +47,45 @@ class STTNDetInpaint:
         split_h = int(round(frame_width * model_height / model_width))
         return max(1, min(split_h, frame_height))
 
-    def __call__(self, input_frames: List[np.ndarray], input_mask: np.ndarray):
+    def __call__(self, input_frames: List[np.ndarray],
+                 input_mask: Union[np.ndarray, List[np.ndarray]]):
         """
         :param input_frames: 原视频帧
-        :param input_mask: 字幕区域mask，0/255 二值。必须保持 255 量级：
+        :param input_mask: 字幕区域 mask，0/255 二值；可以是单张 ndarray
+            （向后兼容）或与 input_frames 等长的逐帧 mask 列表。必须保持 255 量级：
             inpaint() 内部经 ToTorchFormatTensor 的 div(255) 归一后再做 > 0.5 判定，
             若在此处提前归一成 0/1，模型将收不到空洞信号而退化为恒等重建。
         """
-        mask = input_mask[:, :, None]
-        H_ori, W_ori = mask.shape[:2]
+        if isinstance(input_mask, np.ndarray):
+            # 保留旧调用方的单张 mask 语义：整段每帧共用同一张 mask。
+            masks_hr = [input_mask] * len(input_frames)
+        else:
+            masks_hr = list(input_mask)
+            if len(masks_hr) != len(input_frames):
+                raise ValueError("逐帧 STTN mask 数量必须与输入帧数一致")
+        if not input_frames:
+            return []
+
+        first_mask = np.asarray(masks_hr[0])
+        if first_mask.ndim == 3 and first_mask.shape[-1] == 1:
+            first_mask = first_mask[:, :, 0]
+        H_ori, W_ori = first_mask.shape[:2]
+        # 修复带的几何范围需要覆盖这一批中所有帧的字幕，但模型和合成
+        # 使用每帧自己的 mask，不能把这个并集当成模型 mask。
+        union_mask = np.zeros((H_ori, W_ori), dtype=np.uint8)
+        normalized_masks = []
+        for frame_mask in masks_hr:
+            current = np.asarray(frame_mask)
+            if current.ndim == 3 and current.shape[-1] == 1:
+                current = current[:, :, 0]
+            if current.shape != (H_ori, W_ori):
+                raise ValueError("逐帧 STTN mask 的尺寸必须一致")
+            current = np.where(current > 0, 255, 0).astype(np.uint8)
+            normalized_masks.append(current[:, :, None])
+            union_mask = np.maximum(union_mask, current)
         # 确定去字幕的垂直高度部分
         split_h = self.compute_split_h(W_ori, H_ori, self.model_input_width, self.model_input_height)
-        inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, mask)
+        inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, union_mask)
         # 初始化帧存储变量
         # 高分辨率帧存储列表（浅拷贝 + 逐帧 copy，避免 deepcopy 开销）
         frames_hr = [f.copy() for f in input_frames]
@@ -77,7 +104,7 @@ class STTNDetInpaint:
             # 对每个去除部分进行切割和缩放
             for k in range(len(inpaint_area)):
                 image_crop = image[inpaint_area[k][0]:inpaint_area[k][1], :, :]  # 切割
-                mask_crop = mask[inpaint_area[k][0]:inpaint_area[k][1], :, :]  # 切割
+                mask_crop = normalized_masks[j][inpaint_area[k][0]:inpaint_area[k][1], :, :]  # 切割
                 image_resize = cv2.resize(image_crop, (self.model_input_width, self.model_input_height))  # 缩放
                 mask_resize = cv2.resize(mask_crop, (self.model_input_width, self.model_input_height))  # 缩放
                 frames_scaled[k].append(image_resize)  # 将缩放后的帧添加到对应列表
@@ -99,7 +126,7 @@ class STTNDetInpaint:
                     comp = cv2.cvtColor(comp.astype(np.uint8), cv2.COLOR_BGR2RGB)  # 转换颜色空间
                     # 只替换 mask 命中的像素：修复带整条都经过 432x240 往返缩放，
                     # 无条件覆盖会把带内所有非字幕像素一并换成低分辨率结果
-                    mask_area = mask[ymin:ymax, :] > 0
+                    mask_area = normalized_masks[j][ymin:ymax, :] > 0
                     np.copyto(frame[ymin:ymax, :, :], comp, where=mask_area)
                 # 将最终帧添加到列表
                 inpainted_frames.append(frame)

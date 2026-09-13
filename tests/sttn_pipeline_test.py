@@ -5,8 +5,8 @@ STTN 是带级时序模型：整条修复带被压到 432x240 再放大回来，
 字形级遮罩，且所有字形相关开关必须显式报错而非静默降级——静默忽略会让
 调用方以为字形保护生效。
 
-STTN 的 __call__ 只接单张遮罩（不是逐帧列表），所以每段送入的是段内所有
-检出框的并集。
+STTN 的 __call__ 接收与帧序列等长的逐帧遮罩；修复带的几何范围可覆盖
+当前段的全部字幕位置，但不能把该范围当作每帧的遮罩。
 """
 
 from types import SimpleNamespace
@@ -46,11 +46,15 @@ def make_pipe(boxes_for=lambda img, region: [BOX]):
 
 
 def record_calls(pipe):
-    """把 STTN 引擎替换成记录器，返回 (帧数, mask) 调用列表。"""
+    """把 STTN 引擎替换成记录器，返回 (帧数, 逐帧 mask) 调用列表。"""
     calls = []
 
     def engine(frames, mask):
-        calls.append((len(frames), mask.copy()))
+        if isinstance(mask, np.ndarray):
+            saved_mask = mask.copy()
+        else:
+            saved_mask = [m.copy() for m in mask]
+        calls.append((len(frames), saved_mask))
         return [f.copy() for f in frames]
 
     pipe.inpainter = engine
@@ -98,7 +102,8 @@ def test_sttn_receives_box_level_rect_mask(tmp_path):
     pipe.process_video(source, output, region=REGION, locate_stickers=False)
 
     assert calls, "STTN 引擎未被调用"
-    _, mask = calls[0]
+    _, masks = calls[0]
+    mask = masks[0]
     ymin, ymax, xmin, xmax = BOX
     assert mask[ymin:ymax, xmin:xmax].min() == 255
     outside = mask.copy()
@@ -113,11 +118,11 @@ def test_mask_handed_to_sttn_keeps_255_scale(tmp_path):
     pipe = make_pipe()
     calls = record_calls(pipe)
     pipe.process_video(source, output, region=REGION, locate_stickers=False)
-    assert calls[0][1].max() == 255
+    assert max(mask.max() for mask in calls[0][1]) == 255
 
 
-def test_segment_mask_is_union_of_member_boxes(tmp_path):
-    """单张遮罩服务整段，必须覆盖段内每一帧的框。"""
+def test_sttn_receives_per_frame_masks_without_segment_union(tmp_path):
+    """每帧只接收自己的矩形 mask，不能把段内框并集传播给其他帧。"""
     source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
     # 帧值需逐帧变化才能让检测在两个框之间交替；相邻差 1 远低于场景切换阈值
     make_video(source, list(range(10)))
@@ -126,11 +131,14 @@ def test_segment_mask_is_union_of_member_boxes(tmp_path):
     calls = record_calls(pipe)
     pipe.process_video(source, output, region=REGION, locate_stickers=False)
 
-    union = np.zeros_like(calls[0][1])
-    for _, mask in calls:
-        union = np.maximum(union, mask)
-    for ymin, ymax, xmin, xmax in moving:
-        assert union[ymin:ymax, xmin:xmax].min() == 255
+    _, masks = calls[0]
+    assert len(masks) == 10
+    for i, (ymin, ymax, xmin, xmax) in enumerate(moving * 5):
+        mask = masks[i]
+        assert mask[ymin:ymax, xmin:xmax].min() == 255
+        other = moving[(i + 1) % 2]
+        oy1, oy2, ox1, ox2 = other
+        assert mask[oy1:oy2, ox1:ox2].max() == 0
 
 
 def test_segments_respect_max_load_and_never_exceed_it(tmp_path):
