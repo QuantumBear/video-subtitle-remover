@@ -95,6 +95,13 @@ def test_sttn_residual_propainter_min_core_frames_rejects_negative(tmp_path):
                            sttn_residual_propainter_min_core_frames=-1)
 
 
+@pytest.mark.parametrize('limit', [-1, 1, 2.5, None])
+def test_sttn_residual_max_frames_rejects_invalid_limit(tmp_path, limit):
+    with pytest.raises(ValueError, match='sttn_residual_propainter_max_frames'):
+        make_pipe().process_video(tmp_path / 'missing.mp4', tmp_path / 'out.mp4',
+                                  sttn_residual_propainter_max_frames=limit)
+
+
 def test_glyph_options_still_allowed_for_propainter(tmp_path):
     """报错只针对 STTN，不能连带收紧 ProPainter 的既有能力。"""
     pipe = make_pipe()
@@ -476,7 +483,8 @@ def test_sttn_residual_can_be_delegated_to_propainter(tmp_path):
     assert stats['sttn_propainter_peak_reserved_gib'] >= 0
 
 
-def test_sttn_residual_propainter_is_opt_in(tmp_path):
+@pytest.mark.parametrize('max_frames', [0, 30])
+def test_sttn_residual_propainter_is_opt_in(tmp_path, max_frames):
     source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
     make_video(source, [90] * 6)
     pipe = make_pipe()
@@ -485,7 +493,137 @@ def test_sttn_residual_propainter_is_opt_in(tmp_path):
     pipe._ensure_propainter = lambda: pytest.fail('默认不应加载 ProPainter')
     pipe._residual_mask = lambda fixed, original, boxes: np.full(
         fixed.shape[:2], 255, dtype=np.uint8)
-    pipe.process_video(source, output, region=REGION, locate_stickers=False)
+    pipe.process_video(source, output, region=REGION, locate_stickers=False,
+                       sttn_residual_propainter_max_frames=max_frames)
+
+
+@pytest.fixture
+def residual_clip(tmp_path):
+    """真实编解码和合成，仅替换检测与模型，用像素值追踪帧号。"""
+    def run(residual_indices, total=40, **options):
+        source, output = tmp_path / 'in.mp4', tmp_path / 'out.mp4'
+        make_video(source, [90 + i for i in range(total)])
+        pipe = make_pipe()
+        record_calls(pipe)
+        pipe._detect_timeline = lambda *args: (
+            [[BOX] for _ in range(total)],
+            dict(sampled=total, refined=0, ocr_calls=0, tracks=1, discarded=0,
+                 scene_change_frames=[]))
+        calls = []
+
+        class FakePropainter:
+            def inpaint(self, frames, masks):
+                calls.append(([int(f[0, 0, 0]) - 90 for f in frames],
+                              [bool(m.any()) for m in masks]))
+                return [np.full_like(f, 33) for f in frames]
+
+        pipe._ensure_propainter = lambda: setattr(pipe, '_propainter_inpainter', FakePropainter())
+        pipe._residual_mask = lambda fixed, original, boxes: np.full(
+            original.shape[:2], 255 if int(original[0, 0, 0]) - 90 in residual_indices else 0,
+            dtype=np.uint8)
+        options.setdefault('sttn_residual_propainter', True)
+        stats = pipe.process_video(source, output, region=REGION, locate_stickers=False, **options)
+        with av.open(str(output)) as result:
+            frames = list(result.decode(video=0))
+        y1, y2, x1, x2 = BOX
+        means = [f.to_ndarray(format='rgb24')[y1:y2, x1:x2].mean() for f in frames]
+        assert len(frames) == total
+        assert [float(f.pts * f.time_base) for f in frames] == pytest.approx(
+            [i / 30 for i in range(total)])
+        return stats, calls, means
+    return run
+
+
+def test_sttn_residual_max_frames_selects_dense_window_and_preserves_other_frames(residual_clip, capsys):
+    # 原窗口 0-32，后半段 22-27 最密集；同分时选最早的 18-27。
+    residual = {3, 4, 12, 13, 14, 22, 23, 24, 25, 26, 27}
+    stats, calls, means = residual_clip(residual, sttn_residual_propainter_max_frames=10)
+    assert calls == [(list(range(18, 28)), [False] * 4 + [True] * 6)]
+    assert stats['sttn_propainter_calls'] == 1
+    assert stats['sttn_propainter_frames'] == 10
+    assert stats['sttn_propainter_core_frames'] == 6
+    assert stats['sttn_propainter_windows_trimmed'] == 1
+    assert stats['sttn_propainter_input_frames_trimmed'] == 23
+    assert stats['sttn_propainter_core_frames_trimmed'] == 5
+    assert means == pytest.approx([33 if i in range(22, 28) else 90 + i for i in range(40)], abs=5)
+    log = capsys.readouterr().out
+    assert 'candidate_window=0-32 window=18-27' in log
+    assert 'max_frames=10' in log
+
+
+@pytest.mark.parametrize('limit', [None, 0, 40])
+def test_sttn_residual_max_frames_preserves_uncapped_or_short_window(residual_clip, limit):
+    options = {} if limit is None else {'sttn_residual_propainter_max_frames': limit}
+    stats, calls, _ = residual_clip(set(range(10, 20)), **options)
+    assert calls == [(list(range(5, 25)), [False] * 5 + [True] * 10 + [False] * 5)]
+    assert stats['sttn_propainter_windows_trimmed'] == 0
+    assert stats['sttn_propainter_input_frames_trimmed'] == 0
+    assert stats['sttn_propainter_core_frames_trimmed'] == 0
+
+
+def test_sttn_residual_max_frames_rechecks_min_core_after_trimming(residual_clip):
+    stats, calls, means = residual_clip(set(range(10, 20)),
+        sttn_residual_propainter_max_frames=4, sttn_residual_propainter_min_core_frames=5)
+    assert calls == []
+    assert stats['sttn_residual_runs_filtered'] == 1
+    assert stats['sttn_residual_frames_filtered'] == 10
+    assert stats['sttn_propainter_windows_trimmed'] == 0  # 仅统计实际调用的截短窗口
+    assert means == pytest.approx([90 + i for i in range(40)], abs=5)
+
+
+def test_sttn_residual_max_frames_filters_before_spending_window_budget(residual_clip):
+    stats, calls, _ = residual_clip({3} | set(range(15, 25)) | set(range(40, 46)), total=48,
+        sttn_residual_propainter_max_frames=6, sttn_residual_propainter_min_core_frames=5,
+        sttn_residual_propainter_max_windows=1)
+    assert calls == [(list(range(15, 21)), [True] * 6)]
+    assert stats['sttn_residual_runs_filtered'] == 1
+    assert stats['sttn_propainter_windows_trimmed'] == 1
+    assert stats['sttn_propainter_input_frames_trimmed'] == 14
+    assert stats['sttn_propainter_core_frames_trimmed'] == 4
+
+
+def test_sttn_residual_max_frames_and_global_budget_apply_across_segments(residual_clip):
+    stats, calls, means = residual_clip(set(range(110)), total=110,
+        sttn_residual_propainter_max_frames=10, sttn_residual_propainter_max_windows=2)
+    assert [frames for frames, _ in calls] == [list(range(10)), list(range(50, 60))]
+    assert stats['sttn_propainter_calls'] == 2
+    assert stats['sttn_propainter_frames'] == 20
+    assert stats['sttn_propainter_core_frames_trimmed'] == 80
+    assert means[100:] == pytest.approx([90 + i for i in range(100, 110)], abs=5)
+
+
+def test_sttn_residual_max_frames_two_supports_single_frame_segment(residual_clip):
+    stats, calls, _ = residual_clip({0}, total=1, sttn_residual_propainter_max_frames=2)
+    assert calls == [([0, 0], [True, True])]  # RAFT 的帧对补齐仍不超过上限
+    assert stats['sttn_propainter_calls'] == 1
+    assert stats['sttn_propainter_frames'] == 2
+
+
+@pytest.mark.parametrize('limit', [0, 30])
+def test_cli_passes_sttn_residual_max_frames(monkeypatch, limit):
+    import sys
+    import vsr_pipeline
+    calls = []
+    monkeypatch.setattr(vsr_pipeline, 'Pipeline', lambda **kw: SimpleNamespace(
+        process_video=lambda *a, **kw: calls.append(kw) or {}))
+    args = ['--sttn-residual-propaint-max-frames', str(limit)] if limit else []
+    monkeypatch.setattr(sys, 'argv', ['vsr_pipeline.py', '-i', 'in.mp4', '-o', 'out.mp4',
+                                    '--inpaint-mode', 'sttn', '--sttn-residual-propaint', *args])
+    vsr_pipeline.main()
+    assert calls[0]['sttn_residual_propainter_max_frames'] == limit
+
+
+@pytest.mark.parametrize('limit', ['-1', '1', '2.5'])
+def test_cli_rejects_invalid_sttn_residual_max_frames_before_model_init(monkeypatch, capsys, limit):
+    import sys
+    import vsr_pipeline
+    monkeypatch.setattr(vsr_pipeline, 'Pipeline', lambda **kw: pytest.fail('不应加载模型'))
+    monkeypatch.setattr(sys, 'argv', ['vsr_pipeline.py', '-i', 'in.mp4', '-o', 'out.mp4',
+                                    '--sttn-residual-propaint-max-frames', limit])
+    with pytest.raises(SystemExit) as exc:
+        vsr_pipeline.main()
+    assert exc.value.code == 2
+    assert '--sttn-residual-propaint-max-frames' in capsys.readouterr().err
 
 
 def test_residual_probe_skipped_when_no_detection(tmp_path):

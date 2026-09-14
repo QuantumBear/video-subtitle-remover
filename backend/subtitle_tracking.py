@@ -459,3 +459,23 @@ def merge_residual_runs(
         previous = point
     runs.append((max(0, start - context), min(total - 1, previous + context)))
     return merge_closed_ranges(runs)[:max_runs]
+
+
+def trim_residual_window(
+    window: Tuple[int, int],
+    frame_numbers: Sequence[int],
+    max_frames: int,
+) -> Tuple[int, int]:
+    """在闭区间内选残留核心帧最多的连续子窗口；同分时取最早位置。
+
+    上限包含上下文，0 表示不限。只裁短，不拆分或跨越原候选窗口边界。
+    """
+    lo, hi = window
+    if not max_frames or hi - lo + 1 <= max_frames:
+        return window
+    points = set(frame_numbers)
+    start = max(
+        range(lo, hi - max_frames + 2),
+        key=lambda pos: sum(pos <= i < pos + max_frames for i in points),
+    )
+    return start, start + max_frames - 1

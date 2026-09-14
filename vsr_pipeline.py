@@ -47,6 +47,7 @@ from backend.subtitle_tracking import (
     plan_vlm_frames,
     sticker_match_score as _sticker_match_score,
     track_text_boxes,
+    trim_residual_window,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -884,7 +885,8 @@ class Pipeline:
                       sticker_max_area_px=None, subtitle_strength=DEFAULT_SUBTITLE_STRENGTH,
                       temporal_glyphs=False, sttn_residual_propainter=False,
                       sttn_residual_propainter_max_windows=0,
-                      sttn_residual_propainter_min_core_frames=0):
+                      sttn_residual_propainter_min_core_frames=0,
+                      sttn_residual_propainter_max_frames=0):
         """处理单条视频：反馈式 OCR 和轨迹检测，然后按帧或分段修复。
 
         :param region: (ymin, ymax, xmin, xmax) 字幕区域;None 时自动推断字幕带,
@@ -912,7 +914,14 @@ class Pipeline:
                                                      0 表示不设全局上限，默认 0。
         :param sttn_residual_propainter_min_core_frames: 窗口内至少需要包含的残留核心帧数；
                                                          0 表示不做长度过滤，默认 0。
+        :param sttn_residual_propainter_max_frames: 单次 ProPainter 输入帧数上限，包含上下文；
+                                                   0 不限，否则至少 2 帧。超长窗口只选核心帧
+                                                   最多的连续子窗口，其余帧保留 STTN 结果。
         """
+        if (not isinstance(sttn_residual_propainter_max_frames, (int, np.integer))
+                or sttn_residual_propainter_max_frames < 0
+                or sttn_residual_propainter_max_frames == 1):
+            raise ValueError('sttn_residual_propainter_max_frames 必须为 0 或不小于 2 的整数')
         try:
             sttn_residual_propainter_max_windows = int(sttn_residual_propainter_max_windows)
         except (TypeError, ValueError) as exc:
@@ -1032,6 +1041,8 @@ class Pipeline:
         n_sttn_propainter_seconds = 0.0
         n_sttn_propainter_peak_allocated = n_sttn_propainter_peak_reserved = 0
         n_sttn_residual_runs_filtered = n_sttn_residual_frames_filtered = 0
+        n_sttn_propainter_windows_trimmed = n_sttn_propainter_input_frames_trimmed = 0
+        n_sttn_propainter_core_frames_trimmed = 0
         roi_mask = self.boxes_to_mask([region], h, w)
         scene_changes = set(detection['scene_change_frames'])
 
@@ -1180,6 +1191,8 @@ class Pipeline:
                 nonlocal n_sttn_propainter_core_frames, n_sttn_propainter_seconds
                 nonlocal n_sttn_propainter_peak_allocated, n_sttn_propainter_peak_reserved
                 nonlocal n_sttn_residual_runs_filtered, n_sttn_residual_frames_filtered
+                nonlocal n_sttn_propainter_windows_trimmed, n_sttn_propainter_input_frames_trimmed
+                nonlocal n_sttn_propainter_core_frames_trimmed
                 if not seg_frames:
                     return
                 if any(seg_boxes):
@@ -1218,26 +1231,28 @@ class Pipeline:
                     candidate_runs = merge_residual_runs(
                         residual_indices, total=len(comps), context=5, max_runs=3)
                     n_sttn_residual_runs += len(candidate_runs)
-                    if sttn_residual_propainter_min_core_frames:
-                        eligible_runs = []
-                        for lo, hi in candidate_runs:
-                            core_frames = sum(lo <= i <= hi for i in residual_indices)
-                            if core_frames >= sttn_residual_propainter_min_core_frames:
-                                eligible_runs.append((lo, hi))
-                            else:
-                                n_sttn_residual_runs_filtered += 1
-                                n_sttn_residual_frames_filtered += core_frames
-                        candidate_runs = eligible_runs
+                    eligible_runs = []
+                    for candidate in candidate_runs:
+                        lo, hi = trim_residual_window(
+                            candidate, residual_indices, sttn_residual_propainter_max_frames)
+                        core_frames = sum(lo <= i <= hi for i in residual_indices)
+                        # 按裁短后的实际核心帧数检查门槛，再消耗全局窗口预算。
+                        if core_frames >= sttn_residual_propainter_min_core_frames:
+                            eligible_runs.append((candidate, (lo, hi)))
+                        else:
+                            n_sttn_residual_runs_filtered += 1
+                            n_sttn_residual_frames_filtered += sum(
+                                candidate[0] <= i <= candidate[1] for i in residual_indices)
                     if sttn_residual_propainter_max_windows:
                         remaining = (sttn_residual_propainter_max_windows
                                      - n_sttn_propainter_calls)
-                        runs = candidate_runs[:max(0, remaining)]
+                        runs = eligible_runs[:max(0, remaining)]
                     else:
-                        runs = candidate_runs
+                        runs = eligible_runs
                     if runs:
                         self._ensure_propainter()
                         pp_engine = self._propainter_inpainter
-                        for lo, hi in runs:
+                        for (candidate_lo, candidate_hi), (lo, hi) in runs:
                             pp_frames = [comps[i].copy() for i in range(lo, hi + 1)]
                             pp_masks = [
                                 self.boxes_to_mask(seg_boxes[i], h, w)
@@ -1245,8 +1260,17 @@ class Pipeline:
                                 for i in range(lo, hi + 1)]
                             pp_boxes = [seg_boxes[i] for i in range(lo, hi + 1)]
                             core_frames = sum(lo <= i <= hi for i in residual_indices)
+                            if (lo, hi) != (candidate_lo, candidate_hi):
+                                n_sttn_propainter_windows_trimmed += 1
+                                n_sttn_propainter_input_frames_trimmed += (
+                                    candidate_hi - candidate_lo + 1 - len(pp_frames))
+                                n_sttn_propainter_core_frames_trimmed += sum(
+                                    candidate_lo <= i <= candidate_hi for i in residual_indices
+                                ) - core_frames
                             n_sttn_propainter_calls += 1
-                            n_sttn_propainter_frames += len(pp_frames)
+                            # 单帧窗口会由修复函数复制成 RAFT 所需的帧对。
+                            input_frames = max(2, len(pp_frames))
+                            n_sttn_propainter_frames += input_frames
                             n_sttn_propainter_core_frames += core_frames
                             started = time.time()
                             cuda_memory_snapshot(
@@ -1270,8 +1294,10 @@ class Pipeline:
                             peak_allocated = ((window_vram or {}).get('peak_allocated', 0) / gib)
                             peak_reserved = ((window_vram or {}).get('peak_reserved', 0) / gib)
                             print(f'[sttn->propainter] segment={seg_pts[0]}-{seg_pts[-1]} '
+                                  f'candidate_window={seg_pts[candidate_lo]}-{seg_pts[candidate_hi]} '
                                   f'window={seg_pts[lo]}-{seg_pts[hi]} '
-                                  f'residual_frames={core_frames} input_frames={len(pp_frames)} '
+                                  f'residual_frames={core_frames} input_frames={input_frames} '
+                                  f'max_frames={sttn_residual_propainter_max_frames} '
                                   f'elapsed={elapsed:.1f}s '
                                   f'peak_allocated={peak_allocated:.2f}GiB '
                                   f'peak_reserved={peak_reserved:.2f}GiB')
@@ -1427,7 +1453,11 @@ class Pipeline:
               f'(过滤小段 {n_sttn_residual_runs_filtered}段/{n_sttn_residual_frames_filtered}帧) | '
               f'转交ProPainter {n_sttn_propainter_calls}次/{n_sttn_propainter_frames}帧 '
               f'(上限 {sttn_residual_propainter_max_windows or "不限"}, '
-              f'最小核心 {sttn_residual_propainter_min_core_frames or "不限"}帧) '
+              f'最小核心 {sttn_residual_propainter_min_core_frames or "不限"}帧, '
+              f'单窗最多 {sttn_residual_propainter_max_frames or "不限"}帧) '
+              f'截短 {n_sttn_propainter_windows_trimmed}窗/'
+              f'{n_sttn_propainter_input_frames_trimmed}输入帧/'
+              f'{n_sttn_propainter_core_frames_trimmed}核心帧 '
               f'核心 {n_sttn_propainter_core_frames}帧/{n_sttn_propainter_seconds:.1f}s '
               f'峰值 {n_sttn_propainter_peak_allocated / (1024 ** 3):.2f}/'
               f'{n_sttn_propainter_peak_reserved / (1024 ** 3):.2f}GiB | '
@@ -1441,6 +1471,7 @@ class Pipeline:
                 'temporal_glyph_recovered': n_temporal_recovered,
                 'temporal_glyph_added_pixels': n_temporal_pixels,
                 'sttn_residual_propainter_enabled': bool(sttn_residual_propainter),
+                'sttn_residual_propainter_max_frames': sttn_residual_propainter_max_frames,
                 'sttn_residual_frames': n_sttn_residual_frames,
                 'sttn_residual_runs': n_sttn_residual_runs,
                 'sttn_residual_runs_filtered': n_sttn_residual_runs_filtered,
@@ -1448,6 +1479,9 @@ class Pipeline:
                 'sttn_propainter_calls': n_sttn_propainter_calls,
                 'sttn_propainter_frames': n_sttn_propainter_frames,
                 'sttn_propainter_core_frames': n_sttn_propainter_core_frames,
+                'sttn_propainter_windows_trimmed': n_sttn_propainter_windows_trimmed,
+                'sttn_propainter_input_frames_trimmed': n_sttn_propainter_input_frames_trimmed,
+                'sttn_propainter_core_frames_trimmed': n_sttn_propainter_core_frames_trimmed,
                 'sttn_propainter_seconds': n_sttn_propainter_seconds,
                 'sttn_propainter_peak_allocated_gib': n_sttn_propainter_peak_allocated / (1024 ** 3),
                 'sttn_propainter_peak_reserved_gib': n_sttn_propainter_peak_reserved / (1024 ** 3),
@@ -1480,6 +1514,9 @@ def main():
                     help='STTN 残留转交 ProPainter 的整条视频窗口上限;0=不限(默认)')
     ap.add_argument('--sttn-residual-propaint-min-core-frames', type=int, default=0,
                     help='STTN 残留窗口至少包含的核心残留帧数;0=不限(默认)')
+    ap.add_argument('--sttn-residual-propaint-max-frames', type=int, default=0,
+                    help='单次 ProPainter 输入帧数上限(含上下文);0=不限(默认),否则至少 2 帧;'
+                         '超长窗口只处理残留核心帧最多的一段，其余保留 STTN 结果')
     ap.add_argument('--subtitle-strength', choices=SUBTITLE_STRENGTHS,
                     default=DEFAULT_SUBTITLE_STRENGTH,
                     help='仅 ProPainter:light=轻度增强(默认,字形描边多覆盖 1px);'
@@ -1513,6 +1550,8 @@ def main():
                          '整幅物体误检的关键判据;用绝对像素而非相对比例,避免 ROI '
                          '尺寸变化时判据漂移')
     args = ap.parse_args()
+    if args.sttn_residual_propaint_max_frames < 0 or args.sttn_residual_propaint_max_frames == 1:
+        ap.error('--sttn-residual-propaint-max-frames 必须为 0 或不小于 2 的整数')
     if args.template_refine and args.temporal_glyphs:
         ap.error('--template-refine 与 --temporal-glyphs 不能同时开启')
     if args.temporal_glyphs and args.inpaint_mode != 'propainter':
@@ -1538,6 +1577,7 @@ def main():
         sttn_residual_propainter=args.sttn_residual_propaint,
         sttn_residual_propainter_max_windows=args.sttn_residual_propaint_max_windows,
         sttn_residual_propainter_min_core_frames=args.sttn_residual_propaint_min_core_frames,
+        sttn_residual_propainter_max_frames=args.sttn_residual_propaint_max_frames,
         subtitle_strength=args.subtitle_strength,
         locate_stickers=args.locate_stickers,
         ocr_stride=args.ocr_stride, ocr_refine_radius=args.ocr_refine_radius,
