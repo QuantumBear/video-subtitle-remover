@@ -358,10 +358,12 @@ class Pipeline:
     def __init__(self, det_model_dir=DEFAULT_DET_MODEL_DIR,
                  det_model_name=DEFAULT_DET_MODEL_NAME,
                  lama_pt=LAMA_PT, threads=None, device='auto', inpaint_mode='lama',
-                 sticker_backend=DEFAULT_STICKER_BACKEND, sticker_model_id=None):
+                 sticker_backend=DEFAULT_STICKER_BACKEND, sticker_model_id=None,
+                 sttn_profile=False):
         if threads:
             torch.set_num_threads(threads)
         self.inpaint_mode = inpaint_mode
+        self.sttn_profile = sttn_profile
         if sticker_backend not in STICKER_BACKENDS:
             raise ValueError(f'未知 sticker_backend: {sticker_backend}')
         self.sticker_backend = sticker_backend
@@ -427,6 +429,7 @@ class Pipeline:
             self.inpainter = STTNDetInpaint(
                 device=self._sttn_device,
                 model_path=ModelConfig().STTN_DET_MODEL_PATH,
+                profile=getattr(self, 'sttn_profile', False),
             )
             print('[init] STTN 已加载')
             cuda_memory_snapshot('after STTN init', reset_peak=True)
@@ -1039,6 +1042,9 @@ class Pipeline:
         n_sttn_propainter_calls = n_sttn_propainter_frames = 0
         n_sttn_propainter_core_frames = 0
         n_sttn_propainter_seconds = 0.0
+        sttn_profile = self.inpaint_mode == 'sttn' and getattr(self, 'sttn_profile', False)
+        sttn_profile_segments = 0
+        sttn_profile_seconds = 0.0
         n_sttn_propainter_peak_allocated = n_sttn_propainter_peak_reserved = 0
         n_sttn_residual_runs_filtered = n_sttn_residual_frames_filtered = 0
         n_sttn_propainter_windows_trimmed = n_sttn_propainter_input_frames_trimmed = 0
@@ -1185,6 +1191,7 @@ class Pipeline:
 
             def flush_sttn():
                 nonlocal seg_frames, seg_pts, seg_boxes, seg_core
+                nonlocal sttn_profile_segments, sttn_profile_seconds
                 nonlocal trailing_clean, core_count, n_fixed, n_unresolved
                 nonlocal n_sttn_residual_frames, n_sttn_residual_runs
                 nonlocal n_sttn_propainter_calls, n_sttn_propainter_frames
@@ -1214,7 +1221,15 @@ class Pipeline:
                                 - STTN_ROI_PAD)
                     x_max = min(w, max(box[3] for boxes in seg_boxes for box in boxes)
                                 + STTN_ROI_PAD)
+                    if sttn_profile:
+                        sttn_started = time.perf_counter()
                     comps = self.inpainter(seg_frames, masks, x_bounds=(x_min, x_max))
+                    if sttn_profile:
+                        sttn_elapsed = time.perf_counter() - sttn_started
+                        sttn_profile_segments += 1
+                        sttn_profile_seconds += sttn_elapsed
+                        print(f'[sttn-profile-segment] segment={seg_pts[0]}-{seg_pts[-1]} '
+                              f'frames={len(seg_frames)} wall={sttn_elapsed:.3f}s')
                     cuda_memory_snapshot(f'STTN segment {seg_pts[0]}-{seg_pts[-1]} after')
                     n_fixed += sum(seg_core)
                 else:
@@ -1445,6 +1460,10 @@ class Pipeline:
             os.replace(tmp_out, output_path)
         check_status = str(n_checked) if white_glyph_check else '未启用'
         temporal_status = f'{n_temporal_recovered}帧/+{n_temporal_pixels}px' if temporal_glyphs else '未启用'
+        if sttn_profile:
+            print(f'[sttn-profile-total] segments={sttn_profile_segments} '
+                  f'sttn_wall={sttn_profile_seconds:.3f}s '
+                  f'propainter_wall={n_sttn_propainter_seconds:.3f}s')
         print(f'[done] {n} 帧 | 修复 {n_fixed} | 字形补全 {n_recovered} | '
               f'跨帧字形 {temporal_status} | '
               f'残留复核 {check_status} | 补擦 {n_repair} | 疑似残留 {n_unresolved} | '
@@ -1510,6 +1529,8 @@ def main():
                     help='试验性跨帧白字补全(仅 ProPainter,默认关闭,与 --template-refine 互斥)')
     ap.add_argument('--sttn-residual-propaint', action='store_true',
                     help='STTN 模式下将疑似残留帧段交给 ProPainter(默认关闭,会增加耗时)')
+    ap.add_argument('--sttn-profile', action='store_true',
+                    help='仅 STTN:输出修复带分阶段耗时和窗口重复帧统计;CUDA 使用 Event 计时(默认关闭)')
     ap.add_argument('--sttn-residual-propaint-max-windows', type=int, default=0,
                     help='STTN 残留转交 ProPainter 的整条视频窗口上限;0=不限(默认)')
     ap.add_argument('--sttn-residual-propaint-min-core-frames', type=int, default=0,
@@ -1567,7 +1588,8 @@ def main():
 
     pipe = Pipeline(threads=args.threads, device=args.device, inpaint_mode=args.inpaint_mode,
                     sticker_backend=args.sticker_backend,
-                    sticker_model_id=args.sticker_model_id)
+                    sticker_model_id=args.sticker_model_id,
+                    sttn_profile=args.sttn_profile)
     stat = pipe.process_video(
         args.input, args.output,
         region=tuple(args.region) if args.region else None,

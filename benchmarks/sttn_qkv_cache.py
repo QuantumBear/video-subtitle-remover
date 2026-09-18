@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--threads", type=int, default=1, help="CPU 线程数")
+    parser.add_argument("--profile", action="store_true",
+                        help="对比时输出 STTN 分阶段耗时；预热阶段不输出")
     args = parser.parse_args()
     if min(args.frames, args.repeats, args.threads) < 1 or args.warmup < 0:
         parser.error("frames/repeats/threads 必须为正，warmup 必须非负")
@@ -67,6 +69,7 @@ def main():
         for cached in (False, True):
             run(cached)
 
+    engine.profile = args.profile
     timings = {False: [], True: []}
     peaks = {False: [], True: []}
     max_pixel_diff = 0.0

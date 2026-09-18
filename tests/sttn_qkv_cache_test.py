@@ -122,3 +122,40 @@ def test_engine_reuses_only_first_layer_and_keeps_cache_local(frame_count):
     finally:
         for handle in handles:
             handle.remove()
+
+
+@pytest.mark.parametrize('cached', [False, True])
+def test_profile_reports_stages_without_changing_output(cached, capsys):
+    engine = small_engine()
+    engine.cache_first_qkv = cached
+    rng = np.random.default_rng(73)
+    frames = [rng.integers(0, 256, (32, 32, 3), dtype=np.uint8) for _ in range(7)]
+    masks = [np.zeros((32, 32), dtype=np.uint8) for _ in frames]
+    masks[2][8:24, 8:24] = 255
+    engine.profile = False
+    expected = engine.inpaint(frames.copy(), masks.copy())
+    assert '[sttn-profile]' not in capsys.readouterr().out
+    engine.profile = True
+    actual = engine.inpaint(frames.copy(), masks.copy())
+    report = engine.last_profile
+    assert report['frames'] == 7
+    assert report['windows'] == 4
+    assert report['input_frame_visits'] > 7
+    assert report['decoded_frame_visits'] > 7
+    assert report['cache_active'] is cached
+    for stage in ('preprocess', 'upload', 'encoder', 'gather', 'transformer',
+                  'decoder', 'download', 'postprocess'):
+        assert report['stage_seconds'][stage] >= 0
+    assert ('qkv' in report['stage_seconds']) is cached
+    for output, reference in zip(actual, expected):
+        np.testing.assert_array_equal(output, reference)
+    log = capsys.readouterr().out
+    assert '[sttn-profile]' in log
+    assert 'clock=wall' in log
+    assert 'frames=7 windows=4' in log
+    assert 'download_wait_wall=' in log
+    # 同一常驻引擎切换到短段不应累计前一段结果。
+    engine.inpaint(frames[:1], masks[:1])
+    assert engine.last_profile['frames'] == 1
+    assert engine.last_profile['windows'] == 1
+    assert not engine.last_profile['cache_active']

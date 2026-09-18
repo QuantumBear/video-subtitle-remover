@@ -1,5 +1,3 @@
-import time
-
 import cv2
 import numpy as np
 import torch
@@ -11,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from backend.config import config
 from backend.inpaint.sttn.network_sttn import InpaintGenerator
+from backend.inpaint.sttn_profile import STTNProfiler
 from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
 from backend.tools.inpaint_tools import get_inpaint_area_by_mask
 
@@ -21,8 +20,10 @@ _to_tensors = transforms.Compose([
 ])
 
 class STTNDetInpaint:
-    def __init__(self, device, model_path, *, cache_first_qkv=True):
+    def __init__(self, device, model_path, *, cache_first_qkv=True, profile=False):
         self.device = device
+        self.profile = profile
+        self.last_profile = None
         # 1. 创建InpaintGenerator模型实例并装载到选择的设备上
         self.model = InpaintGenerator().to(self.device)
         # 2. 载入预训练模型的权重，转载模型的状态字典
@@ -193,30 +194,35 @@ class STTNDetInpaint:
         """
         使用STTN完成空洞填充（空洞即被遮罩的区域）
         """
+        profiler = STTNProfiler(getattr(self, 'profile', False), self.device)
+        self.last_profile = None
         frame_length = len(frames)
         # 对帧进行预处理转换为张量，并进行归一化
-        feats = _to_tensors(frames).unsqueeze(0) * 2 - 1
-
-        binary_masks = [np.expand_dims((np.array(m) > 0.5).astype(np.uint8), 2) for m in masks]
-        # 将掩码转换为张量
-        masks_tensor = (_to_tensors(masks).unsqueeze(0) > 0.5).float()
+        with profiler.stage('preprocess'):
+            feats = _to_tensors(frames).unsqueeze(0) * 2 - 1
+            binary_masks = [np.expand_dims((np.array(m) > 0.5).astype(np.uint8), 2) for m in masks]
+            # 将掩码转换为张量
+            masks_tensor = (_to_tensors(masks).unsqueeze(0) > 0.5).float()
 
         # 把特征张量转移到指定的设备（CPU或GPU）
-        feats, masks_tensor = feats.to(self.device), masks_tensor.to(self.device)
+        with profiler.stage('upload', device_work=True):
+            feats, masks_tensor = feats.to(self.device), masks_tensor.to(self.device)
         # 初始化一个与视频长度相同的列表，用于存储处理完成的帧
         comp_frames = [None] * frame_length
+        windows = input_frame_visits = decoded_frame_visits = 0
         # 统一关闭梯度计算，用于推理阶段节省内存并加速
         with torch.no_grad():
             # 将处理好的帧通过编码器，产生特征表示
-            feats = self.model.encoder((feats*(1-masks_tensor).float()).view(frame_length, 3, self.model_input_height, self.model_input_width))
+            with profiler.stage('encoder', device_work=True):
+                feats = self.model.encoder((feats*(1-masks_tensor).float()).view(frame_length, 3, self.model_input_height, self.model_input_width))
             # 获取特征维度信息
             _, c, feat_h, feat_w = feats.size()
             # 首个 Transformer block 的 Q/K/V 只依赖当前段的 Encoder 特征，
             # 可在多个滑动窗口之间按帧复用；后续 block 仍随窗口上下文重新计算。
-            qkv_cache = (
-                self.model.project_first_qkv(feats)
-                if self.cache_first_qkv and frame_length > self.neighbor_stride else None
-            )
+            qkv_cache = None
+            if self.cache_first_qkv and frame_length > self.neighbor_stride:
+                with profiler.stage('qkv', device_work=True):
+                    qkv_cache = self.model.project_first_qkv(feats)
             # 调整特征形状以匹配模型的期望输入
             feats = feats.view(1, frame_length, c, feat_h, feat_w)
             # 在设定的邻居帧步幅内循环处理视频
@@ -226,33 +232,60 @@ class STTNDetInpaint:
                 # 获取参考帧的索引
                 ref_ids = self.get_ref_index(neighbor_ids, frame_length)
                 window_ids = neighbor_ids + ref_ids
-                window_qkv = (
-                    tuple(projected[window_ids] for projected in qkv_cache)
-                    if qkv_cache is not None else None
-                )
+                if profiler.enabled:
+                    windows += 1
+                    input_frame_visits += len(window_ids)
+                    decoded_frame_visits += len(neighbor_ids)
+                with profiler.stage('gather', device_work=True):
+                    window_qkv = (
+                        tuple(projected[window_ids] for projected in qkv_cache)
+                        if qkv_cache is not None else None
+                    )
+                    window_feats = feats[0, window_ids, :, :, :]
+                    window_masks = masks_tensor[0, window_ids, :, :, :]
                 # 通过模型推断特征并传递给解码器以生成完成的帧
-                pred_feat = self.model.infer(
-                    feats[0, window_ids, :, :, :],
-                    masks_tensor[0, window_ids, :, :, :],
-                    qkv_cache=window_qkv,
-                )
+                with profiler.stage('transformer', device_work=True):
+                    pred_feat = self.model.infer(
+                        window_feats, window_masks, qkv_cache=window_qkv)
                 # 及时释放窗口切片，避免解码及下个窗口分配时仍占用显存。
-                del window_qkv
+                del window_qkv, window_feats, window_masks
 
                 # 将预测的特征通过解码器生成图片，并应用激活函数tanh
-                pred_img = torch.tanh(self.model.decoder(pred_feat[:len(neighbor_ids), :, :, :]))
-                # 将结果张量重新缩放到0到255的范围内（图像像素值）
-                pred_img = (pred_img + 1) / 2
+                with profiler.stage('decoder', device_work=True):
+                    pred_img = torch.tanh(self.model.decoder(pred_feat[:len(neighbor_ids), :, :, :]))
+                    pred_img = (pred_img + 1) / 2
                 # 将张量移动回CPU并转为NumPy数组
-                pred_img = pred_img.cpu().permute(0, 2, 3, 1).numpy() * 255
-                # 遍历邻近帧
-                for i in range(len(neighbor_ids)):
-                    idx = neighbor_ids[i]
-                    # 将预测的图片转换为无符号8位整数格式
-                    img = pred_img[i].astype(np.uint8) * binary_masks[idx] + frames[idx] * (1 - binary_masks[idx])
-                    if comp_frames[idx] is None:
-                        comp_frames[idx] = img
-                    else:
-                        comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
+                with profiler.stage('download', device_work=True):
+                    pred_img = pred_img.cpu()
+                with profiler.stage('postprocess'):
+                    pred_img = pred_img.permute(0, 2, 3, 1).numpy() * 255
+                    # 遍历邻近帧
+                    for i in range(len(neighbor_ids)):
+                        idx = neighbor_ids[i]
+                        # 将预测的图片转换为无符号8位整数格式
+                        img = pred_img[i].astype(np.uint8) * binary_masks[idx] + frames[idx] * (1 - binary_masks[idx])
+                        if comp_frames[idx] is None:
+                            comp_frames[idx] = img
+                        else:
+                            comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
+        report = profiler.finish()
+        if report is not None:
+            report.update(frames=frame_length, windows=windows,
+                          input_frame_visits=input_frame_visits,
+                          decoded_frame_visits=decoded_frame_visits,
+                          cache_active=qkv_cache is not None)
+            self.last_profile = report
+            stages = ' '.join(
+                f'{name}={report["stage_seconds"].get(name, 0.0):.3f}s'
+                for name in ('preprocess', 'upload', 'encoder', 'qkv', 'gather',
+                             'transformer', 'decoder', 'download', 'postprocess'))
+            print(f'[sttn-profile] device={self.device} clock={report["compute_clock"]} '
+                  f'frames={frame_length} windows={windows} '
+                  f'input_frame_visits={input_frame_visits} '
+                  f'decoded_frame_visits={decoded_frame_visits} '
+                  f'cache={"on" if report["cache_active"] else "off"} '
+                  f'wall={report["wall_seconds"]:.3f}s {stages} '
+                  f'upload_wait_wall={report["host_seconds"]["upload"]:.3f}s '
+                  f'download_wait_wall={report["host_seconds"]["download"]:.3f}s')
         # 返回处理完成的帧序列
         return comp_frames

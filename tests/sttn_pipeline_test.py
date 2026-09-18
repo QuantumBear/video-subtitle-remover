@@ -63,6 +63,76 @@ def record_calls(pipe):
     return calls
 
 
+def test_sttn_profile_cli_reaches_pipeline(monkeypatch):
+    import vsr_pipeline
+
+    seen = {}
+
+    class FakePipeline:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def process_video(self, *args, **kwargs):
+            return {}
+
+    monkeypatch.setattr(vsr_pipeline, 'Pipeline', FakePipeline)
+    monkeypatch.setattr('sys.argv', ['vsr_pipeline.py', '-i', 'in.mp4', '-o', 'out.mp4',
+                                   '--inpaint-mode', 'sttn', '--sttn-profile'])
+    vsr_pipeline.main()
+    assert seen['sttn_profile'] is True
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_sttn_profile_reaches_lazy_engine(monkeypatch, enabled):
+    import sys
+    import vsr_pipeline
+    from backend.inpaint import sttn_det_inpaint
+    from backend.tools import model_config
+
+    monkeypatch.setitem(sys.modules, 'paddleocr', SimpleNamespace(
+        TextDetection=lambda **kwargs: None))
+    monkeypatch.setattr(vsr_pipeline, 'cuda_memory_snapshot', lambda *a, **kw: None)
+    monkeypatch.setattr(model_config, 'ModelConfig', lambda: SimpleNamespace(
+        STTN_DET_MODEL_PATH='unused.pth'))
+    calls = []
+
+    def make_engine(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(sttn_det_inpaint, 'STTNDetInpaint', make_engine)
+    pipe = Pipeline(device='cpu', inpaint_mode='sttn', sttn_profile=enabled)
+    assert not calls
+    pipe._ensure_sttn()
+    pipe._ensure_sttn()
+    assert len(calls) == 1
+    assert pipe.inpainter.profile is enabled
+
+
+def test_sttn_profile_logs_segments_and_resets_per_video(tmp_path, capsys):
+    source = tmp_path / 'in.mp4'
+    make_video(source, [90] * 6)
+    pipe = make_pipe()
+    pipe.sttn_profile = True
+    record_calls(pipe)
+    for i in range(2):
+        pipe.process_video(source, tmp_path / f'out{i}.mp4', region=REGION,
+                           locate_stickers=False)
+        log = capsys.readouterr().out
+        assert '[sttn-profile-segment] segment=0-5' in log
+        assert '[sttn-profile-total] segments=1 ' in log
+
+
+def test_sttn_profile_disabled_by_default(tmp_path, capsys):
+    source = tmp_path / 'in.mp4'
+    make_video(source, [90] * 6)
+    pipe = make_pipe()
+    record_calls(pipe)
+    pipe.process_video(source, tmp_path / 'out.mp4', region=REGION,
+                       locate_stickers=False)
+    assert '[sttn-profile' not in capsys.readouterr().out
+
+
 # ---- 字形相关开关必须显式报错 ----
 
 @pytest.mark.parametrize("option", ["white_glyph_check", "template_refine", "temporal_glyphs"])
@@ -445,22 +515,33 @@ def test_residual_probe_runs_without_white_glyph_check_flag(tmp_path):
     assert stats["residual_check_enabled"] is False  # 开关本身仍是字形专属，标记不属于它
 
 
-def test_sttn_residual_can_be_delegated_to_propainter(tmp_path):
+def test_sttn_residual_can_be_delegated_to_propainter(tmp_path, monkeypatch, capsys):
+    import vsr_pipeline
+
     source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
     make_video(source, [90] * 6)
     pipe = make_pipe()
+    pipe.sttn_profile = True
     pp_calls = []
+    elapsed = [0.0]
+    monkeypatch.setattr(vsr_pipeline.time, 'perf_counter', lambda: elapsed[0])
+    monkeypatch.setattr(vsr_pipeline.time, 'time', lambda: elapsed[0])
+
+    def load_sttn():
+        elapsed[0] += 10
 
     def sttn_engine(frames, mask, x_bounds=None):
+        elapsed[0] += 2
         return [f.copy() for f in frames]
 
     class FakePropainter:
         def inpaint(self, frames, masks):
+            elapsed[0] += 5
             pp_calls.append((len(frames), [int(np.count_nonzero(m)) for m in masks]))
             return [np.full_like(frame, 33) for frame in frames]
 
     pipe.inpainter = sttn_engine
-    pipe._ensure_sttn = lambda: None
+    pipe._ensure_sttn = load_sttn
     pipe._ensure_propainter = lambda: setattr(pipe, '_propainter_inpainter', FakePropainter())
     pipe._residual_mask = lambda fixed, original, boxes: np.full(
         fixed.shape[:2], 255, dtype=np.uint8)
@@ -481,6 +562,9 @@ def test_sttn_residual_can_be_delegated_to_propainter(tmp_path):
     assert stats['sttn_propainter_seconds'] >= 0
     assert stats['sttn_propainter_peak_allocated_gib'] >= 0
     assert stats['sttn_propainter_peak_reserved_gib'] >= 0
+    # STTN 的 2 秒不能计入模型加载的 10 秒或后续 ProPainter 的 5 秒。
+    assert ('[sttn-profile-total] segments=1 sttn_wall=2.000s '
+            'propainter_wall=5.000s') in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('max_frames', [0, 30])
