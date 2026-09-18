@@ -111,13 +111,22 @@ class InpaintGenerator(BaseNetwork):
         output = torch.tanh(output)
         return output
 
-    def infer(self, feat, masks):
+    def project_first_qkv(self, feat):
+        """计算首个 Transformer block 的 Q/K/V 投影。
+
+        ``feat`` 应为 Encoder 输出的逐帧特征 ``[T, C, H, W]``。缓存只在
+        同一段 STTN 推理中有效；窗口调用方负责按帧索引切出需要的条目。
+        """
+        return self.transformer[0].attention.project_qkv(feat)
+
+    def infer(self, feat, masks, qkv_cache=None):
         t, c, h, w = masks.size()
         masks = masks.view(t, c, h, w)
         masks = F.interpolate(masks, scale_factor=1.0/4)
         t, c, _, _ = feat.size()
         enc_feat = self.transformer(
-            {'x': feat, 'm': masks, 'b': 1, 'c': c})['x']
+            {'x': feat, 'm': masks, 'b': 1, 'c': c,
+             'qkv_cache': qkv_cache})['x']
         return enc_feat
 
 
@@ -171,14 +180,25 @@ class MultiHeadedAttention(nn.Module):
             nn.LeakyReLU(0.2, inplace=True))
         self.attention = Attention()
 
-    def forward(self, x, m, b, c):
+    def project_qkv(self, x):
+        """返回当前特征的 Q/K/V 投影，供跨窗口缓存使用。"""
+        return (
+            self.query_embedding(x),
+            self.key_embedding(x),
+            self.value_embedding(x),
+        )
+
+    def forward(self, x, m, b, c, projected_qkv=None):
         bt, _, h, w = x.size()
         t = bt // b
         d_k = c // len(self.patchsize)
         output = []
-        _query = self.query_embedding(x)
-        _key = self.key_embedding(x)
-        _value = self.value_embedding(x)
+        if projected_qkv is None:
+            _query, _key, _value = self.project_qkv(x)
+        else:
+            _query, _key, _value = projected_qkv
+            if any(projected.shape != x.shape for projected in projected_qkv):
+                raise ValueError('cached STTN Q/K/V shape must match feature shape')
         for (width, height), query, key, value in zip(self.patchsize,
                                                       torch.chunk(_query, len(self.patchsize), dim=1), torch.chunk(
                                                           _key, len(self.patchsize), dim=1),
@@ -243,9 +263,11 @@ class TransformerBlock(nn.Module):
         self.feed_forward = FeedForward(hidden)
 
     def forward(self, x):
+        qkv_cache = x.get('qkv_cache')
         x, m, b, c = x['x'], x['m'], x['b'], x['c']
-        x = x + self.attention(x, m, b, c)
+        x = x + self.attention(x, m, b, c, projected_qkv=qkv_cache)
         x = x + self.feed_forward(x)
+        # 缓存只消费一次；下一层输入受窗口上下文影响，必须重新计算 Q/K/V。
         return {'x': x, 'm': m, 'b': b, 'c': c}
 
 

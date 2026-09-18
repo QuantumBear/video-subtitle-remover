@@ -21,7 +21,7 @@ _to_tensors = transforms.Compose([
 ])
 
 class STTNDetInpaint:
-    def __init__(self, device, model_path):
+    def __init__(self, device, model_path, *, cache_first_qkv=True):
         self.device = device
         # 1. 创建InpaintGenerator模型实例并装载到选择的设备上
         self.model = InpaintGenerator().to(self.device)
@@ -29,6 +29,8 @@ class STTNDetInpaint:
         self.model.load_state_dict(torch.load(model_path, map_location='cpu')['netG'])
         # 3. # 将模型设置为评估模式
         self.model.eval()
+        # 首层 Q/K/V 默认在同一 STTN 段内缓存；关闭后可用于回归和基准对比。
+        self.cache_first_qkv = cache_first_qkv
         # 模型输入用的宽和高
         self.model_input_width, self.model_input_height = 432, 240
         # 2. 设置相连帧数
@@ -209,6 +211,12 @@ class STTNDetInpaint:
             feats = self.model.encoder((feats*(1-masks_tensor).float()).view(frame_length, 3, self.model_input_height, self.model_input_width))
             # 获取特征维度信息
             _, c, feat_h, feat_w = feats.size()
+            # 首个 Transformer block 的 Q/K/V 只依赖当前段的 Encoder 特征，
+            # 可在多个滑动窗口之间按帧复用；后续 block 仍随窗口上下文重新计算。
+            qkv_cache = (
+                self.model.project_first_qkv(feats)
+                if self.cache_first_qkv and frame_length > self.neighbor_stride else None
+            )
             # 调整特征形状以匹配模型的期望输入
             feats = feats.view(1, frame_length, c, feat_h, feat_w)
             # 在设定的邻居帧步幅内循环处理视频
@@ -217,9 +225,19 @@ class STTNDetInpaint:
                 neighbor_ids = [i for i in range(max(0, f - self.neighbor_stride), min(frame_length, f + self.neighbor_stride + 1))]
                 # 获取参考帧的索引
                 ref_ids = self.get_ref_index(neighbor_ids, frame_length)
+                window_ids = neighbor_ids + ref_ids
+                window_qkv = (
+                    tuple(projected[window_ids] for projected in qkv_cache)
+                    if qkv_cache is not None else None
+                )
                 # 通过模型推断特征并传递给解码器以生成完成的帧
                 pred_feat = self.model.infer(
-                    feats[0, neighbor_ids + ref_ids, :, :, :], masks_tensor[0, neighbor_ids + ref_ids, :, :, :])
+                    feats[0, window_ids, :, :, :],
+                    masks_tensor[0, window_ids, :, :, :],
+                    qkv_cache=window_qkv,
+                )
+                # 及时释放窗口切片，避免解码及下个窗口分配时仍占用显存。
+                del window_qkv
 
                 # 将预测的特征通过解码器生成图片，并应用激活函数tanh
                 pred_img = torch.tanh(self.model.decoder(pred_feat[:len(neighbor_ids), :, :, :]))
