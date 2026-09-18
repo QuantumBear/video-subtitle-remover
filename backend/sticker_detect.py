@@ -18,6 +18,7 @@
 两个阈值都随素材的 emoji 显示尺寸与样式变化，换素材需重新标定。
 """
 import os
+import time
 from dataclasses import dataclass
 from math import isfinite
 from typing import Dict, List, Sequence, Tuple
@@ -129,27 +130,99 @@ def _box_iou(first: Box, second: Box) -> float:
 class GroundingDinoStickerDetector:
     """常驻的 GroundingDINO 推理封装；worker 进程内加载一次可处理多条视频。"""
 
-    def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str = 'auto'):
+    profile = False
+
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str = 'auto',
+                 profile: bool = False):
         import torch
         from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
+        self.profile = bool(profile)
+        self._profile_stats = self._new_profile_stats()
+        self.last_profile = None
+        init_started = time.perf_counter()
         if device == 'auto':
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = torch.device(device)
         self.model_id = model_id
+        processor_started = time.perf_counter()
         self.processor = AutoProcessor.from_pretrained(model_id)
+        processor_seconds = time.perf_counter() - processor_started
+        model_started = time.perf_counter()
         self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id)
         self.model = self.model.to(self.device).eval()
+        model_seconds = time.perf_counter() - model_started
+        self._profile_stats.update(
+            init_processor_seconds=processor_seconds,
+            init_model_seconds=model_seconds,
+            init_seconds=time.perf_counter() - init_started)
+        if self.profile:
+            print(f'[gdino-profile-init] device={self.device} '
+                  f'total={self._profile_stats["init_seconds"]:.3f}s '
+                  f'processor={processor_seconds:.3f}s model={model_seconds:.3f}s')
+
+    @staticmethod
+    def _new_profile_stats():
+        return {
+            'calls': 0,
+            'wall_seconds': 0.0,
+            'preprocess_seconds': 0.0,
+            'upload_seconds': 0.0,
+            'inference_seconds': 0.0,
+            'postprocess_seconds': 0.0,
+            'filter_seconds': 0.0,
+            'init_seconds': 0.0,
+            'init_processor_seconds': 0.0,
+            'init_model_seconds': 0.0,
+        }
+
+    def _profile_sync(self):
+        """Synchronize CUDA only while profiling, preserving normal throughput."""
+        if getattr(self, 'profile', False) and getattr(self.device, 'type', None) == 'cuda':
+            import torch
+            torch.cuda.synchronize(self.device)
+
+    def _profile_add(self, **values):
+        if not getattr(self, 'profile', False):
+            return
+        stats = getattr(self, '_profile_stats', None)
+        if stats is None:
+            stats = self._new_profile_stats()
+            self._profile_stats = stats
+        for key, value in values.items():
+            stats[key] = stats.get(key, 0.0) + value
+        self.last_profile = dict(stats)
+
+    def profile_summary(self):
+        """Return cumulative DINO inference timings, or ``None`` when disabled."""
+        if not getattr(self, 'profile', False):
+            return None
+        return dict(getattr(self, 'last_profile', None)
+                    or getattr(self, '_profile_stats', self._new_profile_stats()))
 
     def _infer_detections(self, crop, prompt: str, score_threshold: float) -> List[dict]:
         import torch
         from PIL import Image
 
+        profiling = bool(getattr(self, 'profile', False))
+        started = time.perf_counter() if profiling else 0.0
+        self._profile_sync()
+        preprocess_started = time.perf_counter() if profiling else 0.0
         pil = Image.fromarray(crop)
         inputs = self.processor(images=pil, text=prompt, return_tensors='pt')
+        preprocess_seconds = (time.perf_counter() - preprocess_started) if profiling else 0.0
+        upload_started = time.perf_counter() if profiling else 0.0
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        if profiling:
+            self._profile_sync()
+        upload_seconds = (time.perf_counter() - upload_started) if profiling else 0.0
+        inference_started = time.perf_counter() if profiling else 0.0
         with torch.inference_mode():
             outputs = self.model(**inputs)
+        if profiling:
+            self._profile_sync()
+        inference_seconds = (time.perf_counter() - inference_started) if profiling else 0.0
+        postprocess_started = time.perf_counter() if profiling else 0.0
         # 后处理保留弱检测，由调用接口选择候选筛选或强阈值筛选。
         results = self.processor.post_process_grounded_object_detection(
             outputs, inputs['input_ids'],
@@ -157,23 +230,40 @@ class GroundingDinoStickerDetector:
             text_threshold=min(0.15, score_threshold),
             target_sizes=[pil.size[::-1]],
         )[0]
-        return [{'score': float(s), 'box': [float(v) for v in b]}
-                for s, b in zip(results['scores'], results['boxes'])]
+        detections = [{'score': float(s), 'box': [float(v) for v in b]}
+                      for s, b in zip(results['scores'], results['boxes'])]
+        postprocess_seconds = (time.perf_counter() - postprocess_started) if profiling else 0.0
+        if profiling:
+            self._profile_sync()
+            self._profile_add(
+                calls=1,
+                wall_seconds=time.perf_counter() - started,
+                preprocess_seconds=preprocess_seconds,
+                upload_seconds=upload_seconds,
+                inference_seconds=inference_seconds,
+                postprocess_seconds=postprocess_seconds)
+        return detections
 
     def detect_crop(self, crop, prompt: str, score_threshold: float,
                     max_area_px: float) -> List[Tuple[float, float, float, float]]:
         """对单张 RGB crop 推理，返回已过滤的 crop 坐标框。"""
-        return filter_detections(
-            self._infer_detections(crop, prompt, score_threshold),
-            score_threshold, max_area_px)
+        detections = self._infer_detections(crop, prompt, score_threshold)
+        started = time.perf_counter() if getattr(self, 'profile', False) else 0.0
+        result = filter_detections(detections, score_threshold, max_area_px)
+        if getattr(self, 'profile', False):
+            self._profile_add(filter_seconds=time.perf_counter() - started)
+        return result
 
     def detect_candidates(self, crop, region: Sequence[int], prompt: str,
                           score_threshold: float,
                           max_area_px: float) -> List[StickerCandidate]:
         """对单张 RGB crop 推理一次，返回保留置信度的全帧候选框。"""
-        return filter_candidates(
-            self._infer_detections(crop, prompt, score_threshold),
-            region, score_threshold, max_area_px)
+        detections = self._infer_detections(crop, prompt, score_threshold)
+        started = time.perf_counter() if getattr(self, 'profile', False) else 0.0
+        result = filter_candidates(detections, region, score_threshold, max_area_px)
+        if getattr(self, 'profile', False):
+            self._profile_add(filter_seconds=time.perf_counter() - started)
+        return result
 
     def locate(self, video_path, region: Sequence[int], sample_frames: Sequence[int],
                prompt: str = DEFAULT_PROMPT,

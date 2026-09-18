@@ -366,6 +366,34 @@ def test_tracked_location_reserves_late_priority_and_uses_bounded_feedback(tmp_p
     assert stats['budget_skipped'] > 0
 
 
+def test_tracked_location_profile_reports_pass_and_appearance_timings(tmp_path, capsys):
+    from glyph_pipeline_test import write_frames
+    from backend.sticker_detect import StickerCandidate
+
+    source = tmp_path / 'profile.mp4'
+    frames = [picture() for _ in range(4)]
+    for n, frame in enumerate(frames):
+        frame[0, 0] = n
+    write_frames(source, frames)
+
+    class Detector:
+        def detect_candidates(self, *args):
+            return [StickerCandidate(BOX, 0.3)]
+
+    result, stats = sticker_tracking.locate_tracked_stickers(
+        source, (0, 100, 0, 180), [0, 3], Detector(), [[TEXT]] * 4, 4,
+        max_calls=2, profile=True)
+
+    assert set(result) == set(range(4))
+    profile = stats['profile']
+    assert profile['calls'] == 2
+    assert profile['priority_pass_seconds'] >= 0
+    assert profile['scan_pass_seconds'] >= 0
+    assert profile['appearance_seconds'] >= 0
+    log = capsys.readouterr().out
+    assert '[gdino-profile-tracking]' in log
+
+
 def test_zero_budget_does_not_open_video_or_run_models():
     assert hasattr(sticker_tracking, 'locate_tracked_stickers'), 'tracked video detection is missing'
     result, stats = sticker_tracking.locate_tracked_stickers(

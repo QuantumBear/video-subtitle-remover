@@ -194,6 +194,47 @@ def test_detect_candidates_preserves_weak_results_from_one_inference():
     assert calls['model'] == 2
 
 
+def test_gdino_profile_records_inference_stages_without_changing_candidates():
+    """DINO profile only records stage timings and preserves detector output."""
+    import numpy as np
+    import torch
+
+    class FakeProcessor:
+        def __call__(self, images, text, return_tensors):
+            return {'input_ids': torch.tensor([[1]])}
+
+        def post_process_grounded_object_detection(self, outputs, input_ids, **kwargs):
+            return [{'scores': [0.8], 'boxes': [[10, 10, 30, 30]]}]
+
+    class FakeModel:
+        def __call__(self, **inputs):
+            return object()
+
+    detector = sticker_detect.GroundingDinoStickerDetector.__new__(
+        sticker_detect.GroundingDinoStickerDetector)
+    detector.device = torch.device('cpu')
+    detector.processor = FakeProcessor()
+    detector.model = FakeModel()
+    detector.profile = True
+    crop = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    expected = [sticker_detect.StickerCandidate((110, 130, 310, 330), 0.8)]
+    assert detector.detect_candidates(
+        crop, (100, 200, 300, 400), 'emoji.', 0.25, 1200) == expected
+    profile = detector.last_profile
+    assert profile['calls'] == 1
+    assert profile['preprocess_seconds'] >= 0
+    assert profile['upload_seconds'] >= 0
+    assert profile['inference_seconds'] >= 0
+    assert profile['postprocess_seconds'] >= 0
+
+
+def test_gdino_profile_is_disabled_by_default():
+    detector = sticker_detect.GroundingDinoStickerDetector.__new__(
+        sticker_detect.GroundingDinoStickerDetector)
+    assert detector.profile is False
+
+
 # ---- 后端分流 ----
 
 def test_unknown_sticker_backend_is_rejected():
@@ -243,6 +284,25 @@ def test_gdino_backend_forwards_explicit_overrides():
         prompt='emoji.', score_threshold=0.5, max_area_px=500)
     assert captured == {'prompt': 'emoji.', 'score_threshold': 0.5,
                         'max_area_px': 500}
+
+
+def test_sticker_profile_cli_reaches_pipeline(monkeypatch):
+    import vsr_pipeline
+
+    seen = {}
+
+    class FakePipeline:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def process_video(self, *args, **kwargs):
+            return {}
+
+    monkeypatch.setattr(vsr_pipeline, 'Pipeline', FakePipeline)
+    monkeypatch.setattr('sys.argv', ['vsr_pipeline.py', '-i', 'in.mp4', '-o', 'out.mp4',
+                                     '--sticker-backend', 'gdino', '--sticker-profile'])
+    vsr_pipeline.main()
+    assert seen['sticker_profile'] is True
 
 
 def test_locate_returns_empty_dict_for_empty_schedule():

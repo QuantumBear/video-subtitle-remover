@@ -6,6 +6,7 @@ count as independent detections. Coordinates are unpadded full-frame yxyx.
 
 from bisect import bisect_right
 from dataclasses import dataclass, field
+import time
 
 import cv2
 import numpy as np
@@ -314,7 +315,8 @@ class FeedbackSchedule:
 def locate_tracked_stickers(video_path, region, sample_frames, detector,
                             text_timeline, total_frames, *, max_calls=200,
                             prompt=None, score_threshold=0.25, max_area_px=1200,
-                            scene_change_frames=(), max_gap=60, base_step=30):
+                            scene_change_frames=(), max_gap=60, base_step=30,
+                            profile=False):
     """Reserve priority calls, then confirm local presence and spend spare calls.
 
     The first decode retains only small reference patches, never the full video.
@@ -327,6 +329,16 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
 
     from backend.sticker_detect import DEFAULT_PROMPT
 
+    profile_started = time.perf_counter() if profile else 0.0
+    profile_stats = ({
+        'priority_pass_seconds': 0.0,
+        'scan_pass_seconds': 0.0,
+        'recheck_pass_seconds': 0.0,
+        'appearance_seconds': 0.0,
+        'priority_frames': 0,
+        'scan_frames': 0,
+        'recheck_frames': 0,
+    } if profile else None)
     schedule = FeedbackSchedule((n for n in sample_frames if n < total_frames),
                                 max_calls, base_step)
     tracker = StickerTracker(text_timeline, total_frames, score_threshold,
@@ -348,45 +360,80 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
         samples[n] = candidates
         tracker.add_sample(n, rgb, candidates)
 
+    def observe(n, rgb, candidates):
+        started = time.perf_counter() if profile else 0.0
+        changed = tracker.observe(n, rgb, candidates)
+        if profile:
+            profile_stats['appearance_seconds'] += time.perf_counter() - started
+        return changed
+
     priority = set(schedule.priority_frames)
     if priority and total_frames > 0:
+        pass_started = time.perf_counter() if profile else 0.0
         with av.open(os.fspath(video_path)) as src:
             for n, frame in enumerate(src.decode(video=0)):
                 if n > max(priority):
                     break
                 if n in priority:
                     schedule.record_priority(n)
+                    if profile:
+                        profile_stats['priority_frames'] += 1
                     detect(n, frame.to_ndarray(format='rgb24'))
+        if profile:
+            profile_stats['priority_pass_seconds'] += time.perf_counter() - pass_started
+        pass_started = time.perf_counter() if profile else 0.0
         with av.open(os.fspath(video_path)) as src:
             for n, frame in enumerate(src.decode(video=0)):
                 if n >= total_frames:
                     break
+                if profile:
+                    profile_stats['scan_frames'] += 1
                 rgb = frame.to_ndarray(format='rgb24')
-                changed = tracker.observe(n, rgb, samples.get(n, ()))
+                changed = observe(n, rgb, samples.get(n, ()))
                 if schedule.should_check(n, changed=changed, active=tracker.active):
                     before = tracker.stats['strong_hits']
                     detect(n, rgb)
-                    updated = tracker.observe(n, rgb, samples.get(n, ()))
+                    updated = observe(n, rgb, samples.get(n, ()))
                     schedule.record_feedback(n, changed=changed or updated and
                                              tracker.stats['strong_hits'] > before)
                 elif (n not in priority and tracker.active and
                       (changed or n >= schedule.next_check) and schedule.calls >= schedule.max_calls):
                     budget_skipped += 1
+        if profile:
+            profile_stats['scan_pass_seconds'] += time.perf_counter() - pass_started
         # New high-score feedback references can confirm earlier frames too.
         # Re-decode instead of retaining full-resolution video in memory.
         if schedule._attempted - priority:
             for track in tracker.tracks:
                 track.observations.clear()
+            pass_started = time.perf_counter() if profile else 0.0
             with av.open(os.fspath(video_path)) as src:
                 for n, frame in enumerate(src.decode(video=0)):
                     if n >= total_frames:
                         break
-                    tracker.observe(n, frame.to_ndarray(format='rgb24'), samples.get(n, ()))
+                    if profile:
+                        profile_stats['recheck_frames'] += 1
+                    observe(n, frame.to_ndarray(format='rgb24'), samples.get(n, ()))
+            if profile:
+                profile_stats['recheck_pass_seconds'] += time.perf_counter() - pass_started
     result = tracker.finish()
     stats = dict(tracker.stats, calls=schedule.calls,
                  priority_calls=len(priority & schedule._attempted),
                  feedback_calls=len(schedule._attempted - priority),
                  model_failed=model_failed, budget_skipped=budget_skipped)
+    if profile:
+        profile_stats.update(calls=schedule.calls,
+                             wall_seconds=time.perf_counter() - profile_started)
+        stats['profile'] = profile_stats
+        print(f'[gdino-profile-tracking] calls={profile_stats["calls"]} '
+              f'wall={profile_stats["wall_seconds"]:.3f}s '
+              f'priority_pass={profile_stats["priority_pass_seconds"]:.3f}s '
+              f'scan_pass={profile_stats["scan_pass_seconds"]:.3f}s '
+              f'recheck_pass={profile_stats["recheck_pass_seconds"]:.3f}s '
+              f'appearance={profile_stats["appearance_seconds"]:.3f}s '
+              f'frames={profile_stats["priority_frames"]}/'
+              f'{profile_stats["scan_frames"]}/'
+              f'{profile_stats["recheck_frames"]}')
     print(f'[sticker-gdino] calls={stats["calls"]}/{schedule.max_calls} '
           f'priority={stats["priority_calls"]} feedback={stats["feedback_calls"]} '
           f'strong={stats["strong_hits"]} weak={stats["weak_continuations"]} '

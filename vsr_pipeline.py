@@ -331,7 +331,8 @@ DEFAULT_STICKER_BACKEND = 'vlm'   # 保持默认行为不变；本地后端需�
 def locate_stickers_gdino(video_path, region, sample_frames, detector,
                           prompt=None, score_threshold=None, max_area_px=None,
                           *, text_timeline=None, total_frames=None, max_calls=None,
-                          scene_change_frames=(), max_gap=60, base_step=30):
+                          scene_change_frames=(), max_gap=60, base_step=30,
+                          profile=False):
     """兼容采样框调用；提供时间线上下文时返回逐帧外观确认后的原始框。"""
     options = dict(
         prompt=prompt or sticker_detect.DEFAULT_PROMPT,
@@ -347,7 +348,18 @@ def locate_stickers_gdino(video_path, region, sample_frames, detector,
         video_path, region, sample_frames, detector, text_timeline, total_frames,
         max_calls=sticker_detect.DEFAULT_MAX_FRAMES if max_calls is None else max_calls,
         scene_change_frames=scene_change_frames, max_gap=max_gap, base_step=base_step,
+        profile=profile,
         **options)
+    if profile:
+        report = getattr(detector, 'profile_summary', lambda: None)()
+        if report:
+            print(f'[gdino-profile] device={getattr(detector, "device", "unknown")} '
+                  f'calls={int(report["calls"])} wall={report["wall_seconds"]:.3f}s '
+                  f'preprocess={report["preprocess_seconds"]:.3f}s '
+                  f'upload={report["upload_seconds"]:.3f}s '
+                  f'inference={report["inference_seconds"]:.3f}s '
+                  f'postprocess={report["postprocess_seconds"]:.3f}s '
+                  f'filter={report["filter_seconds"]:.3f}s')
     return boxes
 
 
@@ -359,11 +371,12 @@ class Pipeline:
                  det_model_name=DEFAULT_DET_MODEL_NAME,
                  lama_pt=LAMA_PT, threads=None, device='auto', inpaint_mode='lama',
                  sticker_backend=DEFAULT_STICKER_BACKEND, sticker_model_id=None,
-                 sttn_profile=False):
+                 sttn_profile=False, sticker_profile=False):
         if threads:
             torch.set_num_threads(threads)
         self.inpaint_mode = inpaint_mode
         self.sttn_profile = sttn_profile
+        self.sticker_profile = bool(sticker_profile)
         if sticker_backend not in STICKER_BACKENDS:
             raise ValueError(f'未知 sticker_backend: {sticker_backend}')
         self.sticker_backend = sticker_backend
@@ -415,8 +428,11 @@ class Pipeline:
             from backend import sticker_detect
             model_id = self._sticker_model_id or sticker_detect.DEFAULT_MODEL_ID
             print(f'[init] 加载贴纸检测模型: {model_id}')
+            detector_options = dict(model_id=model_id, device=self._sticker_device)
+            if getattr(self, 'sticker_profile', False):
+                detector_options['profile'] = True
             self._sticker_detector = sticker_detect.GroundingDinoStickerDetector(
-                model_id=model_id, device=self._sticker_device)
+                **detector_options)
             print(f'[init] 贴纸检测器就绪(device: {self._sticker_detector.device})')
             cuda_memory_snapshot('after GroundingDINO init')
         return self._sticker_detector
@@ -999,13 +1015,16 @@ class Pipeline:
                     samples = plan_vlm_frames(total, all_boxes, budget, max(1, round(fps)),
                                               scene_change_frames=detection['scene_change_frames'])
                     detector = self._ensure_sticker_detector() if samples else None
-                    associated = locate_stickers_gdino(
-                        input_path, region, samples, detector,
+                    gdino_options = dict(
                         prompt=sticker_prompt, score_threshold=sticker_score,
                         max_area_px=sticker_max_area_px, text_timeline=all_boxes,
                         total_frames=total, max_calls=budget,
                         scene_change_frames=detection['scene_change_frames'],
                         max_gap=max(1, round(fps * 2)), base_step=max(1, round(fps)))
+                    if getattr(self, 'sticker_profile', False):
+                        gdino_options['profile'] = True
+                    associated = locate_stickers_gdino(
+                        input_path, region, samples, detector, **gdino_options)
                 else:
                     samples = plan_vlm_frames(total, all_boxes, vlm_max_calls, max(1, round(fps)),
                                               scene_change_frames=detection['scene_change_frames'])
@@ -1537,6 +1556,8 @@ def main():
                     help='STTN 模式下将疑似残留帧段交给 ProPainter(默认关闭,会增加耗时)')
     ap.add_argument('--sttn-profile', action='store_true',
                     help='仅 STTN:输出修复带分阶段耗时和窗口重复帧统计;CUDA 使用 Event 计时(默认关闭)')
+    ap.add_argument('--sticker-profile', action='store_true',
+                    help='仅 gdino:输出模型初始化、预处理/上传/推理/后处理及逐帧跟踪耗时(默认关闭)')
     ap.add_argument('--sttn-residual-propaint-max-windows', type=int, default=0,
                     help='STTN 残留转交 ProPainter 的整条视频窗口上限;0=不限(默认)')
     ap.add_argument('--sttn-residual-propaint-min-core-frames', type=int, default=0,
@@ -1595,7 +1616,8 @@ def main():
     pipe = Pipeline(threads=args.threads, device=args.device, inpaint_mode=args.inpaint_mode,
                     sticker_backend=args.sticker_backend,
                     sticker_model_id=args.sticker_model_id,
-                    sttn_profile=args.sttn_profile)
+                    sttn_profile=args.sttn_profile,
+                    sticker_profile=args.sticker_profile)
     stat = pipe.process_video(
         args.input, args.output,
         region=tuple(args.region) if args.region else None,
