@@ -53,6 +53,7 @@
 4. `06-models/02-配置项怎么理解.md`
 5. `07-dev/01-开发环境安装.md`
 6. [STTN 性能分析](07-dev/03-STTN性能分析.md)：分阶段耗时、窗口重复帧统计及 Q/K/V 缓存对比。
+7. [GroundingDINO 性能分析](07-dev/04-GroundingDINO性能分析.md)：批量推理、prompt token 复用、失败回退及对照方式。
 
 ## 不要一开始就看的内容
 

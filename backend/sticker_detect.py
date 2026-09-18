@@ -40,6 +40,7 @@ DEFAULT_MAX_AREA_PX = 1200       # 绝对像素上限；emoji 实测最大 898px
                                   # 全屏下比例判据会漂到 2 倍以上，导致误检框漏过；
                                   # 绝对像素不随裁剪尺寸变化，判据一致性更好
 DEFAULT_MAX_FRAMES = 200          # 本地推理无 API 成本，采样密度只受算力约束
+DEFAULT_BATCH_SIZE = 4            # 已确定的优先帧批量推理，反馈补查保持单张
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,8 @@ class GroundingDinoStickerDetector:
     def _new_profile_stats():
         return {
             'calls': 0,
+            'batches': 0,
+            'text_tokenizations': 0,
             'wall_seconds': 0.0,
             'preprocess_seconds': 0.0,
             'upload_seconds': 0.0,
@@ -200,16 +203,39 @@ class GroundingDinoStickerDetector:
         return dict(getattr(self, 'last_profile', None)
                     or getattr(self, '_profile_stats', self._new_profile_stats()))
 
+    def _prepare_inputs(self, images, prompt):
+        """复用当前 prompt 的 CPU token；图像和融合后的文本特征仍逐批计算。"""
+        cached = getattr(self, '_text_cache', None)
+        if cached is None or cached[0] is not self.processor or cached[1] != prompt:
+            # 通过 processor 保留其 prompt 预处理语义，不直接调用 tokenizer。
+            encoded = self.processor(text=prompt, return_tensors='pt')
+            cached = (self.processor, prompt, encoded)
+            self._text_cache = cached
+            self._profile_add(text_tokenizations=1)
+        inputs = self.processor(images=images, return_tensors='pt')
+        # repeat 同时隔离返回值，避免调用方原地修改污染缓存；仅保留一个 prompt。
+        inputs.update({key: value.repeat(len(images), 1)
+                       for key, value in cached[2].items()})
+        return inputs
+
     def _infer_detections(self, crop, prompt: str, score_threshold: float) -> List[dict]:
+        return self._infer_detections_batch([crop], prompt, score_threshold)[0]
+
+    def _infer_detections_batch(self, crops, prompt: str,
+                                score_threshold: float) -> List[List[dict]]:
+        """对多个 RGB crop 做一次批量推理，按输入顺序返回检测结果。"""
         import torch
         from PIL import Image
 
+        crops = list(crops)
+        if not crops:
+            return []
         profiling = bool(getattr(self, 'profile', False))
         started = time.perf_counter() if profiling else 0.0
         self._profile_sync()
         preprocess_started = time.perf_counter() if profiling else 0.0
-        pil = Image.fromarray(crop)
-        inputs = self.processor(images=pil, text=prompt, return_tensors='pt')
+        images = [Image.fromarray(crop) for crop in crops]
+        inputs = self._prepare_inputs(images, prompt)
         preprocess_seconds = (time.perf_counter() - preprocess_started) if profiling else 0.0
         upload_started = time.perf_counter() if profiling else 0.0
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
@@ -228,15 +254,22 @@ class GroundingDinoStickerDetector:
             outputs, inputs['input_ids'],
             box_threshold=min(0.15, score_threshold),
             text_threshold=min(0.15, score_threshold),
-            target_sizes=[pil.size[::-1]],
-        )[0]
-        detections = [{'score': float(s), 'box': [float(v) for v in b]}
-                      for s, b in zip(results['scores'], results['boxes'])]
+            target_sizes=[image.size[::-1] for image in images],
+        )
+        if len(results) != len(images):
+            raise RuntimeError(
+                f'GroundingDINO batch 返回数量异常: {len(results)} != {len(images)}')
+        detections = [
+            [{'score': float(score), 'box': [float(value) for value in box]}
+             for score, box in zip(result['scores'], result['boxes'])]
+            for result in results
+        ]
         postprocess_seconds = (time.perf_counter() - postprocess_started) if profiling else 0.0
         if profiling:
             self._profile_sync()
             self._profile_add(
-                calls=1,
+                calls=len(images),
+                batches=1,
                 wall_seconds=time.perf_counter() - started,
                 preprocess_seconds=preprocess_seconds,
                 upload_seconds=upload_seconds,
@@ -261,6 +294,18 @@ class GroundingDinoStickerDetector:
         detections = self._infer_detections(crop, prompt, score_threshold)
         started = time.perf_counter() if getattr(self, 'profile', False) else 0.0
         result = filter_candidates(detections, region, score_threshold, max_area_px)
+        if getattr(self, 'profile', False):
+            self._profile_add(filter_seconds=time.perf_counter() - started)
+        return result
+
+    def detect_candidates_batch(self, crops, region: Sequence[int], prompt: str,
+                                score_threshold: float,
+                                max_area_px: float) -> List[List[StickerCandidate]]:
+        """对多个 RGB crop 批量推理，并保持每个 crop 的候选结果边界。"""
+        detections = self._infer_detections_batch(crops, prompt, score_threshold)
+        started = time.perf_counter() if getattr(self, 'profile', False) else 0.0
+        result = [filter_candidates(items, region, score_threshold, max_area_px)
+                  for items in detections]
         if getattr(self, 'profile', False):
             self._profile_add(filter_seconds=time.perf_counter() - started)
         return result

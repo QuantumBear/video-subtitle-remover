@@ -156,9 +156,11 @@ def test_detect_candidates_preserves_weak_results_from_one_inference():
     calls = {'model': 0}
 
     class FakeProcessor:
-        def __call__(self, images, text, return_tensors):
+        def __call__(self, images=None, text=None, return_tensors=None):
+            if images is not None:
+                assert images[0].size == (100, 100)
+                return {}
             assert text == 'emoji. sticker.'
-            assert images.size == (100, 100)
             return {'input_ids': torch.tensor([[1]])}
 
         def post_process_grounded_object_detection(self, outputs, input_ids, **kwargs):
@@ -200,7 +202,9 @@ def test_gdino_profile_records_inference_stages_without_changing_candidates():
     import torch
 
     class FakeProcessor:
-        def __call__(self, images, text, return_tensors):
+        def __call__(self, images=None, text=None, return_tensors=None):
+            if images is not None:
+                return {}
             return {'input_ids': torch.tensor([[1]])}
 
         def post_process_grounded_object_detection(self, outputs, input_ids, **kwargs):
@@ -233,6 +237,94 @@ def test_gdino_profile_is_disabled_by_default():
     detector = sticker_detect.GroundingDinoStickerDetector.__new__(
         sticker_detect.GroundingDinoStickerDetector)
     assert detector.profile is False
+
+
+def test_detect_candidates_batch_runs_one_model_call_for_multiple_crops():
+    import numpy as np
+    import torch
+
+    calls = {'model': 0, 'batch_size': 0}
+
+    class FakeProcessor:
+        def __call__(self, images=None, text=None, return_tensors=None):
+            if images is not None:
+                calls['batch_size'] = len(images)
+                return {}
+            return {'input_ids': torch.tensor([[1]])}
+
+        def post_process_grounded_object_detection(self, outputs, input_ids, **kwargs):
+            assert len(kwargs['target_sizes']) == 2
+            return [
+                {'scores': [0.8], 'boxes': [[10, 10, 30, 30]]},
+                {'scores': [0.7], 'boxes': [[20, 20, 40, 40]]},
+            ]
+
+    class FakeModel:
+        def __call__(self, **inputs):
+            calls['model'] += 1
+            assert inputs['input_ids'].shape == (2, 1)
+            return object()
+
+    detector = sticker_detect.GroundingDinoStickerDetector.__new__(
+        sticker_detect.GroundingDinoStickerDetector)
+    detector.device = torch.device('cpu')
+    detector.processor = FakeProcessor()
+    detector.model = FakeModel()
+    detector.profile = True
+    crops = [np.zeros((100, 100, 3), dtype=np.uint8) for _ in range(2)]
+
+    result = detector.detect_candidates_batch(
+        crops, (100, 200, 300, 400), 'emoji.', 0.25, 1200)
+
+    assert result == [
+        [sticker_detect.StickerCandidate((110, 130, 310, 330), 0.8)],
+        [sticker_detect.StickerCandidate((120, 140, 320, 340), 0.7)],
+    ]
+    assert calls == {'model': 1, 'batch_size': 2}
+    assert detector.profile_summary()['calls'] == 2
+    assert detector.profile_summary()['batches'] == 1
+
+
+def test_prompt_tokens_are_reused_across_batch_sizes_and_invalidated_on_change():
+    import torch
+
+    class Processor:
+        def __init__(self):
+            self.text_calls = []
+
+        def __call__(self, images=None, text=None, return_tensors=None):
+            if text is not None:
+                self.text_calls.append(text)
+                # Use the processor's text semantics, including its normalization.
+                return {'input_ids': torch.tensor([[len(text.lower()), 2]]),
+                        'attention_mask': torch.tensor([[1, 1]])}
+            return {'pixel_values': torch.zeros(len(images), 3, 10, 10)}
+
+    detector = sticker_detect.GroundingDinoStickerDetector.__new__(
+        sticker_detect.GroundingDinoStickerDetector)
+    detector.processor = Processor()
+    detector.profile = True
+    first = detector._prepare_inputs([object()], 'Emoji.')
+    # Caller changes to a returned tensor must not poison the cache.
+    first['input_ids'].zero_()
+    batch = detector._prepare_inputs([object()] * 4, 'Emoji.')
+    assert batch['input_ids'].tolist() == [[6, 2]] * 4
+    assert batch['attention_mask'].tolist() == [[1, 1]] * 4
+    assert batch['pixel_values'].shape[0] == 4
+    assert detector.processor.text_calls == ['Emoji.']
+    changed = detector._prepare_inputs([object()], 'Sticker.')
+    assert changed['input_ids'].tolist() == [[8, 2]]
+    assert detector.processor.text_calls == ['Emoji.', 'Sticker.']
+    detector.processor = Processor()
+    detector._prepare_inputs([object()], 'Sticker.')
+    assert detector.processor.text_calls == ['Sticker.']
+    assert detector.profile_summary()['text_tokenizations'] == 3
+
+
+def test_empty_batch_does_not_run_processor_or_model():
+    detector = sticker_detect.GroundingDinoStickerDetector.__new__(
+        sticker_detect.GroundingDinoStickerDetector)
+    assert detector.detect_candidates_batch([], (0, 100, 0, 100), 'emoji.', 0.25, 1200) == []
 
 
 # ---- 后端分流 ----
@@ -300,9 +392,25 @@ def test_sticker_profile_cli_reaches_pipeline(monkeypatch):
 
     monkeypatch.setattr(vsr_pipeline, 'Pipeline', FakePipeline)
     monkeypatch.setattr('sys.argv', ['vsr_pipeline.py', '-i', 'in.mp4', '-o', 'out.mp4',
-                                     '--sticker-backend', 'gdino', '--sticker-profile'])
+                                     '--sticker-backend', 'gdino', '--sticker-profile',
+                                     '--sticker-batch-size', '8'])
     vsr_pipeline.main()
     assert seen['sticker_profile'] is True
+    assert seen['sticker_batch_size'] == 8
+
+
+@pytest.mark.parametrize('size', ['0', '-1'])
+def test_sticker_batch_size_cli_rejects_nonpositive_values(monkeypatch, capsys, size):
+    import vsr_pipeline
+
+    monkeypatch.setattr(vsr_pipeline, 'Pipeline',
+                        lambda **kwargs: pytest.fail('invalid CLI must not load models'))
+    monkeypatch.setattr('sys.argv', ['vsr_pipeline.py', '-i', 'in.mp4', '-o', 'out.mp4',
+                                     '--sticker-batch-size', size])
+    with pytest.raises(SystemExit) as exc:
+        vsr_pipeline.main()
+    assert exc.value.code == 2
+    assert '--sticker-batch-size' in capsys.readouterr().err
 
 
 def test_locate_returns_empty_dict_for_empty_schedule():

@@ -394,6 +394,131 @@ def test_tracked_location_profile_reports_pass_and_appearance_timings(tmp_path, 
     assert '[gdino-profile-tracking]' in log
 
 
+def test_tracked_location_batches_priority_detector_calls(tmp_path):
+    from glyph_pipeline_test import write_frames
+    from backend.sticker_detect import StickerCandidate
+
+    source = tmp_path / 'batch.mp4'
+    write_frames(source, [picture() for _ in range(4)])
+    calls = []
+
+    class Detector:
+        def detect_candidates_batch(self, crops, region, prompt, score_threshold, max_area_px):
+            calls.append(len(crops))
+            return [[StickerCandidate(BOX, 0.3)] for _ in crops]
+
+        def detect_candidates(self, *args):
+            pytest.fail('priority frames should use the batch detector')
+
+    sticker_tracking.locate_tracked_stickers(
+        source, (0, 100, 0, 180), [0, 1, 2, 3], Detector(), [[TEXT]] * 4, 4,
+        max_calls=4, batch_size=2)
+
+    assert calls == [2, 2]
+
+
+@pytest.mark.parametrize('batch_size', [2, 4])
+def test_priority_batches_preserve_tail_order_budget_and_feedback(tmp_path, batch_size):
+    from glyph_pipeline_test import write_frames
+    from backend.sticker_detect import StickerCandidate
+
+    frames = [picture() if n < 10 or n >= 20 else picture(()) for n in range(40)]
+    for n, frame in enumerate(frames):
+        frame[0, 0] = n
+    source = tmp_path / 'batch-feedback.mp4'
+    write_frames(source, frames)
+
+    class Detector:
+        def __init__(self):
+            self.calls = []
+            self.batches = []
+
+        def detect_candidates(self, crop, *args):
+            n = int(crop[0, 0, 0])
+            self.calls.append(n)
+            return [StickerCandidate(BOX, 0.3)] if n < 10 or n >= 20 else []
+
+        def detect_candidates_batch(self, crops, *args):
+            self.batches.append([int(crop[0, 0, 0]) for crop in crops])
+            return [self.detect_candidates(crop, *args) for crop in crops]
+
+    def run(size):
+        detector = Detector()
+        result, stats = sticker_tracking.locate_tracked_stickers(
+            source, (0, 100, 0, 180), [39, 0, 9, 25, 29, 9], detector,
+            [[TEXT]] * 40, 40, max_calls=10, batch_size=size, base_step=8)
+        return detector, result, stats
+
+    baseline, expected, expected_stats = run(1)
+    batched, actual, actual_stats = run(batch_size)
+    assert actual == expected
+    assert actual_stats == expected_stats
+    assert batched.calls == baseline.calls
+    assert batched.calls[:5] == [0, 9, 25, 29, 39]
+    assert len(batched.calls) == len(set(batched.calls)) <= 10
+    assert actual_stats['feedback_calls'] > 0
+    assert [n for group in batched.batches for n in group] == [0, 9, 25, 29]
+    assert all(len(group) == batch_size for group in batched.batches)
+
+
+@pytest.mark.parametrize('failure', ['runtime', 'short_result', 'oom'])
+def test_failed_batch_retries_singly_and_disables_batching(tmp_path, capsys, monkeypatch,
+                                                         failure):
+    import torch
+    from glyph_pipeline_test import write_frames
+    from backend.sticker_detect import StickerCandidate
+
+    frames = [picture() for _ in range(9)]
+    for n, frame in enumerate(frames):
+        frame[0, 0] = n
+    source = tmp_path / 'batch-failure.mp4'
+    write_frames(source, frames)
+    released = []
+    monkeypatch.setattr(torch.cuda, 'empty_cache', lambda: released.append(True))
+
+    class Detector:
+        device = torch.device('cuda')
+
+        def __init__(self):
+            self.calls = []
+            self.batches = 0
+
+        def detect_candidates_batch(self, crops, *args):
+            self.batches += 1
+            if failure == 'short_result':
+                return [[]]
+            if failure == 'oom':
+                raise torch.cuda.OutOfMemoryError('test batch OOM')
+            raise RuntimeError('test batch failure')
+
+        def detect_candidates(self, crop, *args):
+            n = int(crop[0, 0, 0])
+            self.calls.append(n)
+            if n == 2:
+                raise RuntimeError('single frame failed')
+            return [StickerCandidate(BOX, 0.3)]
+
+    def run(size):
+        detector = Detector()
+        result, stats = sticker_tracking.locate_tracked_stickers(
+            source, (0, 100, 0, 180), list(range(9)), detector,
+            [[TEXT]] * 9, 9, max_calls=9, batch_size=size)
+        return detector, result, stats
+
+    _, expected, expected_stats = run(1)
+    capsys.readouterr()
+    detector, actual, stats = run(4)
+    assert detector.batches == 1
+    assert detector.calls == list(range(9))
+    assert actual == expected
+    assert stats.pop('batch_fallbacks') == 1
+    assert expected_stats.pop('batch_fallbacks') == 0
+    assert stats == expected_stats
+    assert stats['model_failed'] == 1
+    assert '[sticker-gdino-batch-fallback]' in capsys.readouterr().out
+    assert released == ([True] if failure == 'oom' else [])
+
+
 def test_zero_budget_does_not_open_video_or_run_models():
     assert hasattr(sticker_tracking, 'locate_tracked_stickers'), 'tracked video detection is missing'
     result, stats = sticker_tracking.locate_tracked_stickers(

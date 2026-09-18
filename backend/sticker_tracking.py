@@ -11,7 +11,7 @@ import time
 import cv2
 import numpy as np
 
-from backend.sticker_detect import _box_iou
+from backend.sticker_detect import DEFAULT_BATCH_SIZE, _box_iou
 from backend.subtitle_tracking import sticker_match_score
 
 
@@ -316,10 +316,11 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
                             text_timeline, total_frames, *, max_calls=200,
                             prompt=None, score_threshold=0.25, max_area_px=1200,
                             scene_change_frames=(), max_gap=60, base_step=30,
-                            profile=False):
+                            profile=False, batch_size=DEFAULT_BATCH_SIZE):
     """Reserve priority calls, then confirm local presence and spend spare calls.
 
-    The first decode retains only small reference patches, never the full video.
+    The first decode buffers at most batch_size priority frames, then retains
+    only small reference patches, never the full video.
     A second decode checks skipped frames locally; model failures consume budget
     but are not treated as confirmed absences.
     """
@@ -344,8 +345,13 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
     tracker = StickerTracker(text_timeline, total_frames, score_threshold,
                              max_gap, scene_change_frames)
     samples = {}
-    model_failed = budget_skipped = 0
+    model_failed = budget_skipped = batch_fallbacks = 0
     ymin, ymax, xmin, xmax = region
+    batch_size = max(1, int(batch_size))
+
+    def store_candidates(n, rgb, candidates):
+        samples[n] = candidates
+        tracker.add_sample(n, rgb, candidates)
 
     def detect(n, rgb):
         nonlocal model_failed
@@ -357,8 +363,50 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
             model_failed += 1
             print(f'[sticker-gdino] f{n} 检测未确认: {type(exc).__name__}')
             return
-        samples[n] = candidates
-        tracker.add_sample(n, rgb, candidates)
+        store_candidates(n, rgb, candidates)
+
+    def detect_many(items):
+        """批量处理已确定的 priority 帧，异常时回退到逐帧调用。"""
+        nonlocal batch_size, batch_fallbacks
+        if not items:
+            return
+        batch_detector = getattr(detector, 'detect_candidates_batch', None)
+        if len(items) == 1 or not callable(batch_detector):
+            for n, rgb in items:
+                detect(n, rgb)
+            return
+        batch_failed = cuda_oom = False
+        try:
+            candidates = batch_detector(
+                [rgb[ymin:ymax, xmin:xmax] for _, rgb in items],
+                region, prompt or DEFAULT_PROMPT, score_threshold, max_area_px)
+            if len(candidates) != len(items):
+                raise RuntimeError(
+                    f'GroundingDINO batch 返回数量异常: {len(candidates)} != {len(items)}')
+        except Exception as exc:
+            import torch
+
+            batch_failed = True
+            cuda_oom = isinstance(exc, torch.cuda.OutOfMemoryError)
+            candidates = None
+            batch_fallbacks += 1
+            batch_size = 1
+            reason = str(exc).replace('\n', ' ')[:200]
+            print(f'[sticker-gdino-batch-fallback] frames={len(items)} '
+                  f'reason={type(exc).__name__}: {reason}; '
+                  '当前视频退回逐帧推理')
+        # 离开 except 后再回收/重试，避免 traceback 继续引用失败批次的 GPU 张量。
+        if batch_failed:
+            if cuda_oom:
+                import gc
+
+                gc.collect()
+                torch.cuda.empty_cache()
+            for n, rgb in items:
+                detect(n, rgb)
+            return
+        for (n, rgb), frame_candidates in zip(items, candidates):
+            store_candidates(n, rgb, frame_candidates)
 
     def observe(n, rgb, candidates):
         started = time.perf_counter() if profile else 0.0
@@ -370,6 +418,7 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
     priority = set(schedule.priority_frames)
     if priority and total_frames > 0:
         pass_started = time.perf_counter() if profile else 0.0
+        pending_priority = []
         with av.open(os.fspath(video_path)) as src:
             for n, frame in enumerate(src.decode(video=0)):
                 if n > max(priority):
@@ -378,7 +427,11 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
                     schedule.record_priority(n)
                     if profile:
                         profile_stats['priority_frames'] += 1
-                    detect(n, frame.to_ndarray(format='rgb24'))
+                    pending_priority.append((n, frame.to_ndarray(format='rgb24')))
+                    if len(pending_priority) >= batch_size:
+                        detect_many(pending_priority)
+                        pending_priority = []
+        detect_many(pending_priority)
         if profile:
             profile_stats['priority_pass_seconds'] += time.perf_counter() - pass_started
         pass_started = time.perf_counter() if profile else 0.0
@@ -420,7 +473,8 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
     stats = dict(tracker.stats, calls=schedule.calls,
                  priority_calls=len(priority & schedule._attempted),
                  feedback_calls=len(schedule._attempted - priority),
-                 model_failed=model_failed, budget_skipped=budget_skipped)
+                 model_failed=model_failed, budget_skipped=budget_skipped,
+                 batch_fallbacks=batch_fallbacks)
     if profile:
         profile_stats.update(calls=schedule.calls,
                              wall_seconds=time.perf_counter() - profile_started)
@@ -439,5 +493,5 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
           f'strong={stats["strong_hits"]} weak={stats["weak_continuations"]} '
           f'local={stats["appearance_recovered"]} absent={stats["appearance_absent"]} '
           f'unknown={stats["appearance_unknown"]} failed={model_failed} '
-          f'budget_skipped={budget_skipped}')
+          f'budget_skipped={budget_skipped} batch_fallbacks={batch_fallbacks}')
     return result, stats
