@@ -354,6 +354,9 @@ def locate_stickers_gdino(video_path, region, sample_frames, detector,
         report = getattr(detector, 'profile_summary', lambda: None)()
         if report:
             print(f'[gdino-profile] device={getattr(detector, "device", "unknown")} '
+                  f'requested_precision={report.get("requested_precision", "fp32")} '
+                  f'precision={report.get("precision", "fp32")} '
+                  f'precision_fallbacks={int(report.get("precision_fallbacks", 0))} '
                   f'calls={int(report["calls"])} batches={int(report["batches"])} '
                   f'text_tokenizations={int(report["text_tokenizations"])} '
                   f'wall={report["wall_seconds"]:.3f}s '
@@ -374,13 +377,17 @@ class Pipeline:
                  lama_pt=LAMA_PT, threads=None, device='auto', inpaint_mode='lama',
                  sticker_backend=DEFAULT_STICKER_BACKEND, sticker_model_id=None,
                  sttn_profile=False, sticker_profile=False,
-                 sticker_batch_size=sticker_detect.DEFAULT_BATCH_SIZE):
+                 sticker_batch_size=sticker_detect.DEFAULT_BATCH_SIZE,
+                 sticker_precision=sticker_detect.DEFAULT_PRECISION):
+        if sticker_precision not in sticker_detect.PRECISIONS:
+            raise ValueError(f'未知 sticker_precision: {sticker_precision}')
         if threads:
             torch.set_num_threads(threads)
         self.inpaint_mode = inpaint_mode
         self.sttn_profile = sttn_profile
         self.sticker_profile = bool(sticker_profile)
         self.sticker_batch_size = max(1, int(sticker_batch_size))
+        self.sticker_precision = sticker_precision
         if sticker_backend not in STICKER_BACKENDS:
             raise ValueError(f'未知 sticker_backend: {sticker_backend}')
         self.sticker_backend = sticker_backend
@@ -432,7 +439,9 @@ class Pipeline:
             from backend import sticker_detect
             model_id = self._sticker_model_id or sticker_detect.DEFAULT_MODEL_ID
             print(f'[init] 加载贴纸检测模型: {model_id}')
-            detector_options = dict(model_id=model_id, device=self._sticker_device)
+            detector_options = dict(
+                model_id=model_id, device=self._sticker_device,
+                precision=getattr(self, 'sticker_precision', sticker_detect.DEFAULT_PRECISION))
             if getattr(self, 'sticker_profile', False):
                 detector_options['profile'] = True
             self._sticker_detector = sticker_detect.GroundingDinoStickerDetector(
@@ -1566,6 +1575,9 @@ def main():
                     help='仅 gdino:输出模型初始化、预处理/上传/推理/后处理及逐帧跟踪耗时(默认关闭)')
     ap.add_argument('--sticker-batch-size', type=int, default=sticker_detect.DEFAULT_BATCH_SIZE,
                     help='gdino priority 帧批量推理大小,默认 4;显存不足时调为 2 或 1')
+    ap.add_argument('--sticker-precision', choices=sticker_detect.PRECISIONS,
+                    default=sticker_detect.DEFAULT_PRECISION,
+                    help='仅 gdino:推理精度,默认 fp32;CUDA 可选 fp16/bf16 混合精度,不兼容时回退 fp32')
     ap.add_argument('--sttn-residual-propaint-max-windows', type=int, default=0,
                     help='STTN 残留转交 ProPainter 的整条视频窗口上限;0=不限(默认)')
     ap.add_argument('--sttn-residual-propaint-min-core-frames', type=int, default=0,
@@ -1628,7 +1640,8 @@ def main():
                     sticker_model_id=args.sticker_model_id,
                     sttn_profile=args.sttn_profile,
                     sticker_profile=args.sticker_profile,
-                    sticker_batch_size=args.sticker_batch_size)
+                    sticker_batch_size=args.sticker_batch_size,
+                    sticker_precision=args.sticker_precision)
     stat = pipe.process_video(
         args.input, args.output,
         region=tuple(args.region) if args.region else None,

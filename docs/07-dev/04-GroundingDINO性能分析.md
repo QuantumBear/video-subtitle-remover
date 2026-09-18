@@ -1,4 +1,4 @@
-# GroundingDINO 批量推理与性能分析
+# GroundingDINO 批量推理、混合精度与性能分析
 
 `vsr_pipeline.py` 的 GDINO 后端默认把已确定的优先采样帧按 4 张一批推理。
 反馈补查需要前面帧的结果来决定下一次检测时间，因此继续逐帧执行。
@@ -8,13 +8,17 @@
 图像特征、文本模型前向和图文融合仍然正常计算；这个缓存不复用跨帧的
 检测结果。仅缓存一个 prompt 的 CPU 张量，避免常驻服务的缓存不断增长。
 
-本轮保留 FP32、图像预处理尺寸、检测阈值、帧预算和跟踪判据。
+默认使用 FP32，可选择 CUDA FP16/BF16 混合精度；图像预处理尺寸、
+检测阈值、帧预算和跟踪判据不变。
 不同 batch 的浮点计算可能存在微小差异，需要关注接近阈值的候选。
 
 ## 参数与对照方式
 
 - `--sticker-batch-size 4`：默认值，仅对 GDINO 优先采样生效。
 - `--sticker-batch-size 1`：关闭批量，仍复用 prompt token，可用于对照。
+- `--sticker-precision fp32`：默认精度。
+- `--sticker-precision fp16` / `bf16`：仅 CUDA，在模型 forward 中启用 autocast。
+  同时作用于优先帧批次和单张反馈补查，后处理使用 FP32。
 - `--sticker-profile`：输出模型初始化、检测分阶段和跟踪各遍耗时。
 
 例如，先测单张，再把 batch 改成 4、输出文件名改为 `test_gdino_b4.mp4`：
@@ -34,6 +38,33 @@ python vsr_pipeline.py \
 最终吞吐量应再关闭 profile 测一次。此示例关闭了 ProPainter 残留转交，
 与此前 DINO profile 的设置一致。
 
+### 混合精度对照
+
+直接沿用 `backend/models/grounding-dino-tiny` 中的 FP32 权重，无需下载、
+转换模型文件或重新训练。权重仍以 FP32 加载，autocast 在推理时选择适用算子的
+计算精度。BF16 的数值范围更接近 FP32，可以先在支持 BF16 的 CUDA 设备上尝试：
+
+```bash
+python vsr_pipeline.py \
+  -i TikSave.io_7635080993354878239.mp4 \
+  -o test_sttn_gdino_bf16.mp4 \
+  --inpaint-mode sttn \
+  --sticker-backend gdino \
+  --sticker-model-id backend/models/grounding-dino-tiny \
+  --sticker-score 0.22 --sticker-max-area-px 1000 \
+  --sticker-batch-size 4 --sticker-precision bf16 \
+  --sttn-profile --sticker-profile
+```
+
+保持其它参数相同，把精度改为 `fp32` / `fp16`，并使用不同输出文件名作对照。
+确认最终 `[gdino-profile]` 的 `precision` 与请求一致、`precision_fallbacks=0`，
+再比较 `inference`、跟踪 `wall` 和总耗时。模型内部也可能因低精度算子兼容问题
+采用较慢的实现，因此启用 AMP 不保证提速。
+
+有限数值的分数和框也可能有偏移，自动回退无法判断这种检测质量变化。
+需要比较 `strong/weak/local/associated_frames` 等统计和成片中的贴纸残留、
+误擦，尤其关注接近 `--sticker-score 0.22` 的检测；统计相同也不保证逐帧框相同。
+
 ## 日志口径
 
 `[gdino-profile]` 中：
@@ -41,7 +72,12 @@ python vsr_pipeline.py \
 - `calls`：成功完成推理的帧数。
 - `batches`：成功完成推理的批次数，包含反馈补查的单张调用。
 - `text_tokenizations`：生成 prompt token 的次数；固定 prompt 通常为 1。
+- `requested_precision` / `precision`：请求精度 / 当前实际精度。
+- `precision_fallbacks`：设备不支持或 forward 异常引发的 FP32 回退次数。
 - `preprocess/upload/inference/postprocess/filter`：各阶段累计秒数。
+
+开启混合精度或 profile 时，初始化输出 `[gdino-precision]`；发生精度回退时，
+即使没有开启 profile，也会输出 `[gdino-precision-fallback]` 及原因。
 
 这些值在检测器实例内累计。`[gdino-profile-tracking]` 是单条视频的统计，
 `priority_pass` 包含优先帧解码、推理与参考建立；`scan_pass` 包含外观核验和
@@ -55,6 +91,15 @@ forward 次数减少不代表等比例提速：每批的计算量更大，收益
 
 ## 失败回退
 
+非 CUDA 设备请求 FP16/BF16、或所选 CUDA 设备不支持 BF16 时，明确记录原因，
+使用 FP32。混合精度 forward 的算子不兼容或输出 NaN、无效无穷值时，
+当前批次以 FP32 重试一次，该检测器后续也使用 FP32。
+GroundingDINO 合法的 `-inf` 文本填充不会触发回退。
+FP32 重试仍异常时继续交由原有批量/帧失败处理，不静默返回空检测。
+精度重试成功后，`calls/batches` 只计成功的帧/批，`inference` 包含失败尝试与重试耗时。
+
+OOM 不触发精度回退，保持请求精度并交给下面的缩批逻辑处理。
+
 批量异常或返回数量不符时，输出 `[sticker-gdino-batch-fallback]`，
 当前批次逐帧重试，当前视频后续也改为单张。CUDA OOM 时先退出异常栈、
 回收临时张量并释放空闲显存缓存，再重试。
@@ -66,7 +111,16 @@ forward 次数减少不代表等比例提速：每批的计算量更大，收益
 
 ## 本地验证（2026-09-18）
 
-相关回归及原片贴纸回放共 179 项通过，1 项可选的慢速 ProPainter 对照跳过。
+混合精度回归覆盖 CLI 到惰性加载的参数传递、默认 FP32、CPU/不支持 BF16 的降级、
+autocast 作用域、整数 token、后处理 FP32、合法文本填充、数值/算子异常与 OOM 分流。
+本次相关回归及原片贴纸回放共 198 项通过、3 项跳过（2 项 CUDA 测试，
+1 项可选慢速 ProPainter 对照）。FP16/BF16 的 CUDA 小模型测试在本地无 CUDA 时跳过；
+它们只能验证封装行为，真实 GroundingDINO 的 CUDA 兼容性与速度仍需目标机器实测。
+
+本地真实权重的 CPU 回退检查中，请求 BF16 后实际使用 FP32，原片第 0 帧
+`(443,1052,0,624)` ROI 的 3 个候选与直接 FP32 forward 的整数框、分数完全一致。
+
+此前批量推理相关回归及原片贴纸回放共 179 项通过，1 项可选的慢速 ProPainter 对照跳过。
 覆盖尾批、帧顺序、反馈采样、预算、换 prompt、异常回退和 CLI 参数。
 
 使用本地真实 GroundingDINO Tiny 权重（Transformers 4.44.2、PyTorch 2.2.2、

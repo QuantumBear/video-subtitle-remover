@@ -19,6 +19,7 @@
 """
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from math import isfinite
 from typing import Dict, List, Sequence, Tuple
@@ -41,6 +42,8 @@ DEFAULT_MAX_AREA_PX = 1200       # 绝对像素上限；emoji 实测最大 898px
                                   # 绝对像素不随裁剪尺寸变化，判据一致性更好
 DEFAULT_MAX_FRAMES = 200          # 本地推理无 API 成本，采样密度只受算力约束
 DEFAULT_BATCH_SIZE = 4            # 已确定的优先帧批量推理，反馈补查保持单张
+PRECISIONS = ('fp32', 'fp16', 'bf16')
+DEFAULT_PRECISION = 'fp32'
 
 
 @dataclass(frozen=True)
@@ -132,9 +135,14 @@ class GroundingDinoStickerDetector:
     """常驻的 GroundingDINO 推理封装；worker 进程内加载一次可处理多条视频。"""
 
     profile = False
+    requested_precision = DEFAULT_PRECISION
+    precision = DEFAULT_PRECISION
+    precision_fallbacks = 0
 
     def __init__(self, model_id: str = DEFAULT_MODEL_ID, device: str = 'auto',
-                 profile: bool = False):
+                 profile: bool = False, precision: str = DEFAULT_PRECISION):
+        if precision not in PRECISIONS:
+            raise ValueError(f'未知 sticker precision: {precision}; 可选 {PRECISIONS}')
         import torch
         from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
@@ -145,6 +153,19 @@ class GroundingDinoStickerDetector:
         if device == 'auto':
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = torch.device(device)
+        self.requested_precision = self.precision = precision
+        self.precision_fallbacks = 0
+        if precision != 'fp32':
+            if self.device.type != 'cuda':
+                self._fallback_precision('混合精度仅支持 CUDA')
+            elif precision == 'bf16':
+                with torch.cuda.device(self.device):
+                    supported = torch.cuda.is_bf16_supported()
+                if not supported:
+                    self._fallback_precision('当前 CUDA 设备不支持 BF16')
+        if self.profile or precision != 'fp32':
+            print(f'[gdino-precision] device={self.device} '
+                  f'requested={self.requested_precision} precision={self.precision}')
         self.model_id = model_id
         processor_started = time.perf_counter()
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -200,8 +221,62 @@ class GroundingDinoStickerDetector:
         """Return cumulative DINO inference timings, or ``None`` when disabled."""
         if not getattr(self, 'profile', False):
             return None
-        return dict(getattr(self, 'last_profile', None)
-                    or getattr(self, '_profile_stats', self._new_profile_stats()))
+        report = dict(getattr(self, 'last_profile', None)
+                      or getattr(self, '_profile_stats', self._new_profile_stats()))
+        report.update(requested_precision=self.requested_precision,
+                      precision=self.precision,
+                      precision_fallbacks=self.precision_fallbacks)
+        return report
+
+    def _fallback_precision(self, reason):
+        previous = self.precision
+        self.precision = 'fp32'
+        self.precision_fallbacks += 1
+        reason = ' '.join(str(reason).split())
+        print(f'[gdino-precision-fallback] device={self.device} '
+              f'requested={self.requested_precision} from={previous} precision=fp32 '
+              f'reason={reason}')
+
+    def _forward_once(self, inputs, precision, *, validate=False):
+        import torch
+
+        amp = precision != 'fp32'
+        # 权重和输入仍为原始精度；只让 CUDA forward 的适用算子使用低精度。
+        # 显式关闭 FP32 路径的 autocast，使重试不受调用方外层上下文影响。
+        context = (torch.autocast(
+            device_type='cuda', enabled=amp,
+            dtype=torch.bfloat16 if precision == 'bf16' else torch.float16)
+            if self.device.type == 'cuda' else nullcontext())
+        with torch.inference_mode():
+            with context:
+                outputs = self.model(**inputs)
+            if amp or validate:
+                # 阈值判断与坐标换算保持 FP32；转换无法修复已发生的溢出。
+                outputs.logits = outputs.logits.float()
+                outputs.pred_boxes = outputs.pred_boxes.float()
+                # DINO 的无效文本位置合法地使用 -inf；每个 query 必须仍有
+                # 有限的最大 logit，NaN / +inf / 全 -inf 均触发重试。
+                valid = (torch.isfinite(outputs.logits.amax(dim=-1)).all()
+                         & torch.isfinite(outputs.pred_boxes).all())
+                if not valid.item():
+                    raise RuntimeError('GroundingDINO non-finite logits or boxes')
+        return outputs
+
+    def _forward(self, inputs):
+        if self.precision == 'fp32':
+            return self._forward_once(inputs, 'fp32')
+        import torch
+
+        try:
+            return self._forward_once(inputs, self.precision)
+        except (RuntimeError, NotImplementedError) as exc:
+            # OOM 由跟踪器缩批处理，改为 FP32 反而会增加显存需求。
+            if isinstance(exc, torch.cuda.OutOfMemoryError) or 'out of memory' in str(exc).lower():
+                raise
+            reason = f'{type(exc).__name__}: {exc}'
+        # 离开 except 后释放失败 forward 的 traceback 和临时张量再重试。
+        self._fallback_precision(reason)
+        return self._forward_once(inputs, 'fp32', validate=True)
 
     def _prepare_inputs(self, images, prompt):
         """复用当前 prompt 的 CPU token；图像和融合后的文本特征仍逐批计算。"""
@@ -224,7 +299,6 @@ class GroundingDinoStickerDetector:
     def _infer_detections_batch(self, crops, prompt: str,
                                 score_threshold: float) -> List[List[dict]]:
         """对多个 RGB crop 做一次批量推理，按输入顺序返回检测结果。"""
-        import torch
         from PIL import Image
 
         crops = list(crops)
@@ -243,8 +317,7 @@ class GroundingDinoStickerDetector:
             self._profile_sync()
         upload_seconds = (time.perf_counter() - upload_started) if profiling else 0.0
         inference_started = time.perf_counter() if profiling else 0.0
-        with torch.inference_mode():
-            outputs = self.model(**inputs)
+        outputs = self._forward(inputs)
         if profiling:
             self._profile_sync()
         inference_seconds = (time.perf_counter() - inference_started) if profiling else 0.0
