@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import torch
+from contextlib import nullcontext
 from torchvision import transforms
 from typing import List, Union
 import sys
@@ -19,9 +20,20 @@ _to_tensors = transforms.Compose([
     ToTorchFormatTensor()  # 将堆叠的图像转化为PyTorch张量
 ])
 
+STTN_PRECISIONS = ('fp32', 'fp16')
+DEFAULT_STTN_PRECISION = 'fp32'
+
 class STTNDetInpaint:
-    def __init__(self, device, model_path, *, cache_first_qkv=True, profile=False):
-        self.device = device
+    def __init__(self, device, model_path, *, cache_first_qkv=True, profile=False,
+                 precision=DEFAULT_STTN_PRECISION):
+        if precision not in STTN_PRECISIONS:
+            raise ValueError(f'未知 STTN precision: {precision}; 可选 {STTN_PRECISIONS}')
+        self.device = torch.device(device)
+        self.requested_precision = precision
+        self.precision = precision
+        self.precision_fallbacks = 0
+        if precision == 'fp16' and self.device.type != 'cuda':
+            self._fallback_precision('混合精度仅支持 CUDA')
         self.profile = profile
         self.last_profile = None
         self.last_profile_bands = []
@@ -38,6 +50,21 @@ class STTNDetInpaint:
         # 2. 设置相连帧数
         self.neighbor_stride = config.sttnNeighborStride.value
         self.ref_length = config.sttnReferenceLength.value
+
+    def _fallback_precision(self, reason):
+        previous = getattr(self, 'precision', DEFAULT_STTN_PRECISION)
+        self.precision = 'fp32'
+        self.precision_fallbacks = getattr(self, 'precision_fallbacks', 0) + 1
+        reason = ' '.join(str(reason).split())
+        print(f'[sttn-precision-fallback] device={self.device} '
+              f'requested={getattr(self, "requested_precision", previous)} '
+              f'from={previous} precision=fp32 reason={reason}')
+
+    def _autocast_context(self, precision):
+        enabled = precision == 'fp16' and self.device.type == 'cuda'
+        if not enabled:
+            return nullcontext()
+        return torch.autocast(device_type='cuda', dtype=torch.float16)
 
     @staticmethod
     def compute_split_h(frame_width, frame_height, model_width, model_height):
@@ -204,6 +231,21 @@ class STTNDetInpaint:
         return ref_index
 
     def inpaint(self, frames: List[np.ndarray], masks: List[np.ndarray]):
+        """运行一条修复带；FP16 失败时丢弃整带结果并用 FP32 重算。"""
+        precision = getattr(self, 'precision', DEFAULT_STTN_PRECISION)
+        try:
+            return self._inpaint_once(frames, masks, precision)
+        except (RuntimeError, NotImplementedError) as exc:
+            # FP32 通常需要更多显存，OOM 交给上层的显存/批处理策略处理。
+            if isinstance(exc, torch.cuda.OutOfMemoryError) or 'out of memory' in str(exc).lower():
+                raise
+            if precision != 'fp16' or getattr(self, 'precision', precision) == 'fp32':
+                raise
+            self._fallback_precision(f'{type(exc).__name__}: {exc}')
+            return self._inpaint_once(frames, masks, 'fp32')
+
+    def _inpaint_once(self, frames: List[np.ndarray], masks: List[np.ndarray],
+                      precision=DEFAULT_STTN_PRECISION):
         """
         使用STTN完成空洞填充（空洞即被遮罩的区域）
         """
@@ -212,10 +254,12 @@ class STTNDetInpaint:
         frame_length = len(frames)
         # 对帧进行预处理转换为张量，并进行归一化
         with profiler.stage('preprocess'):
-            feats = _to_tensors(frames).unsqueeze(0) * 2 - 1
+            # Stack 会把 ndarray 原地转换为 PIL；复制输入避免一次推理改变
+            # 调用方持有的帧，尤其是 FP16 失败后的整带重试需要原始输入。
+            feats = _to_tensors([np.asarray(frame).copy() for frame in frames]).unsqueeze(0) * 2 - 1
             binary_masks = [np.expand_dims((np.array(m) > 0.5).astype(np.uint8), 2) for m in masks]
             # 将掩码转换为张量
-            masks_tensor = (_to_tensors(masks).unsqueeze(0) > 0.5).float()
+            masks_tensor = (_to_tensors([np.asarray(mask).copy() for mask in masks]).unsqueeze(0) > 0.5).float()
 
         # 把特征张量转移到指定的设备（CPU或GPU）
         with profiler.stage('upload', device_work=True):
@@ -225,62 +269,68 @@ class STTNDetInpaint:
         windows = input_frame_visits = decoded_frame_visits = 0
         # 统一关闭梯度计算，用于推理阶段节省内存并加速
         with torch.no_grad():
-            # 将处理好的帧通过编码器，产生特征表示
-            with profiler.stage('encoder', device_work=True):
-                feats = self.model.encoder((feats*(1-masks_tensor).float()).view(frame_length, 3, self.model_input_height, self.model_input_width))
-            # 获取特征维度信息
-            _, c, feat_h, feat_w = feats.size()
-            # 首个 Transformer block 的 Q/K/V 只依赖当前段的 Encoder 特征，
-            # 可在多个滑动窗口之间按帧复用；后续 block 仍随窗口上下文重新计算。
-            qkv_cache = None
-            if self.cache_first_qkv and frame_length > self.neighbor_stride:
-                with profiler.stage('qkv', device_work=True):
-                    qkv_cache = self.model.project_first_qkv(feats)
-            # 调整特征形状以匹配模型的期望输入
-            feats = feats.view(1, frame_length, c, feat_h, feat_w)
-            # 在设定的邻居帧步幅内循环处理视频
-            for f in range(0, frame_length, self.neighbor_stride):
-                # 计算邻近帧的ID
-                neighbor_ids = [i for i in range(max(0, f - self.neighbor_stride), min(frame_length, f + self.neighbor_stride + 1))]
-                # 获取参考帧的索引
-                ref_ids = self.get_ref_index(neighbor_ids, frame_length)
-                window_ids = neighbor_ids + ref_ids
-                if profiler.enabled:
-                    windows += 1
-                    input_frame_visits += len(window_ids)
-                    decoded_frame_visits += len(neighbor_ids)
-                with profiler.stage('gather', device_work=True):
-                    window_qkv = (
-                        tuple(projected[window_ids] for projected in qkv_cache)
-                        if qkv_cache is not None else None
-                    )
-                    window_feats = feats[0, window_ids, :, :, :]
-                    window_masks = masks_tensor[0, window_ids, :, :, :]
-                # 通过模型推断特征并传递给解码器以生成完成的帧
-                with profiler.stage('transformer', device_work=True):
-                    pred_feat = self.model.infer(
-                        window_feats, window_masks, qkv_cache=window_qkv)
-                # 及时释放窗口切片，避免解码及下个窗口分配时仍占用显存。
-                del window_qkv, window_feats, window_masks
+            with self._autocast_context(precision):
+                # 将处理好的帧通过编码器，产生特征表示
+                with profiler.stage('encoder', device_work=True):
+                    feats = self.model.encoder((feats*(1-masks_tensor).float()).view(frame_length, 3, self.model_input_height, self.model_input_width))
+                # 获取特征维度信息
+                _, c, feat_h, feat_w = feats.size()
+                # 首个 Transformer block 的 Q/K/V 只依赖当前段的 Encoder 特征，
+                # 可在多个滑动窗口之间按帧复用；后续 block 仍随窗口上下文重新计算。
+                qkv_cache = None
+                if self.cache_first_qkv and frame_length > self.neighbor_stride:
+                    with profiler.stage('qkv', device_work=True):
+                        qkv_cache = self.model.project_first_qkv(feats)
+                # 调整特征形状以匹配模型的期望输入
+                feats = feats.view(1, frame_length, c, feat_h, feat_w)
+                # 在设定的邻居帧步幅内循环处理视频
+                for f in range(0, frame_length, self.neighbor_stride):
+                    # 计算邻近帧的ID
+                    neighbor_ids = [i for i in range(max(0, f - self.neighbor_stride), min(frame_length, f + self.neighbor_stride + 1))]
+                    # 获取参考帧的索引
+                    ref_ids = self.get_ref_index(neighbor_ids, frame_length)
+                    window_ids = neighbor_ids + ref_ids
+                    if profiler.enabled:
+                        windows += 1
+                        input_frame_visits += len(window_ids)
+                        decoded_frame_visits += len(neighbor_ids)
+                    with profiler.stage('gather', device_work=True):
+                        window_qkv = (
+                            tuple(projected[window_ids] for projected in qkv_cache)
+                            if qkv_cache is not None else None
+                        )
+                        window_feats = feats[0, window_ids, :, :, :]
+                        window_masks = masks_tensor[0, window_ids, :, :, :]
+                    # 通过模型推断特征并传递给解码器以生成完成的帧
+                    with profiler.stage('transformer', device_work=True):
+                        pred_feat = self.model.infer(
+                            window_feats, window_masks, qkv_cache=window_qkv)
+                    # 及时释放窗口切片，避免解码及下个窗口分配时仍占用显存。
+                    del window_qkv, window_feats, window_masks
 
-                # 将预测的特征通过解码器生成图片，并应用激活函数tanh
-                with profiler.stage('decoder', device_work=True):
-                    pred_img = torch.tanh(self.model.decoder(pred_feat[:len(neighbor_ids), :, :, :]))
-                    pred_img = (pred_img + 1) / 2
-                # 将张量移动回CPU并转为NumPy数组
-                with profiler.stage('download', device_work=True):
-                    pred_img = pred_img.cpu()
-                with profiler.stage('postprocess'):
-                    pred_img = pred_img.permute(0, 2, 3, 1).numpy() * 255
-                    # 遍历邻近帧
-                    for i in range(len(neighbor_ids)):
-                        idx = neighbor_ids[i]
-                        # 将预测的图片转换为无符号8位整数格式
-                        img = pred_img[i].astype(np.uint8) * binary_masks[idx] + frames[idx] * (1 - binary_masks[idx])
-                        if comp_frames[idx] is None:
-                            comp_frames[idx] = img
-                        else:
-                            comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
+                    # 将预测的特征通过解码器生成图片，并应用激活函数tanh
+                    with profiler.stage('decoder', device_work=True):
+                        decoded = self.model.decoder(pred_feat[:len(neighbor_ids), :, :, :])
+                        if not torch.isfinite(decoded).all().item():
+                            raise RuntimeError('STTN non-finite decoder output')
+                        pred_img = torch.tanh(decoded)
+                        pred_img = (pred_img + 1) / 2
+                    if not torch.isfinite(pred_img).all().item():
+                        raise RuntimeError('STTN non-finite output')
+                    # 将张量移动回CPU并转为NumPy数组
+                    with profiler.stage('download', device_work=True):
+                        pred_img = pred_img.float().cpu()
+                    with profiler.stage('postprocess'):
+                        pred_img = pred_img.permute(0, 2, 3, 1).numpy() * 255
+                        # 遍历邻近帧
+                        for i in range(len(neighbor_ids)):
+                            idx = neighbor_ids[i]
+                            # 将预测的图片转换为无符号8位整数格式
+                            img = pred_img[i].astype(np.uint8) * binary_masks[idx] + frames[idx] * (1 - binary_masks[idx])
+                            if comp_frames[idx] is None:
+                                comp_frames[idx] = img
+                            else:
+                                comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
         report = profiler.finish()
         if report is not None:
             report.update(frames=frame_length, windows=windows,
@@ -292,7 +342,14 @@ class STTNDetInpaint:
                 f'{name}={report["stage_seconds"].get(name, 0.0):.3f}s'
                 for name in ('preprocess', 'upload', 'encoder', 'qkv', 'gather',
                              'transformer', 'decoder', 'download', 'postprocess'))
-            print(f'[sttn-profile] device={self.device} clock={report["compute_clock"]} '
+            report.update(requested_precision=getattr(self, 'requested_precision', 'fp32'),
+                          precision=getattr(self, 'precision', precision),
+                          precision_fallbacks=getattr(self, 'precision_fallbacks', 0))
+            print(f'[sttn-profile] device={self.device} '
+                  f'requested_precision={report["requested_precision"]} '
+                  f'precision={report["precision"]} '
+                  f'precision_fallbacks={report["precision_fallbacks"]} '
+                  f'clock={report["compute_clock"]} '
                   f'frames={frame_length} windows={windows} '
                   f'input_frame_visits={input_frame_visits} '
                   f'decoded_frame_visits={decoded_frame_visits} '

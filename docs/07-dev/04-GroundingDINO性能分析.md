@@ -8,7 +8,8 @@
 图像特征、文本模型前向和图文融合仍然正常计算；这个缓存不复用跨帧的
 检测结果。仅缓存一个 prompt 的 CPU 张量，避免常驻服务的缓存不断增长。
 
-默认使用 FP32，可选择 CUDA FP16/BF16 混合精度；图像预处理尺寸、
+默认使用 CUDA FP16 混合精度，可用 FP32 或 BF16 覆盖；CPU 或不兼容设备会自动回退 FP32。
+图像预处理尺寸、
 检测阈值、帧预算和跟踪判据不变。
 不同 batch 的浮点计算可能存在微小差异，需要关注接近阈值的候选。
 
@@ -16,8 +17,9 @@
 
 - `--sticker-batch-size 4`：默认值，仅对 GDINO 优先采样生效。
 - `--sticker-batch-size 1`：关闭批量，仍复用 prompt token，可用于对照。
-- `--sticker-precision fp32`：默认精度。
-- `--sticker-precision fp16` / `bf16`：仅 CUDA，在模型 forward 中启用 autocast。
+- `--sticker-precision fp16`：默认精度；在 CUDA 的模型 forward 中启用 autocast。
+- `--sticker-precision fp32`：关闭混合精度，可用于基准和结果对照。
+- `--sticker-precision bf16`：CUDA 可选精度，在模型 forward 中启用 autocast。
   同时作用于优先帧批次和单张反馈补查，后处理使用 FP32。
 - `--sticker-profile`：输出模型初始化、检测分阶段和跟踪各遍耗时。
 
@@ -111,7 +113,7 @@ OOM 不触发精度回退，保持请求精度并交给下面的缩批逻辑处�
 
 ## 本地验证（2026-09-18）
 
-混合精度回归覆盖 CLI 到惰性加载的参数传递、默认 FP32、CPU/不支持 BF16 的降级、
+混合精度回归覆盖 CLI 到惰性加载的参数传递、默认 FP16、CPU/不支持 BF16 的降级、
 autocast 作用域、整数 token、后处理 FP32、合法文本填充、数值/算子异常与 OOM 分流。
 本次相关回归及原片贴纸回放共 198 项通过、3 项跳过（2 项 CUDA 测试，
 1 项可选慢速 ProPainter 对照）。FP16/BF16 的 CUDA 小模型测试在本地无 CUDA 时跳过；

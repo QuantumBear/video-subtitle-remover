@@ -5,17 +5,23 @@
 
 ```bash
 python vsr_pipeline.py -i input.mp4 -o output.mp4 \
-  --inpaint-mode sttn --sttn-profile \
+  --inpaint-mode sttn --sttn-precision fp16 --sttn-profile \
   --sttn-residual-propaint --sttn-residual-propaint-max-windows 8
 ```
 
-Python 调用可使用 `Pipeline(inpaint_mode='sttn', sttn_profile=True)`，
-或直接构造 `STTNDetInpaint(device, model_path, profile=True)`。
+Python 调用可使用 `Pipeline(inpaint_mode='sttn', sttn_precision='fp16', sttn_profile=True)`，
+或直接构造 `STTNDetInpaint(device, model_path, precision='fp16', profile=True)`。
 该选项仅在 STTN 模式生效。
+
+`--sttn-precision` 默认是 `fp32`。设置为 `fp16` 时，CUDA 上仅对
+encoder、首层 Q/K/V、transformer 和 decoder 使用局部 autocast，模型权重仍以
+FP32 加载，输出和 mask 合成回到 FP32。CPU 会自动回退到 FP32。若 CUDA
+算子不支持 Half，或 decoder 产生非有限值，会丢弃当前修复带并完整用 FP32
+重算；OOM 不触发回退，以便沿用上层显存处理策略。
 
 ## 日志范围
 
-- `[sttn-profile]`：一次缩放后修复带的 `inpaint()` 调用。一个视频段可能包含多个修复带，因此可能输出多行；各阶段累计该修复带所有窗口的耗时。
+- `[sttn-profile]`：一次缩放后修复带的 `inpaint()` 调用。一个视频段可能包含多个修复带，因此可能输出多行；各阶段累计该修复带所有窗口的耗时。日志中的 `requested_precision`、`precision` 和 `precision_fallbacks` 分别表示请求精度、当前实际精度和累计回退次数。
 - `[sttn-profile-band]`：一次视频段中实际生成的垂直修复带，包含 `band=当前/总数` 和原图坐标 `ymin,ymax,xmin,xmax`。同一视频段出现多条 `[sttn-profile]` 时，用这个日志判断它们对应的是哪些区域。
 - `[sttn-profile-segment]`：一次完整 STTN 引擎调用，包含 ROI 裁剪、修复带缩放、推理、放大及 mask 合成。`segment` 是原视频帧号范围。不含模型加载、OCR、残留检测、ProPainter 和视频编码。
 - `[sttn-profile-total]`：整条视频的 STTN 引擎调用 wall time 之和，以及已有的 ProPainter fallback wall time。每条视频重新统计，不等于流水线总耗时；完整耗时仍看 `[done]`。

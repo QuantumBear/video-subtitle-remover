@@ -43,7 +43,8 @@ DEFAULT_MAX_AREA_PX = 1200       # 绝对像素上限；emoji 实测最大 898px
 DEFAULT_MAX_FRAMES = 200          # 本地推理无 API 成本，采样密度只受算力约束
 DEFAULT_BATCH_SIZE = 4            # 已确定的优先帧批量推理，反馈补查保持单张
 PRECISIONS = ('fp32', 'fp16', 'bf16')
-DEFAULT_PRECISION = 'fp32'
+# CUDA 上优先使用 FP16；CPU 或不兼容设备会在初始化/forward 时回退到 FP32。
+DEFAULT_PRECISION = 'fp16'
 
 
 @dataclass(frozen=True)
@@ -263,12 +264,17 @@ class GroundingDinoStickerDetector:
         return outputs
 
     def _forward(self, inputs):
-        if self.precision == 'fp32':
+        precision = getattr(self, 'precision', DEFAULT_PRECISION)
+        # 兼容旧调用方通过 __new__ 注入 CPU 测试替身；正式构造时非 CUDA
+        # 请求已经在初始化阶段回退，这里再兜底避免 CPU 误启用 autocast。
+        if self.device.type != 'cuda':
+            precision = 'fp32'
+        if precision == 'fp32':
             return self._forward_once(inputs, 'fp32')
         import torch
 
         try:
-            return self._forward_once(inputs, self.precision)
+            return self._forward_once(inputs, precision)
         except (RuntimeError, NotImplementedError) as exc:
             # OOM 由跟踪器缩批处理，改为 FP32 反而会增加显存需求。
             if isinstance(exc, torch.cuda.OutOfMemoryError) or 'out of memory' in str(exc).lower():

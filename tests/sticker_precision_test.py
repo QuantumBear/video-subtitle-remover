@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from backend.sticker_detect import GroundingDinoStickerDetector
+from backend.sticker_detect import DEFAULT_PRECISION, GroundingDinoStickerDetector
 
 
 @pytest.fixture
@@ -60,10 +60,12 @@ def test_bf16_checks_the_selected_cuda_device(fake_loader, monkeypatch, supporte
     assert fake_loader == [torch.device('cuda:1')]
 
 
-def test_default_fp32_and_invalid_precision(fake_loader):
+def test_default_precision_and_invalid_precision(fake_loader, capsys):
     detector = GroundingDinoStickerDetector(device='cpu')
+    assert detector.requested_precision == DEFAULT_PRECISION == 'fp16'
     assert detector.precision == 'fp32'
-    assert detector.precision_fallbacks == 0
+    assert detector.precision_fallbacks == 1
+    assert '[gdino-precision-fallback]' in capsys.readouterr().out
     with pytest.raises(ValueError, match='precision'):
         GroundingDinoStickerDetector(device='cpu', precision='int8')
     assert len(fake_loader) == 1
@@ -206,7 +208,7 @@ def test_precision_cli_reaches_lazy_detector(monkeypatch, precision):
         argv.extend(['--sticker-precision', precision])
     monkeypatch.setattr('sys.argv', argv)
     vsr_pipeline.main()
-    assert seen['sticker_precision'] == (precision or 'fp32')
+    assert seen['sticker_precision'] == (precision or DEFAULT_PRECISION)
 
     # 实际 Pipeline 构造与惰性加载都要转发精度，OCR 用替身避免加载模型。
     import sys
@@ -221,7 +223,7 @@ def test_precision_cli_reaches_lazy_detector(monkeypatch, precision):
 
     monkeypatch.setattr(vsr_pipeline.sticker_detect, 'GroundingDinoStickerDetector', detector_factory)
     pipe._ensure_sticker_detector()
-    assert options['precision'] == (precision or 'fp32')
+    assert options['precision'] == (precision or DEFAULT_PRECISION)
 
 
 def test_cli_rejects_invalid_precision_before_loading_models(monkeypatch):

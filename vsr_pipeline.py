@@ -354,8 +354,8 @@ def locate_stickers_gdino(video_path, region, sample_frames, detector,
         report = getattr(detector, 'profile_summary', lambda: None)()
         if report:
             print(f'[gdino-profile] device={getattr(detector, "device", "unknown")} '
-                  f'requested_precision={report.get("requested_precision", "fp32")} '
-                  f'precision={report.get("precision", "fp32")} '
+                  f'requested_precision={report.get("requested_precision", sticker_detect.DEFAULT_PRECISION)} '
+                  f'precision={report.get("precision", sticker_detect.DEFAULT_PRECISION)} '
                   f'precision_fallbacks={int(report.get("precision_fallbacks", 0))} '
                   f'calls={int(report["calls"])} batches={int(report["batches"])} '
                   f'text_tokenizations={int(report["text_tokenizations"])} '
@@ -376,7 +376,7 @@ class Pipeline:
                  det_model_name=DEFAULT_DET_MODEL_NAME,
                  lama_pt=LAMA_PT, threads=None, device='auto', inpaint_mode='lama',
                  sticker_backend=DEFAULT_STICKER_BACKEND, sticker_model_id=None,
-                 sttn_profile=False, sticker_profile=False,
+                 sttn_profile=False, sttn_precision='fp32', sticker_profile=False,
                  sticker_batch_size=sticker_detect.DEFAULT_BATCH_SIZE,
                  sticker_precision=sticker_detect.DEFAULT_PRECISION):
         if sticker_precision not in sticker_detect.PRECISIONS:
@@ -385,6 +385,9 @@ class Pipeline:
             torch.set_num_threads(threads)
         self.inpaint_mode = inpaint_mode
         self.sttn_profile = sttn_profile
+        if sttn_precision not in ('fp32', 'fp16'):
+            raise ValueError(f'未知 sttn_precision: {sttn_precision}')
+        self.sttn_precision = sttn_precision
         self.sticker_profile = bool(sticker_profile)
         self.sticker_batch_size = max(1, int(sticker_batch_size))
         self.sticker_precision = sticker_precision
@@ -459,6 +462,7 @@ class Pipeline:
                 device=self._sttn_device,
                 model_path=ModelConfig().STTN_DET_MODEL_PATH,
                 profile=getattr(self, 'sttn_profile', False),
+                precision=getattr(self, 'sttn_precision', 'fp32'),
             )
             print('[init] STTN 已加载')
             cuda_memory_snapshot('after STTN init', reset_peak=True)
@@ -1571,13 +1575,15 @@ def main():
                     help='STTN 模式下将疑似残留帧段交给 ProPainter(默认关闭,会增加耗时)')
     ap.add_argument('--sttn-profile', action='store_true',
                     help='仅 STTN:输出修复带分阶段耗时和窗口重复帧统计;CUDA 使用 Event 计时(默认关闭)')
+    ap.add_argument('--sttn-precision', choices=('fp32', 'fp16'), default='fp32',
+                    help='仅 STTN:推理精度,默认 fp32;CUDA 可选 fp16,不兼容时回退 fp32')
     ap.add_argument('--sticker-profile', action='store_true',
                     help='仅 gdino:输出模型初始化、预处理/上传/推理/后处理及逐帧跟踪耗时(默认关闭)')
     ap.add_argument('--sticker-batch-size', type=int, default=sticker_detect.DEFAULT_BATCH_SIZE,
                     help='gdino priority 帧批量推理大小,默认 4;显存不足时调为 2 或 1')
     ap.add_argument('--sticker-precision', choices=sticker_detect.PRECISIONS,
                     default=sticker_detect.DEFAULT_PRECISION,
-                    help='仅 gdino:推理精度,默认 fp32;CUDA 可选 fp16/bf16 混合精度,不兼容时回退 fp32')
+                    help='仅 gdino:推理精度,默认 fp16;可选 fp32/bf16,不兼容时回退 fp32')
     ap.add_argument('--sttn-residual-propaint-max-windows', type=int, default=0,
                     help='STTN 残留转交 ProPainter 的整条视频窗口上限;0=不限(默认)')
     ap.add_argument('--sttn-residual-propaint-min-core-frames', type=int, default=0,
@@ -1639,6 +1645,7 @@ def main():
                     sticker_backend=args.sticker_backend,
                     sticker_model_id=args.sticker_model_id,
                     sttn_profile=args.sttn_profile,
+                    sttn_precision=args.sttn_precision,
                     sticker_profile=args.sticker_profile,
                     sticker_batch_size=args.sticker_batch_size,
                     sticker_precision=args.sticker_precision)
