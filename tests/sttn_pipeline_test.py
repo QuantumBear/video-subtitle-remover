@@ -604,6 +604,7 @@ def residual_clip(tmp_path):
         source, output = tmp_path / 'in.mp4', tmp_path / 'out.mp4'
         make_video(source, [90 + i for i in range(total)])
         pipe = make_pipe()
+        residual_pixel_counts = options.pop('residual_pixel_counts', {})
         record_calls(pipe)
         pipe._detect_timeline = lambda *args: (
             [[BOX] for _ in range(total)],
@@ -618,9 +619,17 @@ def residual_clip(tmp_path):
                 return [np.full_like(f, 33) for f in frames]
 
         pipe._ensure_propainter = lambda: setattr(pipe, '_propainter_inpainter', FakePropainter())
-        pipe._residual_mask = lambda fixed, original, boxes: np.full(
-            original.shape[:2], 255 if int(original[0, 0, 0]) - 90 in residual_indices else 0,
-            dtype=np.uint8)
+        def residual_mask(fixed, original, boxes):
+            frame_index = int(original[0, 0, 0]) - 90
+            count = int(residual_pixel_counts.get(frame_index, 0))
+            if frame_index in residual_indices and not residual_pixel_counts:
+                count = original.shape[0] * original.shape[1]
+            mask = np.zeros(original.shape[:2], dtype=np.uint8)
+            if count:
+                mask.flat[:count] = 255
+            return mask
+
+        pipe._residual_mask = residual_mask
         options.setdefault('sttn_residual_propainter', True)
         stats = pipe.process_video(source, output, region=REGION, locate_stickers=False, **options)
         with av.open(str(output)) as result:
@@ -690,6 +699,58 @@ def test_sttn_residual_max_frames_and_global_budget_apply_across_segments(residu
     assert stats['sttn_propainter_frames'] == 20
     assert stats['sttn_propainter_core_frames_trimmed'] == 80
     assert means[100:] == pytest.approx([90 + i for i in range(100, 110)], abs=5)
+
+
+def test_sttn_residual_max_windows_prioritizes_most_severe_candidate(residual_clip):
+    stats, calls, _ = residual_clip({3, *range(50, 60)}, total=80,
+                                    sttn_residual_propainter_max_windows=1)
+    assert calls == [(list(range(50, 65)), [True] * 10 + [False] * 5)]
+    assert stats['sttn_propainter_calls'] == 1
+    assert stats['sttn_propainter_core_frames'] == 10
+
+
+def test_sttn_residual_max_windows_breaks_core_ties_by_residual_pixels(residual_clip):
+    stats, calls, _ = residual_clip({3, 4, 5, 50, 51, 52}, total=80,
+                                    residual_pixel_counts={
+                                        3: 60, 4: 60, 5: 60,
+                                        50: 120, 51: 120, 52: 120,
+                                    },
+                                    sttn_residual_propainter_max_windows=1)
+    assert calls == [(list(range(50, 58)), [True] * 3 + [False] * 5)]
+    assert stats['sttn_propainter_core_frames'] == 3
+
+
+def test_sttn_residual_max_windows_rechecks_unresolved_after_propainter(tmp_path):
+    source, output = tmp_path / 'in.mp4', tmp_path / 'out.mp4'
+    make_video(source, [90 + i for i in range(12)])
+    pipe = make_pipe()
+    record_calls(pipe)
+    pipe._detect_timeline = lambda *args: (
+        [[BOX] for _ in range(12)],
+        dict(sampled=12, refined=0, ocr_calls=0, tracks=1, discarded=0,
+             scene_change_frames=[]))
+
+    class FakePropainter:
+        def inpaint(self, frames, masks):
+            return [np.full_like(frame, 33) for frame in frames]
+
+    pipe._ensure_propainter = lambda: setattr(pipe, '_propainter_inpainter', FakePropainter())
+
+    def residual_mask(fixed, original, boxes):
+        # 第一遍 STTN 结果仍保留原亮度，ProPainter 写回后框内变为 33。
+        mask = np.zeros(fixed.shape[:2], dtype=np.uint8)
+        if int(fixed[BOX[0], BOX[2], 0]) > 80:
+            mask[BOX[0]:BOX[1], BOX[2]:BOX[3]] = 255
+        return mask
+
+    pipe._residual_mask = residual_mask
+    stats = pipe.process_video(
+        source, output, region=REGION, locate_stickers=False,
+        sttn_residual_propainter=True,
+        sttn_residual_propainter_max_windows=1)
+
+    assert stats['sttn_propainter_calls'] == 1
+    assert stats['unresolved'] == 0
 
 
 def test_sttn_residual_max_frames_two_supports_single_frame_segment(residual_clip):

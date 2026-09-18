@@ -1067,10 +1067,19 @@ class Pipeline:
         # 第二遍:修复 + 写出
         frame_tb = 1 / rate
         tmp_out = output_path + '.tmp.mp4'
+        defer_propainter_windows = bool(
+            self.inpaint_mode == 'sttn'
+            and sttn_residual_propainter
+            and sttn_residual_propainter_max_windows > 0)
         dst = av.open(tmp_out, 'w')
-        ov = dst.add_stream('libx264', rate=rate)
-        ov.width = w; ov.height = h; ov.pix_fmt = 'yuv420p'
-        ov.options = {'crf': '18', 'bf': '0'}
+        ov = dst.add_stream('libx264rgb' if defer_propainter_windows else 'libx264',
+                            rate=rate)
+        ov.width = w
+        ov.height = h
+        ov.pix_fmt = 'rgb24' if defer_propainter_windows else 'yuv420p'
+        # 有限窗口预算需要第二遍读取第一遍结果；使用无损中间视频，避免
+        # ProPainter 第二遍基于已经压缩的 STTN 结果再次累积编码误差。
+        ov.options = {'crf': '0' if defer_propainter_windows else '18', 'bf': '0'}
         src = av.open(input_path)
         n_fixed = n_repair = n_checked = n = 0
         n_recovered = n_unresolved = n_check_failed = 0
@@ -1087,6 +1096,7 @@ class Pipeline:
         n_sttn_residual_runs_filtered = n_sttn_residual_frames_filtered = 0
         n_sttn_propainter_windows_trimmed = n_sttn_propainter_input_frames_trimmed = 0
         n_sttn_propainter_core_frames_trimmed = 0
+        deferred_propainter_candidates = []
         roi_mask = self.boxes_to_mask([region], h, w)
         scene_changes = set(detection['scene_change_frames'])
 
@@ -1227,6 +1237,64 @@ class Pipeline:
                     clean_img, clean_pts = pending_clean.popleft()
                     write_sttn_frame(clean_img, clean_pts)
 
+            def run_propainter_window(pp_frames, pp_masks, pp_boxes,
+                                      segment_start, segment_end,
+                                      candidate_start, candidate_end,
+                                      window_start, window_end,
+                                      candidate_core_pts, core_pts):
+                """运行一次 ProPainter，并累计实际转交窗口的统计。"""
+                nonlocal n_sttn_propainter_calls, n_sttn_propainter_frames
+                nonlocal n_sttn_propainter_core_frames, n_sttn_propainter_seconds
+                nonlocal n_sttn_propainter_peak_allocated, n_sttn_propainter_peak_reserved
+                nonlocal n_sttn_propainter_windows_trimmed
+                nonlocal n_sttn_propainter_input_frames_trimmed
+                nonlocal n_sttn_propainter_core_frames_trimmed
+                self._ensure_propainter()
+                pp_engine = self._propainter_inpainter
+                core_pts = set(core_pts)
+                candidate_core_pts = set(candidate_core_pts)
+                core_frames = len(core_pts)
+                if (window_start, window_end) != (candidate_start, candidate_end):
+                    n_sttn_propainter_windows_trimmed += 1
+                    n_sttn_propainter_input_frames_trimmed += (
+                        candidate_end - candidate_start + 1 - len(pp_frames))
+                    n_sttn_propainter_core_frames_trimmed += (
+                        len(candidate_core_pts) - core_frames)
+                n_sttn_propainter_calls += 1
+                input_frames = max(2, len(pp_frames))
+                n_sttn_propainter_frames += input_frames
+                n_sttn_propainter_core_frames += core_frames
+                started = time.time()
+                cuda_memory_snapshot(
+                    f'STTN->ProPainter window {window_start}-{window_end}',
+                    reset_peak=True)
+                repaired, _ = self._repair_propainter_segment(
+                    pp_frames, pp_masks, pp_boxes,
+                    white_glyph_check=False, engine=pp_engine)
+                elapsed = time.time() - started
+                window_vram = cuda_memory_snapshot(
+                    f'STTN->ProPainter window {window_start}-{window_end} after')
+                n_sttn_propainter_seconds += elapsed
+                if window_vram:
+                    n_sttn_propainter_peak_allocated = max(
+                        n_sttn_propainter_peak_allocated,
+                        window_vram['peak_allocated'])
+                    n_sttn_propainter_peak_reserved = max(
+                        n_sttn_propainter_peak_reserved,
+                        window_vram['peak_reserved'])
+                gib = 1024 ** 3
+                peak_allocated = ((window_vram or {}).get('peak_allocated', 0) / gib)
+                peak_reserved = ((window_vram or {}).get('peak_reserved', 0) / gib)
+                print(f'[sttn->propainter] segment={segment_start}-{segment_end} '
+                      f'candidate_window={candidate_start}-{candidate_end} '
+                      f'window={window_start}-{window_end} '
+                      f'residual_frames={core_frames} input_frames={input_frames} '
+                      f'max_frames={sttn_residual_propainter_max_frames} '
+                      f'elapsed={elapsed:.1f}s '
+                      f'peak_allocated={peak_allocated:.2f}GiB '
+                      f'peak_reserved={peak_reserved:.2f}GiB')
+                return repaired
+
             def flush_sttn():
                 nonlocal seg_frames, seg_pts, seg_boxes, seg_core
                 nonlocal sttn_profile_segments, sttn_profile_seconds
@@ -1280,12 +1348,15 @@ class Pipeline:
                     comps = seg_frames
                 if sttn_residual_propainter and any(seg_boxes):
                     residual_indices = []
+                    residual_pixels = {}
                     for idx, (comp, boxes) in enumerate(zip(comps, seg_boxes)):
                         if not seg_core[idx] or not boxes:
                             continue
                         residual = self._residual_mask(comp, seg_frames[idx], boxes)
-                        if np.count_nonzero(residual) >= RESID_MIN_PX:
+                        count = int(np.count_nonzero(residual))
+                        if count >= RESID_MIN_PX:
                             residual_indices.append(idx)
+                            residual_pixels[idx] = count
                     n_sttn_residual_frames += len(residual_indices)
                     candidate_runs = merge_residual_runs(
                         residual_indices, total=len(comps), context=5, max_runs=3)
@@ -1295,71 +1366,61 @@ class Pipeline:
                         lo, hi = trim_residual_window(
                             candidate, residual_indices, sttn_residual_propainter_max_frames)
                         core_frames = sum(lo <= i <= hi for i in residual_indices)
+                        pixel_count = sum(residual_pixels.get(i, 0)
+                                          for i in residual_indices if lo <= i <= hi)
                         # 按裁短后的实际核心帧数检查门槛，再消耗全局窗口预算。
                         if core_frames >= sttn_residual_propainter_min_core_frames:
-                            eligible_runs.append((candidate, (lo, hi)))
+                            eligible_runs.append((candidate, (lo, hi),
+                                                   core_frames, pixel_count))
                         else:
                             n_sttn_residual_runs_filtered += 1
                             n_sttn_residual_frames_filtered += sum(
                                 candidate[0] <= i <= candidate[1] for i in residual_indices)
-                    if sttn_residual_propainter_max_windows:
+                    if defer_propainter_windows:
+                        for (candidate_lo, candidate_hi), (lo, hi), core_frames, pixel_count in eligible_runs:
+                            deferred_propainter_candidates.append({
+                                'segment_start': int(seg_pts[0]),
+                                'segment_end': int(seg_pts[-1]),
+                                'candidate_start': int(seg_pts[candidate_lo]),
+                                'candidate_end': int(seg_pts[candidate_hi]),
+                                'window_start': int(seg_pts[lo]),
+                                'window_end': int(seg_pts[hi]),
+                                'core_frames': int(core_frames),
+                                'residual_pixels': int(pixel_count),
+                                'candidate_core_pts': [
+                                    int(seg_pts[i]) for i in residual_indices
+                                    if candidate_lo <= i <= candidate_hi],
+                                'core_pts': [
+                                    int(seg_pts[i]) for i in residual_indices
+                                    if lo <= i <= hi],
+                                'boxes_by_pt': {
+                                    int(seg_pts[i]): [tuple(box) for box in seg_boxes[i]]
+                                    for i in range(lo, hi + 1)},
+                            })
+                        runs = []
+                    elif sttn_residual_propainter_max_windows:
                         remaining = (sttn_residual_propainter_max_windows
                                      - n_sttn_propainter_calls)
                         runs = eligible_runs[:max(0, remaining)]
                     else:
                         runs = eligible_runs
                     if runs:
-                        self._ensure_propainter()
-                        pp_engine = self._propainter_inpainter
-                        for (candidate_lo, candidate_hi), (lo, hi) in runs:
+                        for (candidate_lo, candidate_hi), (lo, hi), _, _ in runs:
                             pp_frames = [comps[i].copy() for i in range(lo, hi + 1)]
                             pp_masks = [
                                 self.boxes_to_mask(seg_boxes[i], h, w)
                                 if i in residual_indices else np.zeros((h, w), dtype='uint8')
                                 for i in range(lo, hi + 1)]
                             pp_boxes = [seg_boxes[i] for i in range(lo, hi + 1)]
-                            core_frames = sum(lo <= i <= hi for i in residual_indices)
-                            if (lo, hi) != (candidate_lo, candidate_hi):
-                                n_sttn_propainter_windows_trimmed += 1
-                                n_sttn_propainter_input_frames_trimmed += (
-                                    candidate_hi - candidate_lo + 1 - len(pp_frames))
-                                n_sttn_propainter_core_frames_trimmed += sum(
-                                    candidate_lo <= i <= candidate_hi for i in residual_indices
-                                ) - core_frames
-                            n_sttn_propainter_calls += 1
-                            # 单帧窗口会由修复函数复制成 RAFT 所需的帧对。
-                            input_frames = max(2, len(pp_frames))
-                            n_sttn_propainter_frames += input_frames
-                            n_sttn_propainter_core_frames += core_frames
-                            started = time.time()
-                            cuda_memory_snapshot(
-                                f'STTN->ProPainter window {seg_pts[lo]}-{seg_pts[hi]} before',
-                                reset_peak=True)
-                            repaired, _ = self._repair_propainter_segment(
+                            repaired = run_propainter_window(
                                 pp_frames, pp_masks, pp_boxes,
-                                white_glyph_check=False, engine=pp_engine)
-                            elapsed = time.time() - started
-                            window_vram = cuda_memory_snapshot(
-                                f'STTN->ProPainter window {seg_pts[lo]}-{seg_pts[hi]} after')
-                            n_sttn_propainter_seconds += elapsed
-                            if window_vram:
-                                n_sttn_propainter_peak_allocated = max(
-                                    n_sttn_propainter_peak_allocated,
-                                    window_vram['peak_allocated'])
-                                n_sttn_propainter_peak_reserved = max(
-                                    n_sttn_propainter_peak_reserved,
-                                    window_vram['peak_reserved'])
-                            gib = 1024 ** 3
-                            peak_allocated = ((window_vram or {}).get('peak_allocated', 0) / gib)
-                            peak_reserved = ((window_vram or {}).get('peak_reserved', 0) / gib)
-                            print(f'[sttn->propainter] segment={seg_pts[0]}-{seg_pts[-1]} '
-                                  f'candidate_window={seg_pts[candidate_lo]}-{seg_pts[candidate_hi]} '
-                                  f'window={seg_pts[lo]}-{seg_pts[hi]} '
-                                  f'residual_frames={core_frames} input_frames={input_frames} '
-                                  f'max_frames={sttn_residual_propainter_max_frames} '
-                                  f'elapsed={elapsed:.1f}s '
-                                  f'peak_allocated={peak_allocated:.2f}GiB '
-                                  f'peak_reserved={peak_reserved:.2f}GiB')
+                                seg_pts[0], seg_pts[-1],
+                                seg_pts[candidate_lo], seg_pts[candidate_hi],
+                                seg_pts[lo], seg_pts[hi],
+                                [seg_pts[i] for i in residual_indices
+                                 if candidate_lo <= i <= candidate_hi],
+                                [seg_pts[i] for i in residual_indices
+                                 if lo <= i <= hi])
                             for i in residual_indices:
                                 if lo <= i <= hi:
                                     comps[i] = repaired[i - lo]
@@ -1390,6 +1451,119 @@ class Pipeline:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+            def apply_deferred_propainter_windows():
+                """在第一遍 STTN 完成后，按全片严重度执行 Top-K 窗口。"""
+                if not defer_propainter_windows:
+                    return
+                nonlocal n_unresolved
+                ranked = sorted(
+                    deferred_propainter_candidates,
+                    key=lambda item: (-item['core_frames'],
+                                      -item['residual_pixels'],
+                                      item['window_start']))
+                selected = sorted(
+                    ranked[:sttn_residual_propainter_max_windows],
+                    key=lambda item: item['window_start'])
+                selected_summary = [
+                    (item['window_start'], item['window_end'],
+                     item['core_frames'], item['residual_pixels'])
+                    for item in selected]
+                print(f'[sttn->propainter-priority] candidates='
+                      f'{len(deferred_propainter_candidates)} '
+                      f'selected={len(selected)} order={selected_summary}')
+                pp_tmp = tmp_out + '.propainter.mp4'
+                first_pass = av.open(tmp_out)
+                second_pass = av.open(pp_tmp, 'w')
+                second_stream = second_pass.add_stream('libx264', rate=rate)
+                second_stream.width = w
+                second_stream.height = h
+                second_stream.pix_fmt = 'yuv420p'
+                second_stream.options = {'crf': '18', 'bf': '0'}
+
+                def write_second_pass(img_bgr, pts):
+                    out_frame = av.VideoFrame.from_ndarray(
+                        cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), format='rgb24')
+                    out_frame.pts = pts
+                    out_frame.time_base = frame_tb
+                    for pkt in second_stream.encode(out_frame):
+                        second_pass.mux(pkt)
+
+                frames = iter(first_pass.decode(video=0))
+                original_pass = av.open(input_path)
+                original_frames = iter(original_pass.decode(video=0))
+                next_pt = 0
+
+                def read_second_pass_frame(expected_pt):
+                    try:
+                        frame = next(frames)
+                        original_frame = next(original_frames)
+                    except StopIteration:
+                        return None
+                    img = np.asarray(frame.to_image())
+                    original_img = np.asarray(original_frame.to_image())
+                    return (cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
+                            cv2.cvtColor(original_img, cv2.COLOR_RGB2BGR))
+
+                for candidate in selected:
+                    lo, hi = candidate['window_start'], candidate['window_end']
+                    while next_pt < lo:
+                        pair = read_second_pass_frame(next_pt)
+                        if pair is None:
+                            raise ValueError(f'第一遍临时视频缺少帧 {next_pt}')
+                        output_frame, _ = pair
+                        write_second_pass(output_frame, next_pt)
+                        next_pt += 1
+                    if next_pt != lo:
+                        raise ValueError(
+                            f'ProPainter 候选窗口重叠或乱序: next={next_pt} lo={lo}')
+                    pp_frames = []
+                    original_pp_frames = []
+                    for pt in range(lo, hi + 1):
+                        pair = read_second_pass_frame(pt)
+                        if pair is None:
+                            raise ValueError(f'第一遍临时视频缺少帧 {pt}')
+                        output_frame, original_frame = pair
+                        pp_frames.append(output_frame)
+                        original_pp_frames.append(original_frame)
+                    core_pts = set(candidate['core_pts'])
+                    pp_boxes = [candidate['boxes_by_pt'].get(pt, [])
+                                for pt in range(lo, hi + 1)]
+                    pp_masks = [
+                        self.boxes_to_mask(boxes, h, w)
+                        if pt in core_pts else np.zeros((h, w), dtype='uint8')
+                        for pt, boxes in zip(range(lo, hi + 1), pp_boxes)]
+                    repaired = run_propainter_window(
+                        pp_frames, pp_masks, pp_boxes,
+                        candidate['segment_start'], candidate['segment_end'],
+                        candidate['candidate_start'], candidate['candidate_end'],
+                        lo, hi, candidate['candidate_core_pts'], candidate['core_pts'])
+                    for offset, pt in enumerate(range(lo, hi + 1)):
+                        output_frame = pp_frames[offset]
+                        if pt in core_pts:
+                            output_frame = np.where(
+                                roi_mask[:, :, None] > 0,
+                                repaired[offset], output_frame)
+                            remaining = np.count_nonzero(self._residual_mask(
+                                output_frame, original_pp_frames[offset], pp_boxes[offset]))
+                            if remaining < RESID_MIN_PX:
+                                n_unresolved -= 1
+                        write_second_pass(output_frame, pt)
+                    next_pt = hi + 1
+
+                while True:
+                    pair = read_second_pass_frame(next_pt)
+                    if pair is None:
+                        break
+                    output_frame, _ = pair
+                    write_second_pass(output_frame, next_pt)
+                    next_pt += 1
+                for pkt in second_stream.encode():
+                    second_pass.mux(pkt)
+                second_pass.close()
+                first_pass.close()
+                original_pass.close()
+                os.replace(pp_tmp, tmp_out)
 
             for frame in src.decode(video=0):
                 n += 1
@@ -1440,6 +1614,7 @@ class Pipeline:
             for pkt in ov.encode():
                 dst.mux(pkt)
             dst.close()
+            apply_deferred_propainter_windows()
         else:
             # ---- LAMA 分支:逐帧修复 + 白字自检 + 补擦 + 防闪混合 ----
             for frame in src.decode(video=0):
@@ -1585,7 +1760,8 @@ def main():
                     default=sticker_detect.DEFAULT_PRECISION,
                     help='仅 gdino:推理精度,默认 fp16;可选 fp32/bf16,不兼容时回退 fp32')
     ap.add_argument('--sttn-residual-propaint-max-windows', type=int, default=0,
-                    help='STTN 残留转交 ProPainter 的整条视频窗口上限;0=不限(默认)')
+                    help='STTN 残留转交 ProPainter 的整条视频窗口上限;0=不限(默认);'
+                         '正数按残留严重度从全片优先选择')
     ap.add_argument('--sttn-residual-propaint-min-core-frames', type=int, default=0,
                     help='STTN 残留窗口至少包含的核心残留帧数;0=不限(默认)')
     ap.add_argument('--sttn-residual-propaint-max-frames', type=int, default=0,
