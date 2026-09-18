@@ -13,11 +13,13 @@ Python 调用可使用 `Pipeline(inpaint_mode='sttn', sttn_precision='fp16', stt
 或直接构造 `STTNDetInpaint(device, model_path, precision='fp16', profile=True)`。
 该选项仅在 STTN 模式生效。
 
-`--sttn-precision` 默认是 `fp32`。设置为 `fp16` 时，CUDA 上仅对
+`--sttn-precision` 默认是 `fp16`。设置为 `fp16` 时，CUDA 上仅对
 encoder、首层 Q/K/V、transformer 和 decoder 使用局部 autocast，模型权重仍以
 FP32 加载，输出和 mask 合成回到 FP32。CPU 会自动回退到 FP32。若 CUDA
 算子不支持 Half，或 decoder 产生非有限值，会丢弃当前修复带并完整用 FP32
 重算；OOM 不触发回退，以便沿用上层显存处理策略。
+
+需要对照旧路径时显式传入 `--sttn-precision fp32`。
 
 ## 日志范围
 

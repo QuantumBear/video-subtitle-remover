@@ -2,7 +2,7 @@
 
 用户选择先提供可选参数，默认保持 FP32。
 
-- `vsr_pipeline.py --sttn-precision fp32|fp16` 经 Pipeline 传到惰性加载的 STTNDetInpaint；默认 `fp32`。
+- `vsr_pipeline.py --sttn-precision fp32|fp16` 经 Pipeline 传到惰性加载的 STTNDetInpaint；默认 `fp16`（GPU 实测后设为默认）。
 - CUDA 的 encoder、首层 QKV 缓存、transformer、decoder 使用局部 autocast；权重保持 FP32，不更换模型文件。输出转 FP32 后做 tanh、像素换算与合成。
 - 非 CUDA 请求 FP16 时记录原因并使用 FP32。FP16 算子异常或非有限 decoder 输出触发整个当前修复带的 FP32 重算，并让该引擎后续调用保持 FP32。失败带的部分结果和 QKV 缓存不能复用。
 - OOM 继续抛给现有处理，不尝试显存需求更高的 FP32。FP32 重试失败继续抛出。

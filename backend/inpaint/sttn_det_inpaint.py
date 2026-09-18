@@ -21,7 +21,7 @@ _to_tensors = transforms.Compose([
 ])
 
 STTN_PRECISIONS = ('fp32', 'fp16')
-DEFAULT_STTN_PRECISION = 'fp32'
+DEFAULT_STTN_PRECISION = 'fp16'
 
 class STTNDetInpaint:
     def __init__(self, device, model_path, *, cache_first_qkv=True, profile=False,
@@ -342,7 +342,7 @@ class STTNDetInpaint:
                 f'{name}={report["stage_seconds"].get(name, 0.0):.3f}s'
                 for name in ('preprocess', 'upload', 'encoder', 'qkv', 'gather',
                              'transformer', 'decoder', 'download', 'postprocess'))
-            report.update(requested_precision=getattr(self, 'requested_precision', 'fp32'),
+            report.update(requested_precision=getattr(self, 'requested_precision', DEFAULT_STTN_PRECISION),
                           precision=getattr(self, 'precision', precision),
                           precision_fallbacks=getattr(self, 'precision_fallbacks', 0))
             print(f'[sttn-profile] device={self.device} '

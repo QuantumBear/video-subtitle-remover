@@ -10,7 +10,7 @@ pytest.importorskip('torchvision')
 
 from backend.inpaint import sttn_det_inpaint
 from backend.inpaint.sttn.network_sttn import Attention, InpaintGenerator
-from backend.inpaint.sttn_det_inpaint import STTNDetInpaint
+from backend.inpaint.sttn_det_inpaint import DEFAULT_STTN_PRECISION, STTNDetInpaint
 
 
 @pytest.fixture(autouse=True)
@@ -50,12 +50,11 @@ def inputs():
     return frames, masks
 
 
-def test_default_is_fp32_and_cpu_fp16_falls_back(engine_factory, inputs, capsys):
+def test_default_is_fp16_and_cpu_falls_back(engine_factory, inputs, capsys):
+    expected_engine = engine_factory(precision='fp32')
+    expected = expected_engine.inpaint(*inputs)
     engine = engine_factory(profile=True)
-    assert engine.requested_precision == engine.precision == 'fp32'
-    expected = engine.inpaint(*inputs)
-    engine = engine_factory(precision='fp16', profile=True)
-    assert engine.requested_precision == 'fp16'
+    assert engine.requested_precision == DEFAULT_STTN_PRECISION == 'fp16'
     assert engine.precision == 'fp32'
     assert engine.precision_fallbacks == 1
     actual = engine.inpaint(*inputs)
@@ -92,8 +91,11 @@ def test_attention_supports_half_without_changing_existing_math(masked):
 @pytest.fixture
 def amp_engine(engine_factory, monkeypatch):
     """CPU 实网检查重试；仅替换 autocast 上下文，CUDA 算子另行验证。"""
-    engine = engine_factory()
+    # 工厂运行在 CPU；先显式构造 FP32，再模拟已通过 CUDA 能力检查的 FP16
+    # 引擎，避免把初始化阶段的 CPU 回退计数混入本测试。
+    engine = engine_factory(precision='fp32')
     engine.requested_precision = engine.precision = 'fp16'
+    engine.precision_fallbacks = 0
     scopes = []
 
     @contextmanager
@@ -205,7 +207,7 @@ def test_cli_precision_reaches_lazy_engine(monkeypatch, precision):
         argv += ['--sttn-precision', precision]
     monkeypatch.setattr(sys, 'argv', argv)
     vsr_pipeline.main()
-    assert seen['sttn_precision'] == (precision or 'fp32')
+    assert seen['sttn_precision'] == (precision or DEFAULT_STTN_PRECISION)
     monkeypatch.setitem(sys.modules, 'paddleocr', SimpleNamespace(TextDetection=lambda **kw: None))
     monkeypatch.setattr(model_config, 'ModelConfig', lambda: SimpleNamespace(STTN_DET_MODEL_PATH='unused.pth'))
     calls = []
@@ -221,7 +223,7 @@ def test_cli_precision_reaches_lazy_engine(monkeypatch, precision):
     pipe._ensure_sttn()
     pipe._ensure_sttn()
     assert len(calls) == 1
-    assert pipe.inpainter.precision == (precision or 'fp32')
+    assert pipe.inpainter.precision == (precision or DEFAULT_STTN_PRECISION)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')

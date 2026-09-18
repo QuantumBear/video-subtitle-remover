@@ -376,7 +376,7 @@ class Pipeline:
                  det_model_name=DEFAULT_DET_MODEL_NAME,
                  lama_pt=LAMA_PT, threads=None, device='auto', inpaint_mode='lama',
                  sticker_backend=DEFAULT_STICKER_BACKEND, sticker_model_id=None,
-                 sttn_profile=False, sttn_precision='fp32', sticker_profile=False,
+                 sttn_profile=False, sttn_precision='fp16', sticker_profile=False,
                  sticker_batch_size=sticker_detect.DEFAULT_BATCH_SIZE,
                  sticker_precision=sticker_detect.DEFAULT_PRECISION):
         if sticker_precision not in sticker_detect.PRECISIONS:
@@ -462,7 +462,7 @@ class Pipeline:
                 device=self._sttn_device,
                 model_path=ModelConfig().STTN_DET_MODEL_PATH,
                 profile=getattr(self, 'sttn_profile', False),
-                precision=getattr(self, 'sttn_precision', 'fp32'),
+                precision=getattr(self, 'sttn_precision', 'fp16'),
             )
             print('[init] STTN 已加载')
             cuda_memory_snapshot('after STTN init', reset_peak=True)
@@ -1575,8 +1575,8 @@ def main():
                     help='STTN 模式下将疑似残留帧段交给 ProPainter(默认关闭,会增加耗时)')
     ap.add_argument('--sttn-profile', action='store_true',
                     help='仅 STTN:输出修复带分阶段耗时和窗口重复帧统计;CUDA 使用 Event 计时(默认关闭)')
-    ap.add_argument('--sttn-precision', choices=('fp32', 'fp16'), default='fp32',
-                    help='仅 STTN:推理精度,默认 fp32;CUDA 可选 fp16,不兼容时回退 fp32')
+    ap.add_argument('--sttn-precision', choices=('fp32', 'fp16'), default='fp16',
+                    help='仅 STTN:推理精度,默认 fp16;可选 fp32,不兼容时回退 fp32')
     ap.add_argument('--sticker-profile', action='store_true',
                     help='仅 gdino:输出模型初始化、预处理/上传/推理/后处理及逐帧跟踪耗时(默认关闭)')
     ap.add_argument('--sticker-batch-size', type=int, default=sticker_detect.DEFAULT_BATCH_SIZE,
