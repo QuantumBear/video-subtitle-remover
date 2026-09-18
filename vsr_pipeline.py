@@ -1225,6 +1225,12 @@ class Pipeline:
                         sttn_started = time.perf_counter()
                     comps = self.inpainter(seg_frames, masks, x_bounds=(x_min, x_max))
                     if sttn_profile:
+                        bands = getattr(self.inpainter, 'last_profile_bands', ())
+                        for band_index, (y_min, y_max, band_x_min, band_x_max) in enumerate(bands, 1):
+                            print(f'[sttn-profile-band] segment={seg_pts[0]}-{seg_pts[-1]} '
+                                  f'band={band_index}/{len(bands)} '
+                                  f'area=(ymin={y_min},ymax={y_max},'
+                                  f'xmin={band_x_min},xmax={band_x_max})')
                         sttn_elapsed = time.perf_counter() - sttn_started
                         sttn_profile_segments += 1
                         sttn_profile_seconds += sttn_elapsed

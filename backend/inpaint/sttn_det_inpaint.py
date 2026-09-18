@@ -24,6 +24,7 @@ class STTNDetInpaint:
         self.device = device
         self.profile = profile
         self.last_profile = None
+        self.last_profile_bands = []
         # 1. 创建InpaintGenerator模型实例并装载到选择的设备上
         self.model = InpaintGenerator().to(self.device)
         # 2. 载入预训练模型的权重，转载模型的状态字典
@@ -51,7 +52,8 @@ class STTNDetInpaint:
         return max(1, min(split_h, frame_height))
 
     def __call__(self, input_frames: List[np.ndarray],
-                 input_mask: Union[np.ndarray, List[np.ndarray]], x_bounds=None):
+                 input_mask: Union[np.ndarray, List[np.ndarray]], x_bounds=None,
+                 *, _profile_root=True):
         """
         :param input_frames: 原视频帧
         :param input_mask: 字幕区域 mask，0/255 二值；可以是单张 ndarray
@@ -63,6 +65,9 @@ class STTNDetInpaint:
         """
         if not input_frames:
             return []
+        if _profile_root:
+            # 记录本次完整 STTN 调用的垂直修复带；ROI 递归调用不能覆盖它。
+            self.last_profile_bands = []
         if isinstance(input_mask, np.ndarray):
             # 保留旧调用方的单张 mask 语义：整段每帧共用同一张 mask。
             masks_hr = [input_mask] * len(input_frames)
@@ -108,9 +113,15 @@ class STTNDetInpaint:
                     # 变窄后的修复带无法覆盖整段垂直跨度时回退整幅宽度，
                     # 避免多行/异常高字幕被 ROI 裁掉。
                     return self.__call__(input_frames, input_mask)
+                if _profile_root and getattr(self, 'profile', False):
+                    self.last_profile_bands = [
+                        (int(ymin), int(ymax), int(xmin + x0), int(xmax + x0))
+                        for ymin, ymax, xmin, xmax in crop_areas
+                    ]
                 cropped = self.__call__(
                     [frame[:, x0:x1, :] for frame in input_frames],
-                    [mask[:, x0:x1, :] for mask in normalized_masks])
+                    [mask[:, x0:x1, :] for mask in normalized_masks],
+                    _profile_root=False)
                 output = [frame.copy() for frame in input_frames]
                 for dst, src in zip(output, cropped):
                     dst[:, x0:x1, :] = src
@@ -118,6 +129,8 @@ class STTNDetInpaint:
         # 确定去字幕的垂直高度部分
         split_h = self.compute_split_h(W_ori, H_ori, self.model_input_width, self.model_input_height)
         inpaint_area = get_inpaint_area_by_mask(W_ori, H_ori, split_h, union_mask)
+        if _profile_root and getattr(self, 'profile', False):
+            self.last_profile_bands = [tuple(map(int, area)) for area in inpaint_area]
         # 初始化帧存储变量
         # 高分辨率帧存储列表（浅拷贝 + 逐帧 copy，避免 deepcopy 开销）
         frames_hr = [f.copy() for f in input_frames]

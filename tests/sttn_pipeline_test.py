@@ -46,7 +46,7 @@ def make_pipe(boxes_for=lambda img, region: [BOX]):
     return pipe
 
 
-def record_calls(pipe):
+def record_calls(pipe, bands=()):
     """把 STTN 引擎替换成记录器，返回 (帧数, 逐帧 mask) 调用列表。"""
     calls = []
 
@@ -58,6 +58,7 @@ def record_calls(pipe):
         calls.append((len(frames), saved_mask))
         return [f.copy() for f in frames]
 
+    engine.last_profile_bands = list(bands)
     pipe.inpainter = engine
     pipe._ensure_sttn = lambda: None
     return calls
@@ -121,6 +122,21 @@ def test_sttn_profile_logs_segments_and_resets_per_video(tmp_path, capsys):
         log = capsys.readouterr().out
         assert '[sttn-profile-segment] segment=0-5' in log
         assert '[sttn-profile-total] segments=1 ' in log
+
+
+def test_sttn_profile_logs_band_coordinates(tmp_path, capsys):
+    source = tmp_path / 'in.mp4'
+    make_video(source, [90] * 6)
+    pipe = make_pipe()
+    pipe.sttn_profile = True
+    record_calls(pipe, bands=[(100, 300, 12, 620), (700, 900, 12, 620)])
+    pipe.process_video(source, tmp_path / 'out.mp4', region=REGION,
+                       locate_stickers=False)
+    log = capsys.readouterr().out
+    assert ('[sttn-profile-band] segment=0-5 band=1/2 '
+            'area=(ymin=100,ymax=300,xmin=12,xmax=620)') in log
+    assert ('[sttn-profile-band] segment=0-5 band=2/2 '
+            'area=(ymin=700,ymax=900,xmin=12,xmax=620)') in log
 
 
 def test_sttn_profile_disabled_by_default(tmp_path, capsys):

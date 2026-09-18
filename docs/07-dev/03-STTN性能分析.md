@@ -16,6 +16,7 @@ Python 调用可使用 `Pipeline(inpaint_mode='sttn', sttn_profile=True)`，
 ## 日志范围
 
 - `[sttn-profile]`：一次缩放后修复带的 `inpaint()` 调用。一个视频段可能包含多个修复带，因此可能输出多行；各阶段累计该修复带所有窗口的耗时。
+- `[sttn-profile-band]`：一次视频段中实际生成的垂直修复带，包含 `band=当前/总数` 和原图坐标 `ymin,ymax,xmin,xmax`。同一视频段出现多条 `[sttn-profile]` 时，用这个日志判断它们对应的是哪些区域。
 - `[sttn-profile-segment]`：一次完整 STTN 引擎调用，包含 ROI 裁剪、修复带缩放、推理、放大及 mask 合成。`segment` 是原视频帧号范围。不含模型加载、OCR、残留检测、ProPainter 和视频编码。
 - `[sttn-profile-total]`：整条视频的 STTN 引擎调用 wall time 之和，以及已有的 ProPainter fallback wall time。每条视频重新统计，不等于流水线总耗时；完整耗时仍看 `[done]`。
 
