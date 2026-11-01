@@ -338,3 +338,65 @@ CPU 可用 `--device cpu --precision fp32 --timing cuda-event` 冒烟；此时
 本地真实权重 3 帧、预热 1 轮、基线及范围各测量 2 轮，输出像素差为 0，
 精度回退为 0；该数据仅验证 CPU 冒烟。全量回归 `503 passed, 24 skipped`，
 算子/范围基准测试 `13 passed, 2 skipped`，两项实采测试因本机无 CUDA 跳过。
+
+### 首轮 CUDA Event 结果与 cuDNN A/B
+
+`benchmark_sttn_events_01` 在 RTX5880-Ada-24Q、Torch `2.11.0+cu128`、
+NumPy `2.2.5` 上测得以下结果。50 帧、FP16、首层 QKV 缓存开启、单线程，
+预热 3 轮、正式 5 轮；输出一致，最大/平均像素差为 0，精度回退为 0。
+无包装基线中位数 `1.123503 s`，事件采集中位数 `1.099923 s`；二者执行
+同一公式，该差异反映波动与先后顺序，不能作为优化收益。
+
+| 范围 | inclusive stream 中位数（ms） | self stream 中位数（ms） |
+| --- | ---: | ---: |
+| band | 1097.805 | 247.009 |
+| encoder | 15.608 | 15.608 |
+| qkv_projection | 89.252 | 89.252 |
+| transformer | 681.123 | 26.038 |
+| multihead | 410.429 | 64.340 |
+| attention | 131.610 | 131.610 |
+| attention_output | 129.767 | 129.767 |
+| feed_forward | 244.171 | 244.171 |
+| decoder | 150.771 | 150.771 |
+
+按每轮原始数据，encoder、QKV 投影、attention 输出、FFN 和 decoder
+这些不重叠的卷积相关范围合计占 band 的 `54.93–60.28%`，占比中位数
+`56.50%`；attention 占比中位数 `11.90%`。这支持先试卷积算法选择。
+这些范围包含激活、插值和提交间隙，不是纯卷积 kernel 时间；也不能
+把表中父子范围或逐字段中位数直接相加。`band` self 还含预处理、
+gather、数值检查、传输、CPU 合成及间隙，不能全部归因于同步。
+
+新增独立基准只切换 `torch.backends.cudnn.benchmark`，生产设置不改：
+
+```bash
+python benchmarks/sttn_cudnn_benchmark.py \
+  --device cuda --frames 50 --warmup 3 --repeats 5 --sessions 2 \
+  --output-dir benchmark_sttn_cudnn_01
+```
+
+使用新输出目录；默认真实权重 `backend/models/sttn-det/sttn.pth`、FP16、
+QKV 缓存开启、线程数 1。默认两组按 `off/on`、`on/off` 执行，共四个
+顺序子进程；每个进程重新加载模型，避免同进程 cuDNN 算法缓存污染。
+父进程只用标准库，子进程日志、逐次记录与汇总均保存在输出目录。
+
+- `first_seconds` 是模型加载后的首次完整带 wall 时间。它仍含剩余惰性
+  初始化和算法选择；不能把开关之间的差值全部当作纯算法搜索成本。
+  模型加载、模块导入、子进程总 wall 另列，不混入带耗时。
+- `runs` 保留首次、预热和正式每次耗时及 allocated/reserved 峰值；
+  `summary` 比较各模式首次中位数、正式热态中位数和所有阶段最大峰值。
+  每带前后同步、重置峰值，不在带间清空 allocator 缓存。首次搜索可能
+  增加 workspace，需结合热态收益评估，不能只看单带速度。
+- 所有阶段均与第一个 off 带输出逐像素比较，保留融合后的浮点值，
+  不先转 uint8。像素不一致仍写完整报告，再以失败退出，速度收益字段
+  为 `null`；精度回退、非有限值或执行失败直接使子进程失败，查看对应日志。
+- `backend` 记录 enabled、deterministic、TF32、benchmark_limit、全局
+  deterministic 等设置，除 benchmark 外须跨进程相同。工具不放宽
+  精度约束，不设置无限搜索，也不修改窗口、mask、融合或清理策略。
+
+本机可用 `--device cpu --precision fp32` 冒烟；CPU 的 `warm_speedup` 和
+显存字段为 `null`，不能据此判断 cuDNN 收益。固定合成帧和单一带长度
+只能用于初筛，GPU 收益、真实视频质量及三并发容量仍需分别实测。
+
+本地真实权重 CPU 冒烟（3 帧、预热 1 轮、正式 2 轮、每模式 1 个进程）
+输出最大/平均像素差均为 0，精度回退为 0。新增测试 `7 passed, 1 skipped`，
+全量回归 `510 passed, 25 skipped`；新增 CUDA 显存采集测试因无 GPU 跳过。
