@@ -461,3 +461,66 @@ CPU 验证使用 `--device cpu --precision fp32`；加速比和显存字段为 `
 本地真实权重 CPU 冒烟（3 帧、预热 1 轮、正式 2 轮、每布局 1 个进程）
 输出最大/平均像素差为 0，精度回退为 0。新增测试 `7 passed, 1 skipped`，
 全量回归 `517 passed, 26 skipped`；CUDA 整带显存验证因本机无 GPU 跳过。
+
+目标 GPU 随后的两组实测中，contiguous 热态中位数为 `1.089411 s`，
+FFN channels_last 为 `1.139486 s`，变慢 `4.60%`，两组执行顺序下均变慢。
+输出像素完全一致，reserved 峰值从 `2.5 GiB` 增至 `2.7265625 GiB`。
+本轮不采用该布局；整带数据不能单独说明卷积与布局转换各自的成本。
+
+### FFN 局部 torch.compile 独立 A/B
+
+继续检查保持 FFN 数学式的局部编译，默认使用 Inductor：
+
+```bash
+python benchmarks/sttn_ffn_compile.py \
+  --device cuda --frames 50 --shape-frames 12 2 \
+  --warmup 3 --repeats 5 --sessions 2 \
+  --output-dir benchmark_sttn_ffn_compile_01
+```
+
+默认真实权重、FP16、首层 QKV 缓存开启、PyTorch 线程数 1。每模式每组
+使用独立进程，按 `eager/compiled`、`compiled/eager` 交换顺序。
+每个进程的 Inductor 和 Triton 磁盘缓存放在输出目录的独立子目录，关闭
+远程编译缓存，避免第二个编译进程直接沿用第一个进程的磁盘缓存。
+输出目录必须不存在。所有进程顺序执行，不启动并发 GPU 任务。
+
+仅基准内的八个 FFN 实例 forward 使用 `torch.compile`，指定
+`fullgraph=True, dynamic=None`，不显式修改权重或输入布局。Inductor 可以
+在内部选择布局及融合；attention、encoder、decoder、mask、窗口、精度
+回退和合成仍走生产实现。编译失败、断图或调用未进入编译图会使测量失败，
+不接受悄悄切回 eager。异常退出也恢复实例 forward 和临时后端设置。
+
+同一引擎依次处理 `50 → 12 → 2 → 50` 帧，最后一项复用主段输入。每次
+访问均记录首次、预热、正式多轮，检查不同段长触发的编译和主段重访复用。
+实际 FFN 输入的时间维由窗口决定，段长改变不一定触发新图。
+
+报告位于 `report.json`，关注：
+
+- `summary` 按段长和访问顺序分开汇总 `first_median_seconds`、
+  `warm_median_seconds`、显存峰值及热态加速比，不混合不同工作量。
+- `sessions[].bands[].runs[]` 保留每带耗时、编译次数、实际 FFN/编译图调用
+  次数和像素差。若正式轮仍有编译，`warm_stable=false`，该项加速比为 `null`。
+- `setup_seconds` 只含包装准备；懒编译在首次实际调用中。首次带 wall 包含
+  图捕获、编译、懒初始化和推理，不能将首次差额全称为纯编译时间。
+  `backend_compile_seconds` 是编译委托函数的主机 wall，已包含在带耗时中。
+- `compilation_events` 记录实际后端编译调用及输入形状；次数不是 Dynamo
+  guard 失败的精确计数。轻量调用计数存在于计时区间，无 profiler/CUDA Events。
+- 八个 FFN 共享 forward 代码对象；旧版默认缓存预算 8 会在变长时触顶。
+  基准显式设置每代码对象预算 64、累计预算 512，使用新旧版本对应字段，
+  写入 `compiler_config`，退出恢复；超限仍直接失败。
+- 所有首次、预热、正式输出按每个段长的首个独立 eager 输出严格比较，保留
+  浮点融合值。任何像素差均在汇总落盘后非零退出，加速比为 `null`。
+  精度回退、非有限值或编译异常直接使子进程失败，详情见对应 `.log`。
+
+CPU 冒烟需要支持 `torch.compile` 的 Python/PyTorch 组合，并指定
+`--device cpu --precision fp32 --compile-backend eager`；该后端仅验证
+图捕获、图复用和报告流程，不执行 Inductor 优化，也不报告 GPU 加速比。
+另有小 FFN 的真实 Inductor CPU 回归。目标 GPU 的性能与输出一致性待实测，
+合成段长结果不能代替完整视频的质量、吞吐和编译成本摊销验证。
+
+本地 Python `3.11.14`、PyTorch `2.2.2` 下，新增测试 `13 passed`，
+含小 FFN 的真实 Inductor 编译。真实权重 CPU/eager 后端冒烟使用
+`3 → 2 → 3` 帧，输出最大/平均像素差为 0，无精度回退；compiled 组
+全部 48 次 FFN 调用执行编译图，后端编译次数为 `8 → 8 → 0`。
+本机另一套 Python 3.12/PyTorch 2.2.2 不支持 compile，相关测试按环境跳过。
+最终全量回归 `526 passed, 30 skipped`；目标 CUDA/FP16 的编译与显存尚待服务器验证。
