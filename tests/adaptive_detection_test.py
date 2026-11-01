@@ -142,7 +142,8 @@ def test_process_video_keeps_frame_count_pts_and_roi(tmp_path, roi, mode):
         assert [round(float(f.pts * f.time_base) * 30) for f in frames] == list(range(83))
 
 
-def test_no_detections_preserves_fractional_rate_and_audio(tmp_path):
+@pytest.mark.parametrize('mode,profile', [('propainter', False), ('sttn', False), ('sttn', True)])
+def test_no_detections_preserves_fractional_rate_and_audio(tmp_path, mode, profile):
     from vsr_pipeline import FFMPEG
 
     raw, source, output = (tmp_path / name for name in ("silent.mp4", "audio.mp4", "out.mp4"))
@@ -153,11 +154,17 @@ def test_no_detections_preserves_fractional_rate_and_audio(tmp_path):
                     "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
                     "-shortest", str(source)], check=True)
     pipe = Pipeline.__new__(Pipeline)
-    pipe.inpaint_mode = "propainter"
+    pipe.inpaint_mode = mode
+    pipe.sttn_profile = profile
     pipe.detect = lambda *args: []
     pipe._ensure_propainter = lambda: pytest.fail("no-text video loaded model")
     stats = pipe.process_video(source, output, locate_stickers=False)
     assert stats["frames"] == 31 and stats["inpainted"] == 0
+    if profile:
+        report = stats['pipeline_profile']
+        assert report['stage_seconds']['audio_finalize'] > 0
+        assert 'sttn_init' not in report['stage_seconds']
+        assert 'residual_probe' not in report['stage_seconds']
     with av.open(str(output)) as result:
         assert len(result.streams.audio) == 1
         stream = result.streams.video[0]

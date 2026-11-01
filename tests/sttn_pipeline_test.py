@@ -144,9 +144,73 @@ def test_sttn_profile_disabled_by_default(tmp_path, capsys):
     make_video(source, [90] * 6)
     pipe = make_pipe()
     record_calls(pipe)
-    pipe.process_video(source, tmp_path / 'out.mp4', region=REGION,
-                       locate_stickers=False)
-    assert '[sttn-profile' not in capsys.readouterr().out
+    stats = pipe.process_video(source, tmp_path / 'out.mp4', region=REGION,
+                               locate_stickers=False)
+    log = capsys.readouterr().out
+    assert '[sttn-profile' not in log
+    assert '[pipeline-profile' not in log
+    assert 'pipeline_profile' not in stats
+
+
+def test_pipeline_profile_separates_residual_cleanup_and_model_time(tmp_path, monkeypatch, capsys):
+    import vsr_pipeline
+
+    source = tmp_path / 'in.mp4'
+    make_video(source, [90] * 6)
+    pipe = make_pipe()
+    elapsed = [0.]
+    monkeypatch.setattr(vsr_pipeline.time, 'perf_counter', lambda: elapsed[0])
+    monkeypatch.setattr(vsr_pipeline, 'cuda_memory_snapshot', lambda *a, **kw: None)
+    monkeypatch.setattr(vsr_pipeline.gc, 'collect', lambda: elapsed.__setitem__(0, elapsed[0] + 1.))
+    original_detect = pipe._detect_timeline
+    original_residual = pipe._residual_mask
+
+    def detect(*args, **kwargs):
+        result = original_detect(*args, **kwargs)
+        elapsed[0] += 4.
+        return result
+
+    def load_sttn():
+        elapsed[0] += 3.
+
+    def engine(frames, masks, x_bounds=None):
+        elapsed[0] += 2.
+        return [f.copy() for f in frames]
+
+    def residual(*args):
+        result = original_residual(*args)
+        elapsed[0] += 0.5
+        return result
+
+    pipe._detect_timeline = detect
+    pipe._ensure_sttn = load_sttn
+    pipe.inpainter = engine
+    pipe._residual_mask = residual
+    outputs = []
+    for enabled in (False, True, True):
+        pipe.sttn_profile = enabled
+        output = tmp_path / f'out{len(outputs)}.mp4'
+        stats = pipe.process_video(source, output, region=REGION, locate_stickers=False)
+        if enabled:
+            report = stats['pipeline_profile']
+            assert report['wall_seconds'] == 13.
+            assert report['stage_seconds']['ocr_timeline'] == 4.
+            assert report['stage_seconds']['sttn_init'] == 3.
+            assert report['stage_seconds']['sttn_infer'] == 2.
+            assert report['stage_seconds']['residual_probe'] == 3.
+            assert report['stage_seconds']['cleanup_gc'] == 1.
+            assert report['stage_calls']['residual_probe'] == 6
+            assert report['accounted_seconds'] == 13.
+            assert report['other_seconds'] == 0.
+            log = capsys.readouterr().out
+            assert '[pipeline-profile-stage] stage=residual_probe ' in log
+            assert '[pipeline-profile-total] clock=wall ' in log
+        else:
+            assert 'pipeline_profile' not in stats
+        with av.open(str(output)) as result:
+            outputs.append([frame.to_ndarray(format='rgb24') for frame in result.decode(video=0)])
+    for output in outputs[1:]:
+        np.testing.assert_array_equal(output, outputs[0])
 
 
 # ---- 字形相关开关必须显式报错 ----
@@ -531,7 +595,8 @@ def test_residual_probe_runs_without_white_glyph_check_flag(tmp_path):
     assert stats["residual_check_enabled"] is False  # 开关本身仍是字形专属，标记不属于它
 
 
-def test_sttn_residual_can_be_delegated_to_propainter(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize('max_windows', [0, 1])
+def test_sttn_residual_can_be_delegated_to_propainter(tmp_path, monkeypatch, capsys, max_windows):
     import vsr_pipeline
 
     source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
@@ -564,7 +629,8 @@ def test_sttn_residual_can_be_delegated_to_propainter(tmp_path, monkeypatch, cap
 
     stats = pipe.process_video(source, output, region=REGION,
                                locate_stickers=False,
-                               sttn_residual_propainter=True)
+                               sttn_residual_propainter=True,
+                               sttn_residual_propainter_max_windows=max_windows)
 
     assert stats['unresolved'] == 6
     assert pp_calls, '残留段开启转交后应调用 ProPainter'
@@ -578,6 +644,15 @@ def test_sttn_residual_can_be_delegated_to_propainter(tmp_path, monkeypatch, cap
     assert stats['sttn_propainter_seconds'] >= 0
     assert stats['sttn_propainter_peak_allocated_gib'] >= 0
     assert stats['sttn_propainter_peak_reserved_gib'] >= 0
+    report = stats['pipeline_profile']
+    assert report['wall_seconds'] == 17.
+    assert report['stage_seconds']['sttn_init'] == 10.
+    assert report['stage_seconds']['sttn_infer'] == 2.
+    assert report['stage_seconds']['propainter_infer'] == 5.
+    assert report['accounted_seconds'] == 17.
+    assert report['other_seconds'] == 0.
+    if max_windows:
+        assert report['stage_seconds']['propainter_second_pass'] == 0.
     # STTN 的 2 秒不能计入模型加载的 10 秒或后续 ProPainter 的 5 秒。
     assert ('[sttn-profile-total] segments=1 sttn_wall=2.000s '
             'propainter_wall=5.000s') in capsys.readouterr().out

@@ -36,6 +36,7 @@ import numpy as np
 import torch
 
 from backend import sticker_detect
+from backend.pipeline_profile import PipelineProfiler
 from backend.subtitle_templates import SubtitleTemplates
 from backend.temporal_glyphs import TemporalGlyphs
 from backend.subtitle_tracking import (
@@ -1013,9 +1014,12 @@ class Pipeline:
         vlm_max_calls = max(1, int(vlm_max_calls))
         if sticker_max_frames is None:
             sticker_max_frames = sticker_detect.DEFAULT_MAX_FRAMES
+        sttn_profile = self.inpaint_mode == 'sttn' and getattr(self, 'sttn_profile', False)
+        pipeline_profiler = PipelineProfiler(sttn_profile)
         t0 = time.time()
         print(f'[detect] mode={mode} roi={region} stride={ocr_stride} adaptive=feedback')
-        all_boxes, detection = self._detect_timeline(
+        all_boxes, detection = pipeline_profiler.call(
+            'ocr_timeline', self._detect_timeline,
             input_path, region, ocr_stride, ocr_refine_radius, progress)
         cuda_memory_snapshot('after OCR timeline')
         total = len(all_boxes)
@@ -1031,7 +1035,8 @@ class Pipeline:
                     budget = max(0, int(sticker_max_frames))
                     samples = plan_vlm_frames(total, all_boxes, budget, max(1, round(fps)),
                                               scene_change_frames=detection['scene_change_frames'])
-                    detector = self._ensure_sticker_detector() if samples else None
+                    detector = pipeline_profiler.call(
+                        'sticker_init', self._ensure_sticker_detector) if samples else None
                     gdino_options = dict(
                         prompt=sticker_prompt, score_threshold=sticker_score,
                         max_area_px=sticker_max_area_px, text_timeline=all_boxes,
@@ -1042,14 +1047,17 @@ class Pipeline:
                                            sticker_detect.DEFAULT_BATCH_SIZE))
                     if getattr(self, 'sticker_profile', False):
                         gdino_options['profile'] = True
-                    associated = locate_stickers_gdino(
+                    associated = pipeline_profiler.call(
+                        'sticker_detect', locate_stickers_gdino,
                         input_path, region, samples, detector, **gdino_options)
                 else:
                     samples = plan_vlm_frames(total, all_boxes, vlm_max_calls, max(1, round(fps)),
                                               scene_change_frames=detection['scene_change_frames'])
-                    hits = locate_stickers_vlm(input_path, region, sample_frames=samples,
-                                               max_calls=vlm_max_calls)
-                    associated = associate_sticker_hits(hits, all_boxes, total,
+                    hits = pipeline_profiler.call(
+                        'sticker_detect', locate_stickers_vlm,
+                        input_path, region, sample_frames=samples, max_calls=vlm_max_calls)
+                    associated = pipeline_profiler.call(
+                        'sticker_associate', associate_sticker_hits, hits, all_boxes, total,
                         max_gap=max(1, round(fps * 2)), scene_change_frames=detection['scene_change_frames'])
                 sticker_boxes = {i: [(max(ry1, y1 - STICKER_MASK_PAD), min(ry2, y2 + STICKER_MASK_PAD),
                                       max(rx1, x1 - STICKER_MASK_PAD), min(rx2, x2 + STICKER_MASK_PAD))
@@ -1062,7 +1070,7 @@ class Pipeline:
             finally:
                 # 检测结果已经物化为普通 numpy 框；释放 DINO 后再加载 ProPainter。
                 detector = None
-                self._release_sticker_detector()
+                pipeline_profiler.call('sticker_release', self._release_sticker_detector)
 
         # 第二遍:修复 + 写出
         frame_tb = 1 / rate
@@ -1071,7 +1079,7 @@ class Pipeline:
             self.inpaint_mode == 'sttn'
             and sttn_residual_propainter
             and sttn_residual_propainter_max_windows > 0)
-        dst = av.open(tmp_out, 'w')
+        dst = pipeline_profiler.call('video_open', av.open, tmp_out, 'w')
         ov = dst.add_stream('libx264rgb' if defer_propainter_windows else 'libx264',
                             rate=rate)
         ov.width = w
@@ -1080,7 +1088,7 @@ class Pipeline:
         # 有限窗口预算需要第二遍读取第一遍结果；使用无损中间视频，避免
         # ProPainter 第二遍基于已经压缩的 STTN 结果再次累积编码误差。
         ov.options = {'crf': '0' if defer_propainter_windows else '18', 'bf': '0'}
-        src = av.open(input_path)
+        src = pipeline_profiler.call('video_open', av.open, input_path)
         n_fixed = n_repair = n_checked = n = 0
         n_recovered = n_unresolved = n_check_failed = 0
         n_temporal_recovered = n_temporal_pixels = 0
@@ -1089,7 +1097,6 @@ class Pipeline:
         n_sttn_propainter_calls = n_sttn_propainter_frames = 0
         n_sttn_propainter_core_frames = 0
         n_sttn_propainter_seconds = 0.0
-        sttn_profile = self.inpaint_mode == 'sttn' and getattr(self, 'sttn_profile', False)
         sttn_profile_segments = 0
         sttn_profile_seconds = 0.0
         n_sttn_propainter_peak_allocated = n_sttn_propainter_peak_reserved = 0
@@ -1225,12 +1232,14 @@ class Pipeline:
             core_count = 0
 
             def write_sttn_frame(img_bgr, pts):
-                out_frame = av.VideoFrame.from_ndarray(
-                    cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), format='rgb24')
-                out_frame.pts = pts
-                out_frame.time_base = frame_tb
-                for pkt in ov.encode(out_frame):
-                    dst.mux(pkt)
+                with pipeline_profiler.stage('output_frame_convert'):
+                    out_frame = av.VideoFrame.from_ndarray(
+                        cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), format='rgb24')
+                    out_frame.pts = pts
+                    out_frame.time_base = frame_tb
+                with pipeline_profiler.stage('video_encode'):
+                    for pkt in ov.encode(out_frame):
+                        dst.mux(pkt)
 
             def flush_pending_clean():
                 while pending_clean:
@@ -1249,7 +1258,7 @@ class Pipeline:
                 nonlocal n_sttn_propainter_windows_trimmed
                 nonlocal n_sttn_propainter_input_frames_trimmed
                 nonlocal n_sttn_propainter_core_frames_trimmed
-                self._ensure_propainter()
+                pipeline_profiler.call('propainter_init', self._ensure_propainter)
                 pp_engine = self._propainter_inpainter
                 core_pts = set(core_pts)
                 candidate_core_pts = set(candidate_core_pts)
@@ -1268,7 +1277,8 @@ class Pipeline:
                 cuda_memory_snapshot(
                     f'STTN->ProPainter window {window_start}-{window_end}',
                     reset_peak=True)
-                repaired, _ = self._repair_propainter_segment(
+                repaired, _ = pipeline_profiler.call(
+                    'propainter_infer', self._repair_propainter_segment,
                     pp_frames, pp_masks, pp_boxes,
                     white_glyph_check=False, engine=pp_engine)
                 elapsed = time.time() - started
@@ -1309,27 +1319,29 @@ class Pipeline:
                 if not seg_frames:
                     return
                 if any(seg_boxes):
-                    self._ensure_sttn()
+                    pipeline_profiler.call('sttn_init', self._ensure_sttn)
                     cuda_memory_snapshot(f'STTN segment {seg_pts[0]}-{seg_pts[-1]} before')
                     # STTN 使用逐帧矩形 mask，避免某一帧出现的字幕位置
                     # 被段内并集传播到其他帧，造成运动物体拖影。
-                    masks = []
-                    radius = STTN_MASK_TEMPORAL_RADIUS
-                    for i in range(len(seg_boxes)):
-                        if not seg_core[i]:
-                            masks.append(np.zeros((h, w), dtype='uint8'))
-                            continue
-                        local_boxes = [box
-                                       for boxes in seg_boxes[max(0, i - radius):i + radius + 1]
-                                       for box in boxes]
-                        masks.append(self.boxes_to_mask(local_boxes, h, w))
-                    x_min = max(0, min(box[2] for boxes in seg_boxes for box in boxes)
-                                - STTN_ROI_PAD)
-                    x_max = min(w, max(box[3] for boxes in seg_boxes for box in boxes)
-                                + STTN_ROI_PAD)
+                    with pipeline_profiler.stage('sttn_mask_prepare'):
+                        masks = []
+                        radius = STTN_MASK_TEMPORAL_RADIUS
+                        for i in range(len(seg_boxes)):
+                            if not seg_core[i]:
+                                masks.append(np.zeros((h, w), dtype='uint8'))
+                                continue
+                            local_boxes = [box
+                                           for boxes in seg_boxes[max(0, i - radius):i + radius + 1]
+                                           for box in boxes]
+                            masks.append(self.boxes_to_mask(local_boxes, h, w))
+                        x_min = max(0, min(box[2] for boxes in seg_boxes for box in boxes)
+                                    - STTN_ROI_PAD)
+                        x_max = min(w, max(box[3] for boxes in seg_boxes for box in boxes)
+                                    + STTN_ROI_PAD)
                     if sttn_profile:
                         sttn_started = time.perf_counter()
-                    comps = self.inpainter(seg_frames, masks, x_bounds=(x_min, x_max))
+                    comps = pipeline_profiler.call(
+                        'sttn_infer', self.inpainter, seg_frames, masks, x_bounds=(x_min, x_max))
                     if sttn_profile:
                         bands = getattr(self.inpainter, 'last_profile_bands', ())
                         for band_index, (y_min, y_max, band_x_min, band_x_max) in enumerate(bands, 1):
@@ -1352,7 +1364,8 @@ class Pipeline:
                     for idx, (comp, boxes) in enumerate(zip(comps, seg_boxes)):
                         if not seg_core[idx] or not boxes:
                             continue
-                        residual = self._residual_mask(comp, seg_frames[idx], boxes)
+                        residual = pipeline_profiler.call(
+                            'residual_probe', self._residual_mask, comp, seg_frames[idx], boxes)
                         count = int(np.count_nonzero(residual))
                         if count >= RESID_MIN_PX:
                             residual_indices.append(idx)
@@ -1430,14 +1443,17 @@ class Pipeline:
                         write_sttn_frame(seg_frames[idx], pts)
                         continue
                     # ROI 之外严格保留原帧,与 ProPainter 分支同一约定
-                    out_bgr = np.where(roi_mask[:, :, None] > 0, comp, seg_frames[idx])
+                    with pipeline_profiler.stage('roi_composite'):
+                        out_bgr = np.where(roi_mask[:, :, None] > 0, comp, seg_frames[idx])
                     # 残留探测(检测+计数，不修复):实测证明 STTN 在已覆盖区域内
                     # 生成质量本身不稳定(偶发发白/发糊)，是引擎能力问题而非遮罩
                     # 形状问题——两种独立的后处理修复尝试都不能稳定改善，因此
                     # 不做自动补像素，只用 ProPainter 分支同款判据标记疑似残留，
                     # 交给调用方复核或换 propainter 重跑
                     if np.count_nonzero(
-                            self._residual_mask(out_bgr, seg_frames[idx], seg_boxes[idx])) >= RESID_MIN_PX:
+                            pipeline_profiler.call(
+                                'residual_probe', self._residual_mask,
+                                out_bgr, seg_frames[idx], seg_boxes[idx])) >= RESID_MIN_PX:
                         n_unresolved += 1
                     write_sttn_frame(out_bgr, pts)
                 seg_frames, seg_pts, seg_boxes, seg_core = [], [], [], []
@@ -1448,9 +1464,9 @@ class Pipeline:
                 # 不清理在长视频/高并发场景下会耗尽 free 显存触发 OOM，即使
                 # 实际占用很小。sttn_auto_inpaint.py 与 _release_sticker_detector
                 # 都在同等位置做这一步，此前本分支和 ProPainter 分支都遗漏了
-                gc.collect()
+                pipeline_profiler.call('cleanup_gc', gc.collect)
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    pipeline_profiler.call('cleanup_cuda_cache', torch.cuda.empty_cache)
 
             def apply_deferred_propainter_windows():
                 """在第一遍 STTN 完成后，按全片严重度执行 Top-K 窗口。"""
@@ -1482,12 +1498,14 @@ class Pipeline:
                 second_stream.options = {'crf': '18', 'bf': '0'}
 
                 def write_second_pass(img_bgr, pts):
-                    out_frame = av.VideoFrame.from_ndarray(
-                        cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), format='rgb24')
-                    out_frame.pts = pts
-                    out_frame.time_base = frame_tb
-                    for pkt in second_stream.encode(out_frame):
-                        second_pass.mux(pkt)
+                    with pipeline_profiler.stage('output_frame_convert'):
+                        out_frame = av.VideoFrame.from_ndarray(
+                            cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB), format='rgb24')
+                        out_frame.pts = pts
+                        out_frame.time_base = frame_tb
+                    with pipeline_profiler.stage('video_encode'):
+                        for pkt in second_stream.encode(out_frame):
+                            second_pass.mux(pkt)
 
                 frames = iter(first_pass.decode(video=0))
                 original_pass = av.open(input_path)
@@ -1544,7 +1562,8 @@ class Pipeline:
                             output_frame = np.where(
                                 roi_mask[:, :, None] > 0,
                                 repaired[offset], output_frame)
-                            remaining = np.count_nonzero(self._residual_mask(
+                            remaining = np.count_nonzero(pipeline_profiler.call(
+                                'residual_probe', self._residual_mask,
                                 output_frame, original_pp_frames[offset], pp_boxes[offset]))
                             if remaining < RESID_MIN_PX:
                                 n_unresolved -= 1
@@ -1565,15 +1584,16 @@ class Pipeline:
                 original_pass.close()
                 os.replace(pp_tmp, tmp_out)
 
-            for frame in src.decode(video=0):
+            for frame in pipeline_profiler.iterate('video_decode', src.decode(video=0)):
                 n += 1
                 if n - 1 in scene_changes:
                     flush_sttn()
                     flush_pending_clean()
                 boxes = all_boxes[n - 1] if n - 1 < len(all_boxes) else []
                 boxes = boxes + sticker_boxes.get(n - 1, [])
-                img = np.asarray(frame.to_image())  # RGB
-                img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                with pipeline_profiler.stage('input_frame_convert'):
+                    img = np.asarray(frame.to_image())  # RGB
+                    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                 if boxes:
                     if not seg_frames:
                         # 延迟写出的干净帧作为字幕段前置上下文。
@@ -1611,10 +1631,12 @@ class Pipeline:
                     progress(n, total, f'STTN 修复 {n_fixed}')
             flush_sttn()
             flush_pending_clean()
-            for pkt in ov.encode():
-                dst.mux(pkt)
-            dst.close()
-            apply_deferred_propainter_windows()
+            with pipeline_profiler.stage('video_encode_flush'):
+                for pkt in ov.encode():
+                    dst.mux(pkt)
+                dst.close()
+            if defer_propainter_windows:
+                pipeline_profiler.call('propainter_second_pass', apply_deferred_propainter_windows)
         else:
             # ---- LAMA 分支:逐帧修复 + 白字自检 + 补擦 + 防闪混合 ----
             for frame in src.decode(video=0):
@@ -1663,26 +1685,36 @@ class Pipeline:
             dst.close()
 
         # 源音频以 AAC 合回，源无音频时直接改名。
-        has_audio = any(s.type == 'audio' for s in src.streams)
-        src.close()
-        if has_audio:
-            final = output_path + '.mux.mp4'
-            subprocess.check_output([
-                FFMPEG, '-y', '-i', tmp_out, '-i', input_path,
-                '-map', '0:v:0', '-map', '1:a:0',
-                # 音频边界可能略早于视频；-shortest 会截掉已写出的末帧。
-                '-c:v', 'copy', '-c:a', 'aac',
-                '-loglevel', 'error', final])
-            os.remove(tmp_out)
-            os.replace(final, output_path)
-        else:
-            os.replace(tmp_out, output_path)
+        with pipeline_profiler.stage('audio_finalize'):
+            has_audio = any(s.type == 'audio' for s in src.streams)
+            src.close()
+            if has_audio:
+                final = output_path + '.mux.mp4'
+                subprocess.check_output([
+                    FFMPEG, '-y', '-i', tmp_out, '-i', input_path,
+                    '-map', '0:v:0', '-map', '1:a:0',
+                    # 音频边界可能略早于视频；-shortest 会截掉已写出的末帧。
+                    '-c:v', 'copy', '-c:a', 'aac',
+                    '-loglevel', 'error', final])
+                os.remove(tmp_out)
+                os.replace(final, output_path)
+            else:
+                os.replace(tmp_out, output_path)
         check_status = str(n_checked) if white_glyph_check else '未启用'
         temporal_status = f'{n_temporal_recovered}帧/+{n_temporal_pixels}px' if temporal_glyphs else '未启用'
         if sttn_profile:
             print(f'[sttn-profile-total] segments={sttn_profile_segments} '
                   f'sttn_wall={sttn_profile_seconds:.3f}s '
                   f'propainter_wall={n_sttn_propainter_seconds:.3f}s')
+        pipeline_report = pipeline_profiler.finish()
+        if pipeline_report is not None:
+            for name, seconds in pipeline_report['stage_seconds'].items():
+                print(f'[pipeline-profile-stage] stage={name} wall={seconds:.3f}s '
+                      f'calls={pipeline_report["stage_calls"][name]}')
+            print(f'[pipeline-profile-total] clock=wall '
+                  f'wall={pipeline_report["wall_seconds"]:.3f}s '
+                  f'accounted={pipeline_report["accounted_seconds"]:.3f}s '
+                  f'other={pipeline_report["other_seconds"]:.3f}s')
         print(f'[done] {n} 帧 | 修复 {n_fixed} | 字形补全 {n_recovered} | '
               f'跨帧字形 {temporal_status} | '
               f'残留复核 {check_status} | 补擦 {n_repair} | 疑似残留 {n_unresolved} | '
@@ -1701,7 +1733,7 @@ class Pipeline:
               f'{n_sttn_propainter_peak_reserved / (1024 ** 3):.2f}GiB | '
               f'耗时 {time.time() - t0:.0f}s → {output_path}')
         cuda_memory_snapshot('after process_video')
-        return {'frames': n, 'inpainted': n_fixed, 'repaired': n_repair,
+        stats = {'frames': n, 'inpainted': n_fixed, 'repaired': n_repair,
                 'template_recovered': int(n_recovered), 'unresolved': n_unresolved,
                 'residual_check_failed': n_check_failed,
                 'residual_check_enabled': bool(white_glyph_check),
@@ -1725,6 +1757,9 @@ class Pipeline:
                 'sttn_propainter_peak_reserved_gib': n_sttn_propainter_peak_reserved / (1024 ** 3),
                 'ocr_calls': detection['ocr_calls'], 'tracks': detection['tracks'],
                 'seconds': time.time() - t0}
+        if pipeline_report is not None:
+            stats['pipeline_profile'] = pipeline_report
+        return stats
 
 
 # ---------- CLI ----------
@@ -1749,7 +1784,7 @@ def main():
     ap.add_argument('--sttn-residual-propaint', action='store_true',
                     help='STTN 模式下将疑似残留帧段交给 ProPainter(默认关闭,会增加耗时)')
     ap.add_argument('--sttn-profile', action='store_true',
-                    help='仅 STTN:输出修复带分阶段耗时和窗口重复帧统计;CUDA 使用 Event 计时(默认关闭)')
+                    help='仅 STTN:输出修复带及流水线阶段耗时、窗口重复帧统计;CUDA 使用 Event 计时(默认关闭)')
     ap.add_argument('--sttn-precision', choices=('fp32', 'fp16'), default='fp16',
                     help='仅 STTN:推理精度,默认 fp16;可选 fp32,不兼容时回退 fp32')
     ap.add_argument('--sticker-profile', action='store_true',
