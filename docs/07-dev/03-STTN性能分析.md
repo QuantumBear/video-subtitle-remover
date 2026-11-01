@@ -78,6 +78,39 @@ python vsr_pipeline.py \
 
 Python 返回统计在启用时增加 `pipeline_profile`，包含 `wall_seconds`、`stage_seconds`、`stage_calls`、`accounted_seconds` 和 `other_seconds`。每条视频重新累计；关闭时不添加该字段、不输出新日志，也不读取新增计时时钟。日志不改变检测、mask、模型推理、残留统计或视频编码参数。
 
+## 按需执行 STTN 残留诊断
+
+STTN 默认逐个核心帧进行最终疑似残留诊断，只影响统计，不修改输出像素。
+已接受当前修复画质、希望省去这部分耗时时，可追加 `--sttn-skip-residual-check`：
+
+```bash
+python vsr_pipeline.py \
+  -i TikSave.io_7635080993354878239.mp4 \
+  -o test_sttn_pipeline_gdino_16.mp4 \
+  --inpaint-mode sttn \
+  --sticker-backend gdino \
+  --sticker-model-id backend/models/grounding-dino-tiny \
+  --sticker-score 0.22 --sticker-max-area-px 1000 \
+  --sttn-profile --sticker-profile \
+  --sttn-skip-residual-check
+```
+
+不传该开关即保留原诊断行为；它不依赖 profile 开关。Python 对应
+`pipe.process_video(..., sttn_residual_check=False)`，参数仅支持 STTN。
+跳过后日志显示 `疑似残留 未检测`，返回 `unresolved=None`
+（序列化成 JSON 为 `null`）、`sttn_residual_check_enabled=False`；
+默认 STTN 返回 `sttn_residual_check_enabled=True`，`unresolved` 仍为整数。
+原 `residual_check_enabled` 继续表示 `white_glyph_check` 白字复修开关，含义不变。
+
+与 `--sttn-residual-propaint` 同时使用时，仍执行补修候选检测及窗口选择，
+只跳过最终诊断和补修后的统计复查，`unresolved` 同样为 `None`；
+候选及实际补修窗口统计继续返回。未启用补修时，跳过诊断后不应出现
+`residual_probe` 阶段；启用补修后该阶段仍包含必要的候选检测。
+
+本地编解码回归验证开关不改变输出像素、帧数及时间戳。实际收益需用同一
+GPU、输入和参数做 A/B 复测；原样片该阶段的 `11.345 s` 仅作为可省时间的
+预算参考，不能当作已测得的加速。正式吞吐测试应统一关闭两个 profile。
+
 ## 修复带内的阶段
 
 | 字段 | 范围 |

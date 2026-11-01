@@ -923,7 +923,8 @@ class Pipeline:
                       temporal_glyphs=False, sttn_residual_propainter=False,
                       sttn_residual_propainter_max_windows=0,
                       sttn_residual_propainter_min_core_frames=0,
-                      sttn_residual_propainter_max_frames=0):
+                      sttn_residual_propainter_max_frames=0,
+                      sttn_residual_check=True):
         """处理单条视频：反馈式 OCR 和轨迹检测，然后按帧或分段修复。
 
         :param region: (ymin, ymax, xmin, xmax) 字幕区域;None 时自动推断字幕带,
@@ -954,6 +955,9 @@ class Pipeline:
         :param sttn_residual_propainter_max_frames: 单次 ProPainter 输入帧数上限，包含上下文；
                                                    0 不限，否则至少 2 帧。超长窗口只选核心帧
                                                    最多的连续子窗口，其余帧保留 STTN 结果。
+        :param sttn_residual_check: STTN 最终疑似残留诊断，默认开启；关闭仅省去统计，
+                                    不影响输出像素及 ProPainter 补修候选检测。
+                                    关闭时返回 unresolved=None，日志显示“未检测”。
         """
         if (not isinstance(sttn_residual_propainter_max_frames, (int, np.integer))
                 or sttn_residual_propainter_max_frames < 0
@@ -977,6 +981,9 @@ class Pipeline:
             raise ValueError('template_refine 与 temporal_glyphs 不能同时开启')
         if temporal_glyphs and self.inpaint_mode != 'propainter':
             raise ValueError('temporal_glyphs 仅支持 propainter')
+        if not sttn_residual_check and self.inpaint_mode != 'sttn':
+            raise ValueError('sttn_residual_check=False 仅支持 sttn 模式')
+        sttn_residual_check_enabled = self.inpaint_mode == 'sttn' and bool(sttn_residual_check)
         if self.inpaint_mode == 'sttn':
             # STTN 走整框矩形遮罩:笔画级精度在 432x240 的横向压缩中必然丢失。
             # 字形相关能力一律显式报错而非静默忽略——静默降级会让调用方
@@ -1090,7 +1097,8 @@ class Pipeline:
         ov.options = {'crf': '0' if defer_propainter_windows else '18', 'bf': '0'}
         src = pipeline_profiler.call('video_open', av.open, input_path)
         n_fixed = n_repair = n_checked = n = 0
-        n_recovered = n_unresolved = n_check_failed = 0
+        n_recovered = n_check_failed = 0
+        n_unresolved = None if self.inpaint_mode == 'sttn' and not sttn_residual_check_enabled else 0
         n_temporal_recovered = n_temporal_pixels = 0
         # STTN 残留转交 ProPainter 的运行统计；默认关闭时保持全为 0。
         n_sttn_residual_frames = n_sttn_residual_runs = 0
@@ -1449,8 +1457,9 @@ class Pipeline:
                     # 生成质量本身不稳定(偶发发白/发糊)，是引擎能力问题而非遮罩
                     # 形状问题——两种独立的后处理修复尝试都不能稳定改善，因此
                     # 不做自动补像素，只用 ProPainter 分支同款判据标记疑似残留，
-                    # 交给调用方复核或换 propainter 重跑
-                    if np.count_nonzero(
+                    # 交给调用方复核或换 propainter 重跑。调用方可跳过这项
+                    # 纯诊断；上面用于选择 ProPainter 窗口的候选检测仍保留。
+                    if sttn_residual_check_enabled and np.count_nonzero(
                             pipeline_profiler.call(
                                 'residual_probe', self._residual_mask,
                                 out_bgr, seg_frames[idx], seg_boxes[idx])) >= RESID_MIN_PX:
@@ -1562,11 +1571,12 @@ class Pipeline:
                             output_frame = np.where(
                                 roi_mask[:, :, None] > 0,
                                 repaired[offset], output_frame)
-                            remaining = np.count_nonzero(pipeline_profiler.call(
-                                'residual_probe', self._residual_mask,
-                                output_frame, original_pp_frames[offset], pp_boxes[offset]))
-                            if remaining < RESID_MIN_PX:
-                                n_unresolved -= 1
+                            if sttn_residual_check_enabled:
+                                remaining = np.count_nonzero(pipeline_profiler.call(
+                                    'residual_probe', self._residual_mask,
+                                    output_frame, original_pp_frames[offset], pp_boxes[offset]))
+                                if remaining < RESID_MIN_PX:
+                                    n_unresolved -= 1
                         write_second_pass(output_frame, pt)
                     next_pt = hi + 1
 
@@ -1701,6 +1711,7 @@ class Pipeline:
             else:
                 os.replace(tmp_out, output_path)
         check_status = str(n_checked) if white_glyph_check else '未启用'
+        unresolved_status = '未检测' if n_unresolved is None else str(n_unresolved)
         temporal_status = f'{n_temporal_recovered}帧/+{n_temporal_pixels}px' if temporal_glyphs else '未启用'
         if sttn_profile:
             print(f'[sttn-profile-total] segments={sttn_profile_segments} '
@@ -1717,7 +1728,7 @@ class Pipeline:
                   f'other={pipeline_report["other_seconds"]:.3f}s')
         print(f'[done] {n} 帧 | 修复 {n_fixed} | 字形补全 {n_recovered} | '
               f'跨帧字形 {temporal_status} | '
-              f'残留复核 {check_status} | 补擦 {n_repair} | 疑似残留 {n_unresolved} | '
+              f'残留复核 {check_status} | 补擦 {n_repair} | 疑似残留 {unresolved_status} | '
               f'复核未完成 {n_check_failed} | '
               f'STTN残留候选 {n_sttn_residual_frames}帧/{n_sttn_residual_runs}段 '
               f'(过滤小段 {n_sttn_residual_runs_filtered}段/{n_sttn_residual_frames_filtered}帧) | '
@@ -1737,6 +1748,7 @@ class Pipeline:
                 'template_recovered': int(n_recovered), 'unresolved': n_unresolved,
                 'residual_check_failed': n_check_failed,
                 'residual_check_enabled': bool(white_glyph_check),
+                'sttn_residual_check_enabled': sttn_residual_check_enabled,
                 'temporal_glyphs_enabled': bool(temporal_glyphs),
                 'temporal_glyph_recovered': n_temporal_recovered,
                 'temporal_glyph_added_pixels': n_temporal_pixels,
@@ -1783,6 +1795,9 @@ def main():
                     help='试验性跨帧白字补全(仅 ProPainter,默认关闭,与 --template-refine 互斥)')
     ap.add_argument('--sttn-residual-propaint', action='store_true',
                     help='STTN 模式下将疑似残留帧段交给 ProPainter(默认关闭,会增加耗时)')
+    ap.add_argument('--sttn-skip-residual-check', action='store_true',
+                    help='仅 STTN:跳过最终疑似残留诊断并标记未检测;'
+                         '不改变画面或 ProPainter 补修候选检测(默认保留诊断)')
     ap.add_argument('--sttn-profile', action='store_true',
                     help='仅 STTN:输出修复带及流水线阶段耗时、窗口重复帧统计;CUDA 使用 Event 计时(默认关闭)')
     ap.add_argument('--sttn-precision', choices=('fp32', 'fp16'), default='fp16',
@@ -1835,6 +1850,8 @@ def main():
                          '整幅物体误检的关键判据;用绝对像素而非相对比例,避免 ROI '
                          '尺寸变化时判据漂移')
     args = ap.parse_args()
+    if args.sttn_skip_residual_check and args.inpaint_mode != 'sttn':
+        ap.error('--sttn-skip-residual-check 仅支持 --inpaint-mode sttn')
     if args.sttn_residual_propaint_max_frames < 0 or args.sttn_residual_propaint_max_frames == 1:
         ap.error('--sttn-residual-propaint-max-frames 必须为 0 或不小于 2 的整数')
     if args.sticker_batch_size < 1:
@@ -1870,6 +1887,7 @@ def main():
         sttn_residual_propainter_max_windows=args.sttn_residual_propaint_max_windows,
         sttn_residual_propainter_min_core_frames=args.sttn_residual_propaint_min_core_frames,
         sttn_residual_propainter_max_frames=args.sttn_residual_propaint_max_frames,
+        sttn_residual_check=not args.sttn_skip_residual_check,
         subtitle_strength=args.subtitle_strength,
         locate_stickers=args.locate_stickers,
         ocr_stride=args.ocr_stride, ocr_refine_radius=args.ocr_refine_radius,

@@ -595,8 +595,117 @@ def test_residual_probe_runs_without_white_glyph_check_flag(tmp_path):
     assert stats["residual_check_enabled"] is False  # 开关本身仍是字形专属，标记不属于它
 
 
+def test_sttn_skip_residual_check_preserves_pixels_and_pts(tmp_path, capsys):
+    source = tmp_path / 'in.mp4'
+    make_video(source, [90 + i for i in range(12)])
+    pipe = make_pipe()
+    pipe.sttn_profile = True
+    pipe._ensure_sttn = lambda: None
+    pipe._detect_timeline = lambda *args: (
+        [[]] * 3 + [[BOX]] * 6 + [[]] * 3,
+        dict(sampled=12, refined=0, ocr_calls=0, tracks=1, discarded=0,
+             scene_change_frames=[]))
+
+    def engine(frames, masks, x_bounds=None):
+        return [np.where(mask[:, :, None] > 0, np.uint8(210), frame)
+                for frame, mask in zip(frames, masks)]
+
+    pipe.inpainter = engine
+    outputs = []
+    for enabled in (True, False, True):
+        def residual(fixed, original, boxes):
+            if not enabled:
+                pytest.fail('跳过诊断时不应执行残留检测')
+            return np.full(fixed.shape[:2], 255, dtype=np.uint8)
+
+        pipe._residual_mask = residual
+        output = tmp_path / f'out{len(outputs)}.mp4'
+        # 两次开启均使用默认值，同时验证跳过状态不会串到下一条视频。
+        options = {} if enabled else {'sttn_residual_check': False}
+        stats = pipe.process_video(source, output, region=REGION,
+                                   locate_stickers=False, **options)
+        assert stats['frames'] == 12
+        assert stats['inpainted'] == 6
+        assert stats['sttn_residual_check_enabled'] is enabled
+        assert stats['residual_check_enabled'] is False  # 原白字复修开关含义不变
+        log = capsys.readouterr().out
+        if enabled:
+            assert stats['unresolved'] == 6
+            assert stats['pipeline_profile']['stage_calls']['residual_probe'] == 6
+            assert '疑似残留 6 |' in log
+        else:
+            assert stats['unresolved'] is None
+            assert 'residual_probe' not in stats['pipeline_profile']['stage_seconds']
+            assert 'residual_probe' not in stats['pipeline_profile']['stage_calls']
+            assert '疑似残留 未检测 |' in log
+        with av.open(str(output)) as result:
+            frames = list(result.decode(video=0))
+            assert [round(float(f.pts * f.time_base) * 30) for f in frames] == list(range(12))
+            outputs.append([f.to_ndarray(format='rgb24') for f in frames])
+    for output in outputs[1:]:
+        np.testing.assert_array_equal(output, outputs[0])
+    assert outputs[0][5][BOX[0]:BOX[1], BOX[2]:BOX[3]].mean() > 200
+    assert outputs[0][0].mean() < 100  # 上下文帧保留原始内容
+
+
+def test_sttn_skip_residual_check_without_detection_reports_unknown(tmp_path, capsys):
+    source = tmp_path / 'in.mp4'
+    make_video(source, [90] * 3)
+    pipe = make_pipe(lambda img, region: [])
+    pipe._ensure_sttn = lambda: pytest.fail('无检测不应加载模型')
+    stats = pipe.process_video(source, tmp_path / 'out.mp4', region=REGION,
+                               locate_stickers=False, sttn_residual_check=False)
+    assert stats['frames'] == 3
+    assert stats['unresolved'] is None
+    assert stats['sttn_residual_check_enabled'] is False
+    assert '疑似残留 未检测 |' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('skip', [False, True])
+def test_cli_sttn_skip_residual_check_reaches_video_processing(tmp_path, monkeypatch, capsys, skip):
+    import vsr_pipeline
+
+    source, output = tmp_path / 'in.mp4', tmp_path / 'out.mp4'
+    make_video(source, [90] * 3)
+    pipe = make_pipe()
+    record_calls(pipe)
+    if skip:
+        pipe._residual_mask = lambda *args: pytest.fail('CLI 跳过诊断未生效')
+    # 只替换重量级模型初始化，CLI 解析及 process_video/编解码均执行真实逻辑。
+    monkeypatch.setattr(vsr_pipeline, 'Pipeline', lambda **kwargs: pipe)
+    options = ['--sttn-skip-residual-check'] if skip else []
+    monkeypatch.setattr('sys.argv', ['vsr_pipeline.py', '-i', str(source), '-o', str(output),
+                                   '--inpaint-mode', 'sttn', '--no-locate-stickers',
+                                   '-c', *map(str, REGION), *options])
+    vsr_pipeline.main()
+    log = capsys.readouterr().out
+    assert ('疑似残留 未检测 |' in log) is skip
+    with av.open(str(output)) as result:
+        assert len(list(result.decode(video=0))) == 3
+
+
+@pytest.mark.parametrize('mode', ['lama', 'propainter'])
+def test_skip_sttn_residual_check_rejects_other_modes_before_io(tmp_path, monkeypatch, capsys, mode):
+    import vsr_pipeline
+
+    pipe = make_pipe()
+    pipe.inpaint_mode = mode
+    with pytest.raises(ValueError, match='sttn_residual_check.*sttn'):
+        pipe.process_video(tmp_path / 'missing.mp4', tmp_path / 'out.mp4',
+                           sttn_residual_check=False)
+    monkeypatch.setattr(vsr_pipeline, 'Pipeline', lambda **kw: pytest.fail('不应初始化模型'))
+    monkeypatch.setattr('sys.argv', ['vsr_pipeline.py', '-i', 'missing.mp4', '-o', 'out.mp4',
+                                   '--inpaint-mode', mode, '--sttn-skip-residual-check'])
+    with pytest.raises(SystemExit) as exc:
+        vsr_pipeline.main()
+    assert exc.value.code == 2
+    assert '--sttn-skip-residual-check' in capsys.readouterr().err
+
+
 @pytest.mark.parametrize('max_windows', [0, 1])
-def test_sttn_residual_can_be_delegated_to_propainter(tmp_path, monkeypatch, capsys, max_windows):
+@pytest.mark.parametrize('residual_check', [True, False])
+def test_sttn_residual_can_be_delegated_to_propainter(
+        tmp_path, monkeypatch, capsys, max_windows, residual_check):
     import vsr_pipeline
 
     source, output = tmp_path / "in.mp4", tmp_path / "out.mp4"
@@ -624,15 +733,21 @@ def test_sttn_residual_can_be_delegated_to_propainter(tmp_path, monkeypatch, cap
     pipe.inpainter = sttn_engine
     pipe._ensure_sttn = load_sttn
     pipe._ensure_propainter = lambda: setattr(pipe, '_propainter_inpainter', FakePropainter())
-    pipe._residual_mask = lambda fixed, original, boxes: np.full(
-        fixed.shape[:2], 255, dtype=np.uint8)
+    def residual(fixed, original, boxes):
+        if not residual_check and fixed[BOX[0], BOX[2], 0] == 33:
+            pytest.fail('跳过诊断时不应复查 ProPainter 输出')
+        return np.full(fixed.shape[:2], 255, dtype=np.uint8)
+
+    pipe._residual_mask = residual
 
     stats = pipe.process_video(source, output, region=REGION,
                                locate_stickers=False,
                                sttn_residual_propainter=True,
-                               sttn_residual_propainter_max_windows=max_windows)
+                               sttn_residual_propainter_max_windows=max_windows,
+                               sttn_residual_check=residual_check)
 
-    assert stats['unresolved'] == 6
+    assert stats['unresolved'] == (6 if residual_check else None)
+    assert stats['sttn_residual_check_enabled'] is residual_check
     assert pp_calls, '残留段开启转交后应调用 ProPainter'
     assert pp_calls[0][0] >= 6, 'ProPainter 输入应包含残留段上下文'
     assert any(count > 0 for count in pp_calls[0][1])
@@ -645,6 +760,8 @@ def test_sttn_residual_can_be_delegated_to_propainter(tmp_path, monkeypatch, cap
     assert stats['sttn_propainter_peak_allocated_gib'] >= 0
     assert stats['sttn_propainter_peak_reserved_gib'] >= 0
     report = stats['pipeline_profile']
+    expected_probes = (18 if max_windows else 12) if residual_check else 6
+    assert report['stage_calls']['residual_probe'] == expected_probes
     assert report['wall_seconds'] == 17.
     assert report['stage_seconds']['sttn_init'] == 10.
     assert report['stage_seconds']['sttn_infer'] == 2.
@@ -656,6 +773,11 @@ def test_sttn_residual_can_be_delegated_to_propainter(tmp_path, monkeypatch, cap
     # STTN 的 2 秒不能计入模型加载的 10 秒或后续 ProPainter 的 5 秒。
     assert ('[sttn-profile-total] segments=1 sttn_wall=2.000s '
             'propainter_wall=5.000s') in capsys.readouterr().out
+    with av.open(str(output)) as result:
+        frames = [f.to_ndarray(format='rgb24') for f in result.decode(video=0)]
+    assert len(frames) == 6
+    for frame in frames:
+        assert 28 < frame[BOX[0]:BOX[1], BOX[2]:BOX[3]].mean() < 38
 
 
 @pytest.mark.parametrize('max_frames', [0, 30])
