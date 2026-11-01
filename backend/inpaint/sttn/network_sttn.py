@@ -203,10 +203,6 @@ class MultiHeadedAttention(nn.Module):
                                                           _key, len(self.patchsize), dim=1),
                                                       torch.chunk(_value, len(self.patchsize), dim=1)):
             out_w, out_h = w // width, h // height
-            mm = m.view(b, t, 1, out_h, height, out_w, width)
-            mm = mm.permute(0, 1, 3, 5, 2, 4, 6).contiguous().view(
-                b,  t*out_h*out_w, height*width)
-            mm = (mm.mean(-1) > 0.5).unsqueeze(1).repeat(1, t*out_h*out_w, 1)
             # 1) embedding and reshape
             query = query.view(b, t, d_k, out_h, height, out_w, width)
             query = query.permute(0, 1, 3, 5, 2, 4, 6).contiguous().view(
@@ -225,7 +221,9 @@ class MultiHeadedAttention(nn.Module):
                 tmp1.append(y)
             y = torch.cat(tmp1,1)
             '''
-            y, _ = self.attention(query, key, value, mm)
+            # Attention 不使用 m；保留原有无 attention mask 的计算语义，
+            # 避免每路构造并展开未使用的二次方大小临时张量。
+            y, _ = self.attention(query, key, value, None)
             # 3) "Concat" using a view and apply a final linear.
             y = y.view(b, t, out_h, out_w, d_k, height, width)
             y = y.permute(0, 1, 4, 2, 5, 3, 6).contiguous().view(bt, d_k, h, w)

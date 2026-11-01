@@ -167,3 +167,39 @@ python benchmarks/sttn_qkv_cache.py --device cuda --frames 50 \
 
 性能分析本身有开销。定位后用相同输入、预热和重复次数，不带 `--profile` 再测最终加速比。
 不要用本机 CPU 的耗时推算 5090 上的收益。
+
+## 删除未使用的注意力 mask
+
+`network_sttn.py` 的四路 patch attention 原先每层都从 mask 构造 `mm`，
+执行重排、均值、阈值和 `repeat`，得到 token 数量平方大小的临时 bool 张量。
+`Attention.forward()` 实际未读取该参数，当前实现只删除这部分无用计算，
+仍按原来的 QK、softmax 和 V 完成注意力。函数参数及权重键保持原样。
+输入帧上的空洞遮罩、逐帧合成 mask、窗口融合和精度回退继续使用原路径。
+本次没有修改 `auto_sttn.py` 的独立实现，也不合并 GPU 数值检查。
+
+固定随机输入、同一真实权重和窗口，可在目标 GPU 直接 A/B：
+
+```bash
+python benchmarks/sttn_attention_mask.py \
+  --device cuda --frames 50 --warmup 3 --repeats 5
+```
+
+工具在同一引擎上顺序恢复冻结的旧 attention forward，与新路径交替运行；
+生产引擎无需切换开关。两边默认 FP16、首层 QKV 缓存开启，模型加载不计时，
+整带耗时包含预处理、上传、编码、窗口推理、解码、下载和 CPU 合成，不包含
+外层修复带缩放、OCR、GDINO 或编解码。可用 `--precision fp32` 或
+`--cache off` 分别验证另一精度和无缓存路径，两边始终使用相同设置。
+
+先看 `outputs_match=true`、`max_pixel_difference=0`，再看 `legacy_seconds`、
+`optimized_seconds` 的中位数和两边 `peak_allocated_gib`；峰值是 PyTorch
+allocated，不含 reserved 或其它进程显存。工具不清空分配器缓存，预热后
+交替顺序减少先后影响；精度回退或输出像素不一致时以失败退出。
+需要定位 `transformer` 内的变化时另跑一次追加 `--profile`，正式速度比较
+使用上面的无 profile 命令，避免将计时开销混入收益。
+
+本地验证包含缓存开关、单帧/重叠窗口、batch>1、不同 mask 的特征及整带
+输出等价，算子记录确认推理不再执行 `repeat`。真实 `sttn.pth` 权重的
+3 帧、CPU FP32 单次冒烟中，新旧整带输出逐像素一致，无精度回退；无预热且
+仅一次，不作为性能结论。本机没有 CUDA，目标 GPU 加速及峰值变化待实测。
+本轮全量回归为 `490 passed, 22 skipped`，其中新增 9 项测试通过、3 项 CUDA
+等价性测试因本机无 CUDA 跳过；独立只读审查未发现需修复的问题。
