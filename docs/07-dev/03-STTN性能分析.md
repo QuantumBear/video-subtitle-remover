@@ -200,6 +200,84 @@ allocated，不含 reserved 或其它进程显存。工具不清空分配器缓�
 本地验证包含缓存开关、单帧/重叠窗口、batch>1、不同 mask 的特征及整带
 输出等价，算子记录确认推理不再执行 `repeat`。真实 `sttn.pth` 权重的
 3 帧、CPU FP32 单次冒烟中，新旧整带输出逐像素一致，无精度回退；无预热且
-仅一次，不作为性能结论。本机没有 CUDA，目标 GPU 加速及峰值变化待实测。
+仅一次，不作为性能结论。本机没有 CUDA，目标 GPU 实测由用户执行，见下节。
 本轮全量回归为 `490 passed, 22 skipped`，其中新增 9 项测试通过、3 项 CUDA
 等价性测试因本机无 CUDA 跳过；独立只读审查未发现需修复的问题。
+
+### 首轮 GPU A/B：输出一致，耗时差异很小
+
+用户按上面的无 profile 命令测量：`NVIDIA RTX5880-Ada-24Q`，
+PyTorch `2.11.0+cu128`、NumPy `2.2.5`，CPU 线程 1，50 帧，预热 3 轮、
+测量 5 轮；两边 FP16、首层 QKV 缓存开启，无精度回退。
+
+| 指标 | 旧路径 | 删除无用 mask |
+| --- | ---: | ---: |
+| 整带中位耗时 | 1.102735 s | 1.096091 s |
+| 五轮耗时范围 | 1.094368–1.121409 s | 1.091761–1.111887 s |
+| 峰值 allocated | 1.647917 GiB | 1.647479 GiB |
+
+本轮中位数少 `6.644 ms`、`0.603%`，比值为 `1.0061×`；两边测量范围重叠，
+差额小于本轮耗时波动，尚不能认定为稳定加速。峰值 allocated 仅少
+`0.449 MiB`（471,040 字节），对当前显存预算没有实质影响。
+静态累计分配/写入量不等于同时存活的张量峰值，不能据原累计约 `0.33 GiB`
+推断应节省同量峰值显存。
+
+`outputs_match=true`、最大和平均像素差均为 0。本轮支持保留这项无用计算
+清理，但没有显示明显的性能收益；尚无改动后真实视频的完整流水线 A/B，
+不能将本次合成单修复带比值直接外推到整片或并发吞吐。原始终端测量值：
+
+- 旧路径：`1.104269 / 1.121409 / 1.102004 / 1.102735 / 1.094368 s`。
+- 新路径：`1.099747 / 1.091761 / 1.111887 / 1.093564 / 1.096091 s`。
+
+## Transformer 算子级分析
+
+无用 mask 的首轮 GPU 收益很小，下一步先定位卷积、矩阵乘、布局搬运和同步
+各自的成本。新增工具仅在基准采集时为当前模型实例加 `record_function`
+范围，退出时恢复，不改生产计算、窗口、精度或清理策略：
+
+```bash
+python benchmarks/sttn_operator_profile.py \
+  --device cuda --frames 50 --warmup 3 --repeats 5 \
+  --output-dir benchmark_sttn_operators_01
+```
+
+使用真实 `sttn.pth`、固定随机种子 42、FP16 和首层 QKV 缓存；输入与
+`sttn_attention_mask.py` 相同。先在没有 profiler、没有临时范围的情况下预热
+和重复测量，再独立采集一次完整修复带。`baseline_median_seconds` 才是本轮
+无采集开销的整带耗时，`capture_wall_seconds` 包含采集与收尾开销，不能用于
+计算加速比。这是合成单带基准，不含 OCR、GDINO、外层带缩放或视频编解码。
+
+终端打印分类、范围及分别按 CPU/GPU 排序的热点；输出目录生成：
+
+- `report.json`：环境、窗口/缓存设置、每轮基线、输出差异、完整算子和分类表。
+- `trace.json`：Chrome trace，可在支持该格式的 trace viewer 中查看 GPU 执行、
+  CPU 提交间隙和同步等待。
+
+重点先确认 `outputs_match=true`、`max_pixel_difference=0` 和精度未回退，
+再比较 `scope=transformer` 下 `convolution`、`matmul`、`softmax`、
+`layout_copy_index`。`region` 进一步区分 `qkv_projection`、`attention`、
+`attention_output` 和 `feed_forward`；`qkv_cache` 是窗口外首层缓存构建。
+`finite_check` 包含引擎中的非有限值检查，`host_wait_or_scalar` 包含 `.item()`
+及同步；两者仍按原方式执行，本工具没有合并数值检查。
+
+时间单位为毫秒，口径如下：
+
+- `operators/categories` 使用 **self** CPU 时间和归属于该算子的 self GPU 时间，
+  避免将 `conv2d → convolution → cudnn_convolution` 等父子重复累计。
+  每个事件归入一个分类，分类是诊断提示，具体算子名保留在完整表中。
+- `regions` 是包含子范围的时间，`band → transformer → multihead → attention`
+  相互嵌套，**不能相加**，也不能再加到算子表。
+- CPU 时间可能包含等待 GPU，**不能与 GPU 时间相加**。原始 `device_events`
+  是单独的 kernel/copy 表，也不能再加到算子归属的 GPU 时间上。
+- `outside_model` 包括预处理、窗口 gather、数值检查、传输和 CPU 合成；
+  NumPy/Python 部分不进入 ATen 算子表，其间隙可在 `sttn::band` 的 trace 中查看。
+- `device_timing_status=attributed` 才能根据算子 GPU 时间定位；若为
+  `unattributed`，只能看到原始设备事件；`unavailable` 表示未采到设备时间，
+  需要检查服务器 profiler/CUPTI 环境，不能将 `null` 解释为 GPU 耗时为零。
+
+需要看输入形状时另跑一次加 `--record-shapes`（采集开销更高）；还可用
+`--cache off`、`--precision fp32` 比较其它设置，勿混合这些设置的计时结果。
+本机 CPU 冒烟使用真实权重、3 帧、预热 1 轮、测量 2 轮，带形状采集，
+输出一致、最大像素差为 0；GPU 数据仍待采集，不据 CPU 热点预测 GPU 收益。
+本轮全量回归 `498 passed, 23 skipped`；新增算子分析测试为 8 项通过，
+1 项 CUDA 实采测试因本机无 CUDA 跳过。

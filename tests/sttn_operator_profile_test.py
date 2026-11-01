@@ -1,0 +1,175 @@
+"""算子报告必须保留原输出，且不能重复累计嵌套算子或 CUDA kernel。"""
+
+import json
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+torch = pytest.importorskip('torch')
+pytest.importorskip('torchvision')
+pytest.importorskip('cv2')
+
+from backend.inpaint.sttn.network_sttn import InpaintGenerator
+from backend.inpaint.sttn_det_inpaint import STTNDetInpaint
+from benchmarks import sttn_operator_profile as benchmark
+
+
+@pytest.fixture(autouse=True)
+def single_cpu_thread():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(previous)
+
+
+def small_engine():
+    torch.manual_seed(81)
+    engine = STTNDetInpaint.__new__(STTNDetInpaint)
+    engine.device = torch.device('cpu')
+    engine.precision = engine.requested_precision = 'fp32'
+    engine.precision_fallbacks = 0
+    engine.profile = False
+    engine.model = InpaintGenerator(init_weights=False).eval()
+    for block in engine.model.transformer:
+        block.attention.patchsize = [(8, 8), (4, 4), (2, 2), (1, 1)]
+    engine.model_input_width = engine.model_input_height = 32
+    engine.neighbor_stride, engine.ref_length = 2, 3
+    engine.cache_first_qkv = True
+    return engine
+
+
+@pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='requires CUDA'))])
+def test_profile_writes_trace_and_keeps_complete_band_output(tmp_path, device):
+    engine = small_engine()
+    engine.device = torch.device(device)
+    engine.model.to(engine.device)
+    rng = np.random.default_rng(51)
+    frames = [rng.integers(0, 256, (32, 32, 3), dtype=np.uint8) for _ in range(7)]
+    masks = [np.zeros((32, 32), dtype=np.uint8) for _ in frames]
+    for mask in masks:
+        mask[8:24, 8:24] = 255
+    originals = [array.copy() for array in frames + masks]
+    expected = engine.inpaint(frames, masks)
+
+    report = benchmark.run_profile(engine, frames, masks, tmp_path,
+                                   warmup=1, repeats=2, top=10)
+
+    assert report['outputs_match'] is True
+    assert report['max_pixel_difference'] == 0
+    assert len(report['baseline_seconds']) == 2
+    assert all(value > 0 for value in report['baseline_seconds'])
+    if device == 'cuda':
+        assert report['device_timing_status'] == 'attributed'
+        assert report['attributed_self_device_total_ms'] > 0
+    else:
+        assert report['device_timing_status'] == 'cpu_only'
+        assert report['attributed_self_device_total_ms'] is None
+    assert any(row['scope'] == 'transformer' and row['category'] == 'convolution'
+               and row['self_cpu_ms'] > 0 for row in report['categories'])
+    assert any(row['region'] == 'attention' and row['category'] == 'matmul'
+               for row in report['operators'])
+    assert any(row['category'] == 'finite_check' for row in report['operators'])
+    assert json.loads((tmp_path / 'report.json').read_text()) == report
+    trace = json.loads((tmp_path / 'trace.json').read_text())
+    names = {event.get('name') for event in trace['traceEvents']}
+    assert {'sttn::transformer', 'sttn::attention', 'aten::bmm'} <= names
+    assert not any('forward' in module.__dict__ for module in engine.model.modules())
+    for result, reference in zip(engine.inpaint(frames, masks), expected):
+        np.testing.assert_array_equal(result, reference)
+    for array, original in zip(frames + masks, originals):
+        np.testing.assert_array_equal(array, original)
+
+
+def test_temporary_ranges_restore_instance_forward_after_exception():
+    engine = small_engine()
+    # 实例已有覆盖也必须原样恢复；不修改类级 forward。
+    original = engine.model.encoder.forward
+    engine.model.encoder.forward = original
+    with pytest.raises(RuntimeError, match='injected'):
+        with benchmark.model_ranges(engine.model):
+            raise RuntimeError('injected')
+    assert engine.model.encoder.__dict__['forward'] is original
+    del engine.model.encoder.forward
+    assert not any('forward' in module.__dict__ for module in engine.model.modules())
+
+
+def test_report_uses_exclusive_times_and_does_not_count_kernel_twice():
+    from torch.autograd.profiler_util import FunctionEvent
+
+    def event(index, name, start, end, parent=None, device=None):
+        # 新版统一 device 时间要求 use_device='cuda'；2.2 的 CUDA 字段尚未统一。
+        kwargs = {'use_device': 'cuda'} if hasattr(FunctionEvent, 'device_time_total') else {}
+        if device is not None:
+            kwargs['device_type'] = device
+        result = FunctionEvent(index, name, 1, start, end, **kwargs)
+        if parent is not None:
+            parent.append_cpu_child(result)
+            result.cpu_parent = parent
+        return result
+
+    region = event(1, 'sttn::transformer', 0, 100)
+    conv = event(2, 'aten::conv2d', 10, 70, region)
+    backend = event(3, 'aten::cudnn_convolution', 20, 60, conv)
+    backend.append_kernel('conv_kernel', 0, 30)
+    kernel = event(4, 'conv_kernel', 20, 50, device=torch.autograd.DeviceType.CUDA)
+    wait = event(5, 'cudaDeviceSynchronize', 100, 120)
+
+    report = benchmark.summarize_events([region, conv, backend, kernel, wait], cuda=True)
+
+    assert report['operator_self_cpu_total_ms'] == pytest.approx(.080)
+    assert report['attributed_self_device_total_ms'] == pytest.approx(.030)
+    assert report['device_event_total_ms'] == pytest.approx(.030)
+    assert len(report['operators']) == 3
+    category = next(row for row in report['categories'] if row['category'] == 'convolution')
+    assert category['self_cpu_ms'] == pytest.approx(.060)
+    assert category['self_device_ms'] == pytest.approx(.030)
+    assert report['regions'][0]['cpu_total_ms'] == pytest.approx(.100)
+    assert report['regions'][0]['device_total_ms'] == pytest.approx(.030)
+
+
+@pytest.mark.parametrize('modern', [False, True])
+def test_device_time_fields_support_old_and_new_torch(modern):
+    fields = ({'self_device_time_total': 7., 'device_time_total': 11.} if modern else
+              {'self_cuda_time_total': 7., 'cuda_time_total': 11.})
+    event = SimpleNamespace(**fields)
+    assert benchmark.device_time_us(event, exclusive=True) == 7.
+    assert benchmark.device_time_us(event, exclusive=False) == 11.
+
+
+def test_missing_cuda_events_are_reported_as_unavailable():
+    report = benchmark.summarize_events([], cuda=True)
+    assert report['device_timing_status'] == 'unavailable'
+    assert report['attributed_self_device_total_ms'] is None
+    assert report['device_event_total_ms'] is None
+
+
+@pytest.mark.parametrize('failure', ['pixel_change', 'precision_fallback'])
+def test_profile_rejects_changed_results_or_precision(tmp_path, failure):
+    engine = small_engine()
+    original = engine.inpaint
+    frames = [np.full((32, 32, 3), 127, dtype=np.uint8)]
+    masks = [np.full((32, 32), 255, dtype=np.uint8)]
+    calls = 0
+
+    def change_after_baseline(images, holes):
+        nonlocal calls
+        calls += 1
+        result = original(images, holes)
+        if calls == 2:
+            if failure == 'pixel_change':
+                result[0] = result[0].copy()
+                result[0][0, 0, 0] = (int(result[0][0, 0, 0]) + 1) % 256
+            else:
+                engine.precision_fallbacks += 1
+        return result
+
+    engine.inpaint = change_after_baseline
+    with pytest.raises(RuntimeError, match='像素不一致|精度回退'):
+        benchmark.run_profile(engine, frames, masks, tmp_path, warmup=0, repeats=1)
+    assert not any('forward' in module.__dict__ for module in engine.model.modules())
+    if failure == 'pixel_change':
+        report = json.loads((tmp_path / 'report.json').read_text())
+        assert report['outputs_match'] is False
+        assert report['max_pixel_difference'] == 1
