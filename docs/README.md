@@ -55,6 +55,11 @@
 6. [STTN 性能分析](07-dev/03-STTN性能分析.md)：分阶段耗时、窗口重复帧统计及 Q/K/V 缓存对比。
 7. [GroundingDINO 性能分析](07-dev/04-GroundingDINO性能分析.md)：批量推理、prompt token 复用、失败回退及对照方式。
 
+## 自建服务与成本评估
+
+- [STTN 自建 Serving 评估与优化路线](07-dev/05-STTN自建Serving评估与优化路线.md)：替代 Kaipai 的业务背景、STTN 优化候选、DGX Spark 采购判断，以及性能和成本的测量口径。
+- [STTN 首次 GPU 基线分析](07-dev/06-STTN首次GPU基线分析.md)：实际设备更正为 RTX5880-Ada-24Q，QKV 缓存对照、耗时分布，以及批量预处理优化和 A/B 命令。
+
 ## 不要一开始就看的内容
 
 下面这些文件很难，不适合第一天读：

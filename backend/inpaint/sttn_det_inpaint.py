@@ -2,7 +2,6 @@ import cv2
 import numpy as np
 import torch
 from contextlib import nullcontext
-from torchvision import transforms
 from typing import List, Union
 import sys
 import os
@@ -11,17 +10,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from backend.config import config
 from backend.inpaint.sttn.network_sttn import InpaintGenerator
 from backend.inpaint.sttn_profile import STTNProfiler
-from backend.inpaint.utils.sttn_utils import Stack, ToTorchFormatTensor
 from backend.tools.inpaint_tools import get_inpaint_area_by_mask
-
-# 定义图像预处理方式
-_to_tensors = transforms.Compose([
-    Stack(),  # 将图像堆叠为序列
-    ToTorchFormatTensor()  # 将堆叠的图像转化为PyTorch张量
-])
 
 STTN_PRECISIONS = ('fp32', 'fp16')
 DEFAULT_STTN_PRECISION = 'fp16'
+
+
+def _preprocess_sttn(frames, masks):
+    """将 uint8 BGR 帧和二维 0/255 mask 批量转为 CPU 模型输入。"""
+    height, width = frames[0].shape[:2]
+    # 直接写入连续 TCHW 缓冲区，同时完成 BGR→RGB 和布局转换。
+    # stack 的 out 避免中间 THWC/PIL 副本，也兼容非连续 ROI 输入。
+    rgb = np.empty((len(frames), 3, height, width), dtype=np.uint8)
+    np.stack([np.asarray(frame).transpose(2, 0, 1)[::-1] for frame in frames], out=rgb)
+    feats = torch.from_numpy(rgb).float().div_(255).mul_(2).sub_(1).unsqueeze(0)
+
+    mask_batch = np.stack(masks)
+    # 合成沿用原量级 >0.5；模型沿用 /255 后 >0.5，不能合并阈值。
+    binary_masks = list((mask_batch > 0.5).astype(np.uint8)[..., None])
+    masks_tensor = (torch.from_numpy(mask_batch).float().div_(255).gt_(0.5)
+                    .unsqueeze(0).unsqueeze(2))
+    return feats, masks_tensor, binary_masks
+
 
 class STTNDetInpaint:
     def __init__(self, device, model_path, *, cache_first_qkv=True, profile=False,
@@ -85,7 +95,7 @@ class STTNDetInpaint:
         :param input_frames: 原视频帧
         :param input_mask: 字幕区域 mask，0/255 二值；可以是单张 ndarray
             （向后兼容）或与 input_frames 等长的逐帧 mask 列表。必须保持 255 量级：
-            inpaint() 内部经 ToTorchFormatTensor 的 div(255) 归一后再做 > 0.5 判定，
+            inpaint() 内部经 div(255) 归一后再做 > 0.5 判定，
             若在此处提前归一成 0/1，模型将收不到空洞信号而退化为恒等重建。
         :param x_bounds: 可选的原图横向 ROI `(xmin, xmax)`；ROI 必须完整覆盖
             所有帧的 mask，模型在裁剪区域内推理后再贴回原图。
@@ -254,12 +264,7 @@ class STTNDetInpaint:
         frame_length = len(frames)
         # 对帧进行预处理转换为张量，并进行归一化
         with profiler.stage('preprocess'):
-            # Stack 会把 ndarray 原地转换为 PIL；复制输入避免一次推理改变
-            # 调用方持有的帧，尤其是 FP16 失败后的整带重试需要原始输入。
-            feats = _to_tensors([np.asarray(frame).copy() for frame in frames]).unsqueeze(0) * 2 - 1
-            binary_masks = [np.expand_dims((np.array(m) > 0.5).astype(np.uint8), 2) for m in masks]
-            # 将掩码转换为张量
-            masks_tensor = (_to_tensors([np.asarray(mask).copy() for mask in masks]).unsqueeze(0) > 0.5).float()
+            feats, masks_tensor, binary_masks = _preprocess_sttn(frames, masks)
 
         # 把特征张量转移到指定的设备（CPU或GPU）
         with profiler.stage('upload', device_work=True):

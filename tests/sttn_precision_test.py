@@ -76,6 +76,20 @@ def test_invalid_precision_rejected_before_loading(monkeypatch):
         STTNDetInpaint('cpu', 'unused.pth', precision='bf16')
 
 
+@pytest.mark.parametrize('cached', [False, True])
+def test_batched_preprocess_preserves_complete_band_output(
+        engine_factory, inputs, monkeypatch, cached):
+    from benchmarks.sttn_preprocess import legacy_preprocess
+
+    engine = engine_factory(precision='fp32', cache_first_qkv=cached)
+    with monkeypatch.context() as patch:
+        patch.setattr(sttn_det_inpaint, '_preprocess_sttn', legacy_preprocess)
+        expected = engine.inpaint(*inputs)
+    actual = engine.inpaint(*inputs)
+    for output, reference in zip(actual, expected):
+        np.testing.assert_array_equal(output, reference)
+
+
 @pytest.mark.parametrize('masked', [False, True])
 def test_attention_supports_half_without_changing_existing_math(masked):
     # 原实现 masked_fill 的返回值被丢弃。本次保持已部署的 attention 语义。
