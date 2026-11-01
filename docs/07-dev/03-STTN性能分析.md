@@ -400,3 +400,64 @@ QKV 缓存开启、线程数 1。默认两组按 `off/on`、`on/off` 执行，�
 本地真实权重 CPU 冒烟（3 帧、预热 1 轮、正式 2 轮、每模式 1 个进程）
 输出最大/平均像素差均为 0，精度回退为 0。新增测试 `7 passed, 1 skipped`，
 全量回归 `510 passed, 25 skipped`；新增 CUDA 显存采集测试因无 GPU 跳过。
+
+### cuDNN 首轮结果：保持关闭
+
+`benchmark_sttn_cudnn_01` 同样使用 RTX5880-Ada-24Q、Torch `2.11.0+cu128`、
+cuDNN `91900`、FP16、50 帧、单线程、QKV 缓存开启。两组独立进程交替顺序，
+每进程首次 1 轮、预热 3 轮、正式 5 轮，`benchmark_limit=10`。
+
+| 指标 | benchmark off | benchmark on |
+| --- | ---: | ---: |
+| 首次整带中位数（s） | 1.627181 | 16.241300 |
+| 正式热态中位数（s） | 1.089679 | 1.086434 |
+| 峰值 allocated（GiB） | 1.647479 | 1.650707 |
+| 峰值 reserved（GiB） | 2.500000 | 2.345703 |
+| 与首个 off 输出最大像素差 | 0 | 2 |
+
+热态合并中位数仅差 `3.245 ms`（约 `0.30%`），逐组比较一次略慢、一次略快，
+没有稳定收益。开启后的首次调用分别为 `19.373 s`、`13.109 s`，关闭时为
+`1.598 s`、`1.656 s`；首次中位数增加 `14.614 s`，不能全归为纯搜索成本。
+精度均未回退，但 on 两个进程最大像素差分别为 `2`、`1.5`，
+`outputs_match=false`，加速比字段按约定为 `null`。本轮保持生产配置关闭。
+
+### FFN channels_last 独立 A/B
+
+下一步只比较 FFN 的两层卷积，验证布局优化能否覆盖转换成本：
+
+```bash
+python benchmarks/sttn_ffn_layout.py \
+  --device cuda --frames 50 --warmup 3 --repeats 5 --sessions 2 \
+  --output-dir benchmark_sttn_ffn_layout_01
+```
+
+默认真实权重、FP16、线程数 1、首层 QKV 缓存开启。输出目录须为新目录。
+每组顺序为 `contiguous/channels-last`，下一组反转，共四个独立顺序进程。
+两种模式都将 `cudnn.benchmark` 设为 `False`，其余后端配置必须完全相同。
+生产模型、遮罩、窗口、数值检查及清理策略保持原样。
+
+仅基准中的 8 个 FFN 实例改变布局：卷积权重在带计时前转为
+`torch.channels_last`，每次 FFN 调用将输入转入该布局，输出转回 NCHW
+连续存储后再做原残差相加。输入/输出转换均在 `engine.inpaint()` 内，
+计入每带 wall；未修改 attention、encoder 或 decoder 的权重/输入布局。
+退出时（包括异常）恢复原实例 forward 和权重 stride/值；不修改类定义。
+
+报告格式沿用 cuDNN 工具的 `runs`、`sessions`、`summary`：
+
+- `first_seconds` / `warm_median_seconds` 分开记录首次和预热后热态，均为
+  前后同步的完整带 wall，包含生产传输和合成；没有 profiler 开销。
+- `layout_setup_seconds` 单列一次性权重布局转换；CUDA 上同步计时，
+  `layout_setup_peak_allocated_gib` / `layout_setup_peak_reserved_gib` 单列该阶段峰值。
+  不持有额外 GPU 权重副本供恢复，避免将基准自身副本算作布局的长期显存。
+- 每带 `peak_allocated_gib` / `peak_reserved_gib` 含权重、workspace 和
+  allocator 状态，带间不清缓存。布局恢复在计时之后，进程总 wall 仍包含恢复。
+- 首次、预热和正式输出全部对照首个 contiguous 带，按融合后的浮点值逐像素
+  检查。差异写入报告后失败退出，`warm_speedup=null`；精度回退、非有限值、
+  执行失败直接使子进程失败，详情见对应日志。不会因差异很小就自动放行。
+
+CPU 验证使用 `--device cpu --precision fp32`；加速比和显存字段为 `null`。
+收益须看目标 GPU 的整带结果，局部卷积更快不代表含转换的整带更快。
+
+本地真实权重 CPU 冒烟（3 帧、预热 1 轮、正式 2 轮、每布局 1 个进程）
+输出最大/平均像素差为 0，精度回退为 0。新增测试 `7 passed, 1 skipped`，
+全量回归 `517 passed, 26 skipped`；CUDA 整带显存验证因本机无 GPU 跳过。
