@@ -454,4 +454,8 @@ Pipeline `106.790 s`、同进程复用 Pipeline `105.626 s`。只复用进程本
 区分卷积、注意力矩阵乘、布局搬运和同步等待，再选下一项优化。
 工具将无 profiler 基线与采集分开，输出 JSON 和 Chrome trace；运行方法和
 计时限制见[算子级分析](03-STTN性能分析.md#transformer-算子级分析)。
-目前仅完成本地 CPU 冒烟，尚无目标 GPU 算子数据，不先推断收益。
+首轮 GPU 采集中位基线 `1.095010 s/带`、输出一致，但 CUPTI 初始化失败，
+`device_timing_status=unavailable`。CPU `.item()` 等待不能等价为可优化空间，
+也不能据 CPU 提交耗时确定卷积/注意力的 GPU 成本。现已补充
+`--timing cuda-event`，在基准内采集 QKV、attention、输出卷积、FFN 等范围，
+不依赖 CUPTI；新模式的目标 GPU 结果仍待采集。

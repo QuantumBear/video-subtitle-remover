@@ -281,3 +281,60 @@ python benchmarks/sttn_operator_profile.py \
 输出一致、最大像素差为 0；GPU 数据仍待采集，不据 CPU 热点预测 GPU 收益。
 本轮全量回归 `498 passed, 23 skipped`；新增算子分析测试为 8 项通过，
 1 项 CUDA 实采测试因本机无 CUDA 跳过。
+
+### CUPTI 不可用时，用 CUDA Event 测范围
+
+首轮服务器算子采集的无 profiler 中位数为 `1.095010 s`，五轮范围
+`1.091726–1.103121 s`，输出一致；但 CUPTI 返回
+`CUPTI_ERROR_NOT_INITIALIZED (15)`，`device_timing_status=unavailable`，
+没有 GPU 算子时间。采集 wall `2.081678 s` 含 profiler 开销，不能作为基线。
+其中 20 次 `_local_scalar_dense` 的 CPU self 时间共 `713.624 ms`，对应
+10 窗口各两次 `.item()`。该时间包含等待前序 GPU 运算完成，不能视为
+删除检查即可节省的时间，也不能用卷积的 CPU 提交耗时判断 GPU 卷积成本。
+
+此环境先用不依赖 CUPTI 的模式采集同一完整修复带：
+
+```bash
+python benchmarks/sttn_operator_profile.py \
+  --device cuda --frames 50 --warmup 3 --repeats 5 \
+  --timing cuda-event --output-dir benchmark_sttn_events_01
+```
+
+该模式不调用 `torch.profiler`，不生成 Chrome trace，`report.json` 中
+`trace=null`、`device_timing_status=stream_intervals`。
+先按原设置完成无包装基线，再校准一带初始化可复用事件，最后单独重复采集
+`--repeats` 带。校准输出也参与一致性检查；所有阶段均须保持精度，发生
+精度回退或输出变化会以失败退出。现有两次数值检查、传输、窗口融合不改。
+
+终端的 `[event-region]` 和报告的 `regions` 给出每带累计值的逐字段中位数：
+
+| 范围 | 观察内容 |
+| --- | --- |
+| `qkv_cache` / `qkv_projection` | 窗口外缓存构建 / 每个 Q、K、V 卷积；后者也含缓存构建内的投影 |
+| `attention` | 四路注意力的矩阵乘、缩放和 softmax，合计 320 次/50 帧带 |
+| `attention_output` | 拼接后的输出卷积和激活 |
+| `feed_forward` | 每层两次前馈卷积和激活 |
+| `multihead` 的 self | 扣除投影、attention、输出卷积后的重排、拼接及提交间隙 |
+| `transformer` 的 self | 扣除 multihead/FFN 后的残差运算及范围外间隙 |
+| `band` 的 self | 模型模块之外的预处理、gather、数值检查、传输、CPU 合成及间隙 |
+
+`inclusive_stream_ms` 是范围开始/结束事件之间的 stream 经过时间，含子范围；
+`self_stream_ms` 扣除直接子范围，避免父子重复累计。GPU 事件只记录，
+每带结束时统一同步一次读取，不新增逐模块同步；原有 `.item()` 和 `.cpu()`
+仍会按生产路径等待。事件复用只用于同一进程中的顺序基准，当前只支持
+STTN 的单 stream 路径，不代表多 stream 或并发容量。
+
+事件区间包含 CPU 提交 kernel 的间隙、事件和包装开销，并非纯 kernel
+执行时间；尤其 `band` 会包含 GPU 等待 CPU 的间隙。`inclusive_host_ms` /
+`self_host_ms` 是对应主机经过时间，可能等待 GPU，不能再与 stream 时间相加。
+只在同一带内按 self 汇总，`regions` 各字段中位数不保证可加；
+需要核对时使用 `region_runs` 中各次原始范围。正式速度仍看无包装的
+`baseline_median_seconds`，采集 wall 仅用于衡量工具开销。
+
+CPU 可用 `--device cpu --precision fp32 --timing cuda-event` 冒烟；此时
+`compute_clock=wall`，stream 字段均为 `null`，不能当 GPU 数据。
+`--record-shapes` 只支持原 `--timing profiler` 模式。
+
+本地真实权重 3 帧、预热 1 轮、基线及范围各测量 2 轮，输出像素差为 0，
+精度回退为 0；该数据仅验证 CPU 冒烟。全量回归 `503 passed, 24 skipped`，
+算子/范围基准测试 `13 passed, 2 skipped`，两项实采测试因本机无 CUDA 跳过。

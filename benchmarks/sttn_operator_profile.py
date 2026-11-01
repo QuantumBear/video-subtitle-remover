@@ -2,6 +2,7 @@
 
 python benchmarks/sttn_operator_profile.py --device cuda --frames 50 \
     --warmup 3 --repeats 5 --output-dir benchmark_sttn_operators_01
+无 CUPTI 环境追加 --timing cuda-event，改用可复用 CUDA Event 测嵌套范围。
 """
 
 import argparse
@@ -21,10 +22,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from backend.inpaint.sttn_det_inpaint import STTNDetInpaint
+from benchmarks.sttn_region_timing import capture_regions
 
 
 @contextmanager
-def model_ranges(model):
+def model_ranges(model, *, range_context=None):
     """仅在采集期间为当前实例加范围；正常/异常退出均恢复实例属性。"""
     targets = [(model.encoder, 'forward', 'encoder'),
                (model.decoder, 'forward', 'decoder'),
@@ -40,11 +42,13 @@ def model_ranges(model):
             (attention.output_linear, 'attention_output'),
             (block.feed_forward, 'feed_forward')))
     saved = []
+    if range_context is None:
+        range_context = lambda label: record_function(f'sttn::{label}')
 
     def wrapped(original, label):
         @wraps(original)
         def forward(*args, **kwargs):
-            with record_function(f'sttn::{label}'):
+            with range_context(label):
                 return original(*args, **kwargs)
         return forward
 
@@ -172,10 +176,16 @@ def summarize_events(events, *, cuda):
 
 
 def run_profile(engine, frames, masks, output_dir, *, warmup=3, repeats=5, top=20,
-                record_shapes=False, model_path=None):
-    """无 profiler 预热/计时后仅采集一次整带；返回完整 JSON 并输出热点。"""
+                record_shapes=False, model_path=None, timing='profiler'):
+    """无包装预热/计时后独立采集算子或重复范围计时，输出完整 JSON。"""
     if engine.profile:
         raise ValueError('算子基准须关闭引擎阶段 profile，避免混入额外 CUDA Event/同步')
+    if timing not in ('profiler', 'cuda-event'):
+        raise ValueError(f'未知计时方式: {timing}')
+    if min(len(frames), repeats, top) < 1 or len(frames) != len(masks) or warmup < 0:
+        raise ValueError('帧数/mask 数量须一致且非空，repeats/top 须为正，warmup 须非负')
+    if timing == 'cuda-event' and record_shapes:
+        raise ValueError('--record-shapes 仅适用于 --timing profiler')
     device = engine.device
     cuda = device.type == 'cuda'
     precision = engine.precision, engine.precision_fallbacks
@@ -222,21 +232,28 @@ def run_profile(engine, frames, masks, output_dir, *, warmup=3, repeats=5, top=2
 
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    activities = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if cuda else [])
-    synchronize()
-    start = time.perf_counter()
-    with profile(activities=activities, record_shapes=record_shapes) as capture:
-        with model_ranges(engine.model):
-            with record_function('sttn::band'):
-                output = engine.inpaint(frames, masks)
+    if timing == 'cuda-event':
+        report = capture_regions(engine, frames, masks, range_context=model_ranges,
+                                 repeats=repeats, check_precision=check_precision, compare=compare)
+        capture_wall = report['region_capture_median_seconds']
+        trace = None
+    else:
+        activities = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if cuda else [])
         synchronize()
-    capture_wall = time.perf_counter() - start
-    check_precision()
-    compare(output)
-    capture.export_chrome_trace(str(output_dir / 'trace.json'))
-    report = summarize_events(capture.events(), cuda=cuda)
+        start = time.perf_counter()
+        with profile(activities=activities, record_shapes=record_shapes) as capture:
+            with model_ranges(engine.model):
+                with record_function('sttn::band'):
+                    output = engine.inpaint(frames, masks)
+            synchronize()
+        capture_wall = time.perf_counter() - start
+        check_precision()
+        compare(output)
+        trace = str(output_dir / 'trace.json')
+        capture.export_chrome_trace(trace)
+        report = summarize_events(capture.events(), cuda=cuda)
     report.update(
-        scope='inpaint_band', device=str(device),
+        scope='inpaint_band', device=str(device), timing=timing,
         model=str(Path(model_path).resolve()) if model_path is not None else None,
         device_name=torch.cuda.get_device_name(device) if cuda else 'CPU',
         torch=torch.__version__, numpy=np.__version__, threads=torch.get_num_threads(),
@@ -247,10 +264,10 @@ def run_profile(engine, frames, masks, output_dir, *, warmup=3, repeats=5, top=2
         cache_active=engine.cache_first_qkv and len(frames) > engine.neighbor_stride,
         warmup=warmup, repeats=repeats, record_shapes=record_shapes,
         baseline_seconds=timings, baseline_median_seconds=statistics.median(timings),
-        profiled_runs=1, capture_wall_seconds=capture_wall,
+        profiled_runs=repeats if timing == 'cuda-event' else 1, capture_wall_seconds=capture_wall,
         outputs_match=max_diff == 0, max_pixel_difference=max_diff,
         mean_pixel_difference=total_diff / count,
-        trace=str(output_dir / 'trace.json'),
+        trace=trace,
         timing_notes=[
             'baseline_seconds: no profiler, no ranges; synchronized band wall time',
             'capture_wall_seconds includes profiler overhead and export preparation; not a speed baseline',
@@ -260,6 +277,18 @@ def run_profile(engine, frames, masks, output_dir, *, warmup=3, repeats=5, top=2
             'host_wait_or_scalar includes CPU waiting, not pure GPU compute; inspect trace for gaps',
             'outside_model includes preprocessing, gather, finite checks, transfers and CPU composition; '
             'NumPy/Python work is visible as band gaps, not ATen operator time'])
+    if timing == 'cuda-event':
+        report['timing_notes'] = [
+            'baseline_seconds: synchronized band wall time without profiler or temporary wrappers',
+            'CUDA Events do not need CUPTI; no torch.profiler capture or Chrome trace in this mode',
+            'one calibration band initializes reusable event pairs; region_runs contains measured bands only',
+            'inclusive_stream_ms includes child ranges; self_stream_ms subtracts direct child intervals',
+            'stream intervals include host launch gaps/event overhead and are not pure kernel execution time',
+            'one added stream sync per captured band when reading events; no per-range sync',
+            'host times can wait on GPU; do not add host and stream times or inclusive nested ranges',
+            'regions contains per-field medians across runs; medians need not sum; inspect individual region_runs',
+            'band self interval includes work outside wrapped modules, transfers, finite checks and CPU gaps',
+            'CPU smoke uses wall host time only; stream fields are null']
     (output_dir / 'report.json').write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(f'[operator-profile] baseline_median={report["baseline_median_seconds"]:.6f}s '
@@ -269,8 +298,15 @@ def run_profile(engine, frames, masks, output_dir, *, warmup=3, repeats=5, top=2
         print(f'[operator-category] scope={row["scope"]} category={row["category"]} '
               f'self_cpu_ms={row["self_cpu_ms"]:.3f} self_device_ms={row["self_device_ms"]}')
     for row in report['regions']:
-        print(f'[operator-region] name={row["name"]} calls={row["calls"]} '
-              f'cpu_total_ms={row["cpu_total_ms"]:.3f} device_total_ms={row["device_total_ms"]}')
+        if timing == 'cuda-event':
+            print(f'[event-region] name={row["name"]} calls={row["calls"]} '
+                  f'inclusive_stream_ms={row["inclusive_stream_ms"]} '
+                  f'self_stream_ms={row["self_stream_ms"]} '
+                  f'inclusive_host_ms={row["inclusive_host_ms"]:.3f} '
+                  f'self_host_ms={row["self_host_ms"]:.3f}')
+        else:
+            print(f'[operator-region] name={row["name"]} calls={row["calls"]} '
+                  f'cpu_total_ms={row["cpu_total_ms"]:.3f} device_total_ms={row["device_total_ms"]}')
     clocks = ['cpu'] + (['device'] if report['device_timing_status'] == 'attributed' else [])
     for clock in clocks:
         rows = sorted(report['operators'], key=lambda row: row[f'self_{clock}_ms'], reverse=True)
@@ -295,6 +331,8 @@ def main():
     parser.add_argument('--precision', choices=('fp16', 'fp32'), default='fp16')
     parser.add_argument('--cache', choices=('on', 'off'), default='on')
     parser.add_argument('--top', type=int, default=20)
+    parser.add_argument('--timing', choices=('profiler', 'cuda-event'), default='profiler',
+                        help='profiler 采集算子；cuda-event 分段计时不依赖 CUPTI')
     parser.add_argument('--record-shapes', action='store_true', help='额外记录算子输入形状，采集开销更高')
     parser.add_argument('--output-dir', type=Path, default=Path('benchmark_sttn_operators_01'))
     args = parser.parse_args()
@@ -304,6 +342,8 @@ def main():
         parser.error('当前环境没有 CUDA；CPU 验证请指定 --device cpu --precision fp32')
     if args.device == 'cpu' and args.precision != 'fp32':
         parser.error('CPU 验证请指定 --precision fp32')
+    if args.timing == 'cuda-event' and args.record_shapes:
+        parser.error('--record-shapes 仅适用于 --timing profiler')
     torch.set_num_threads(args.threads)
     engine = STTNDetInpaint(args.device, str(args.model), precision=args.precision,
                            cache_first_qkv=args.cache == 'on')
@@ -318,7 +358,7 @@ def main():
             mask[height // 2:height // 2 + 32, x:x + 128] = 255
     run_profile(engine, frames, masks, args.output_dir, warmup=args.warmup,
                 repeats=args.repeats, top=args.top, record_shapes=args.record_shapes,
-                model_path=args.model)
+                model_path=args.model, timing=args.timing)
 
 
 if __name__ == '__main__':

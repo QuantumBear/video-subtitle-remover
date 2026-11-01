@@ -146,7 +146,8 @@ def test_missing_cuda_events_are_reported_as_unavailable():
 
 
 @pytest.mark.parametrize('failure', ['pixel_change', 'precision_fallback'])
-def test_profile_rejects_changed_results_or_precision(tmp_path, failure):
+@pytest.mark.parametrize('timing', ['profiler', 'cuda-event'])
+def test_profile_rejects_changed_results_or_precision(tmp_path, failure, timing):
     engine = small_engine()
     original = engine.inpaint
     frames = [np.full((32, 32, 3), 127, dtype=np.uint8)]
@@ -167,9 +168,130 @@ def test_profile_rejects_changed_results_or_precision(tmp_path, failure):
 
     engine.inpaint = change_after_baseline
     with pytest.raises(RuntimeError, match='像素不一致|精度回退'):
-        benchmark.run_profile(engine, frames, masks, tmp_path, warmup=0, repeats=1)
+        benchmark.run_profile(engine, frames, masks, tmp_path, warmup=0, repeats=1, timing=timing)
     assert not any('forward' in module.__dict__ for module in engine.model.modules())
     if failure == 'pixel_change':
         report = json.loads((tmp_path / 'report.json').read_text())
         assert report['outputs_match'] is False
         assert report['max_pixel_difference'] == 1
+
+
+@pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='requires CUDA'))])
+def test_region_timing_does_not_need_torch_profiler_and_preserves_output(tmp_path, monkeypatch, device):
+    engine = small_engine()
+    engine.device = torch.device(device)
+    engine.model.to(engine.device)
+    frames = [np.full((32, 32, 3), 127, dtype=np.uint8) for _ in range(3)]
+    masks = [np.full((32, 32), 255, dtype=np.uint8) for _ in frames]
+    expected = engine.inpaint(frames, masks)
+
+    def no_cupti(*args, **kwargs):
+        raise AssertionError('CUDA Event 模式不能调用 torch.profiler')
+
+    monkeypatch.setattr(benchmark, 'profile', no_cupti)
+    report = benchmark.run_profile(engine, frames, masks, tmp_path,
+                                   warmup=0, repeats=2, timing='cuda-event')
+    assert report['timing'] == 'cuda-event'
+    assert report['compute_clock'] == ('cuda_event' if device == 'cuda' else 'wall')
+    assert report['outputs_match'] is True
+    assert report['max_pixel_difference'] == 0
+    assert len(report['region_runs']) == 2
+    assert len(report['baseline_seconds']) == 2
+    rows = {row['name']: row for row in report['regions']}
+    assert rows['attention']['calls'] == 64  # 2 窗口 × 8 层 × 4 路。
+    assert rows['qkv_projection']['calls'] == 45  # 缓存3次 + 两窗口各21次。
+    assert rows['transformer']['inclusive_host_ms'] > 0
+    assert rows['feed_forward']['self_host_ms'] > 0
+    if device == 'cuda':
+        assert rows['transformer']['inclusive_stream_ms'] > 0
+        assert rows['attention']['self_stream_ms'] > 0
+        for run in report['region_runs']:
+            band = next(row for row in run['regions'] if row['name'] == 'band')
+            assert sum(row['self_stream_ms'] for row in run['regions']) == pytest.approx(
+                band['inclusive_stream_ms'], abs=.01)
+    else:
+        assert rows['transformer']['inclusive_stream_ms'] is None
+    assert report['trace'] is None
+    assert not (tmp_path / 'trace.json').exists()
+    assert json.loads((tmp_path / 'report.json').read_text()) == report
+    assert not any('forward' in module.__dict__ for module in engine.model.modules())
+    assert 'project_first_qkv' not in engine.model.__dict__
+    for actual, reference in zip(engine.inpaint(frames, masks), expected):
+        np.testing.assert_array_equal(actual, reference)
+
+
+def test_cuda_region_timer_defers_sync_and_subtracts_children(monkeypatch):
+    from benchmarks.sttn_region_timing import RegionTimer
+
+    # 本机无 CUDA，仅替换硬件接口；真实计时器负责嵌套/去重/复用/读数顺序。
+    clock = SimpleNamespace(ms=0., synchronized=False, syncs=0, events=0)
+
+    class Stream:
+        def synchronize(self):
+            clock.syncs += 1
+            clock.synchronized = True
+
+    stream = Stream()
+
+    class Event:
+        def __init__(self, *, enable_timing):
+            assert enable_timing
+            clock.events += 1
+
+        def record(self, target):
+            assert target is stream
+            self.ms = clock.ms
+            clock.synchronized = False
+
+        def elapsed_time(self, end):
+            assert clock.synchronized, '只能在整带同步后读取事件'
+            return end.ms - self.ms
+
+    monkeypatch.setattr(torch.cuda, 'current_stream', lambda device: stream)
+    monkeypatch.setattr(torch.cuda, 'Event', Event)
+    timer = RegionTimer('cuda')
+    for _ in range(2):
+        timer.reset()
+        clock.ms = 0.
+        with timer.region('band'):
+            clock.ms = 10.
+            with timer.region('transformer'):
+                clock.ms = 20.
+                with timer.region('feed_forward'):
+                    clock.ms = 60.
+                clock.ms = 80.
+            clock.ms = 100.
+        assert not clock.synchronized
+        rows = {row['name']: row for row in timer.finish()}
+        assert rows['band']['inclusive_stream_ms'] == 100.
+        assert rows['band']['self_stream_ms'] == 30.
+        assert rows['transformer']['inclusive_stream_ms'] == 70.
+        assert rows['transformer']['self_stream_ms'] == 30.
+        assert rows['feed_forward']['self_stream_ms'] == 40.
+        assert sum(row['self_stream_ms'] for row in rows.values()) == 100.
+    assert clock.syncs == 2
+    assert clock.events == 6, '重复采集须复用已初始化的事件'
+
+
+def test_region_ranges_restore_after_model_exception():
+    from benchmarks.sttn_region_timing import RegionTimer
+
+    engine = small_engine()
+    original = engine.model.transformer[0].feed_forward.forward
+
+    def fail(features):
+        raise RuntimeError('injected region failure')
+
+    engine.model.transformer[0].feed_forward.forward = fail
+    timer = RegionTimer('cpu')
+    with pytest.raises(RuntimeError, match='injected region failure'):
+        with benchmark.model_ranges(engine.model, range_context=timer.region):
+            with timer.region('band'):
+                engine.inpaint([np.full((32, 32, 3), 127, dtype=np.uint8)],
+                               [np.full((32, 32), 255, dtype=np.uint8)])
+    assert engine.model.transformer[0].feed_forward.__dict__['forward'] is fail
+    assert 'forward' not in engine.model.encoder.__dict__
+    assert 'project_first_qkv' not in engine.model.__dict__
+    assert timer.finish()
+    engine.model.transformer[0].feed_forward.forward = original
