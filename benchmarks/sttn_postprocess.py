@@ -21,21 +21,19 @@ sys.path.insert(0, str(ROOT))
 from benchmarks.sttn_cudnn_benchmark import backend_settings, measure_mode
 
 
-def batched_postprocess(pred_img, neighbor_ids, frames, binary_masks, comp_frames):
-    """窗口内一次量化、批量替换背景；跨窗口仍依次做原 0.5 递推。"""
+def legacy_postprocess(pred_img, neighbor_ids, frames, binary_masks, comp_frames):
+    """冻结生产接入之前的逐帧实现，保留独立 A/B 基线。"""
     import numpy as np
 
-    images = (pred_img.permute(0, 2, 3, 1).numpy() * 255).astype(np.uint8)
-    # binary_masks 来自生产预处理，严格为 0/1；copyto 等价于原 mask 乘加。
-    masks = np.stack([binary_masks[idx] for idx in neighbor_ids])
-    background = np.stack([frames[idx] for idx in neighbor_ids])
-    np.copyto(images, background, where=masks == 0)
+    pred_img = pred_img.permute(0, 2, 3, 1).numpy() * 255
     for i, idx in enumerate(neighbor_ids):
+        img = (pred_img[i].astype(np.uint8) * binary_masks[idx]
+               + frames[idx] * (1 - binary_masks[idx]))
         if comp_frames[idx] is None:
-            comp_frames[idx] = images[i]
+            comp_frames[idx] = img
         else:
             comp_frames[idx] = (comp_frames[idx].astype(np.float32) * 0.5
-                                + images[i].astype(np.float32) * 0.5)
+                                + img.astype(np.float32) * 0.5)
 
 
 @contextmanager
@@ -46,7 +44,7 @@ def postprocess_execution(*, mode):
     if mode not in ('legacy', 'batched'):
         raise ValueError(f'未知后处理模式: {mode}')
     previous = sttn_det_inpaint._postprocess_sttn
-    target = previous if mode == 'legacy' else batched_postprocess
+    target = legacy_postprocess if mode == 'legacy' else previous
     state = dict(postprocess_calls=0, postprocess_frame_visits=0)
 
     def process(prediction, ids, frames, masks, composites):

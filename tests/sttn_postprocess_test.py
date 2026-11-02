@@ -27,12 +27,12 @@ def frozen_postprocess(prediction, ids, frames, masks, composites):
                                     + image.astype(np.float32) * 0.5)
 
 
-@pytest.mark.parametrize('implementation', ['production', 'batched'])
+@pytest.mark.parametrize('implementation', ['production', 'legacy'])
 def test_quantization_masks_and_strided_inputs_match_frozen_production(implementation):
     if implementation == 'production':
         process = sttn_det_inpaint._postprocess_sttn
     else:
-        from benchmarks.sttn_postprocess import batched_postprocess as process
+        from benchmarks.sttn_postprocess import legacy_postprocess as process
     rng = np.random.default_rng(81)
     # 包含所有 uint8 值、量化边界两侧，以及非连续 NCHW tensor。
     values = np.arange(256, dtype=np.float32) / np.float32(255)
@@ -63,12 +63,12 @@ def test_quantization_masks_and_strided_inputs_match_frozen_production(implement
         np.testing.assert_array_equal(item, original)
 
 
-@pytest.mark.parametrize('implementation', ['production', 'batched'])
+@pytest.mark.parametrize('implementation', ['production', 'legacy'])
 def test_three_overlaps_keep_recursive_half_mix_and_uint8_before_compositing(implementation):
     if implementation == 'production':
         process = sttn_det_inpaint._postprocess_sttn
     else:
-        from benchmarks.sttn_postprocess import batched_postprocess as process
+        from benchmarks.sttn_postprocess import legacy_postprocess as process
     frames = [np.zeros((1, 1, 3), dtype=np.uint8)]
     masks = [np.ones((1, 1, 1), dtype=np.uint8)]
     result = [None]
@@ -108,6 +108,28 @@ def band():
     return frames, masks
 
 
+def test_default_band_batches_background_but_legacy_benchmark_stays_per_frame(engine, monkeypatch):
+    from benchmarks import sttn_postprocess as benchmark
+    frames, masks = band()
+    copies = []
+    original_copyto = np.copyto
+
+    def record_copyto(destination, source, **kwargs):
+        copies.append(destination.shape)
+        return original_copyto(destination, source, **kwargs)
+
+    monkeypatch.setattr(np, 'copyto', record_copyto)
+    actual = engine.inpaint(frames, masks)
+    assert copies == [(3, 32, 32, 3), (5, 32, 32, 3), (3, 32, 32, 3)]
+    copies.clear()
+    with benchmark.postprocess_execution(mode='legacy'):
+        reference = engine.inpaint(frames, masks)
+    assert copies == []  # 基线不能随生产默认值改变而变成批量版。
+    for result, expected in zip(actual, reference):
+        assert result.dtype == expected.dtype
+        np.testing.assert_array_equal(result, expected)
+
+
 @pytest.mark.parametrize('raise_inside', [False, True])
 def test_benchmark_restores_helper_on_normal_or_exception_exit(raise_inside):
     from benchmarks import sttn_postprocess as benchmark
@@ -132,6 +154,7 @@ def test_full_band_preserves_fused_qkv_precision_inputs_and_unmasked_pixels(engi
     frames, masks = band()
     originals = [item.copy() for item in frames + masks]
     previous = sttn_det_inpaint._postprocess_sttn
+    default_output = engine.inpaint(frames, masks)
     legacy, reference = benchmark.measure_postprocess(engine, frames, masks, mode='legacy',
                                                       warmup=0, repeats=1)
     batched, returned = benchmark.measure_postprocess(engine, frames, masks, mode='batched',
@@ -153,7 +176,8 @@ def test_full_band_preserves_fused_qkv_precision_inputs_and_unmasked_pixels(engi
             assert report['peak_allocated_gib'] is None
     assert returned is reference
     assert sttn_det_inpaint._postprocess_sttn is previous
-    for actual, frame, mask in zip(reference, frames, masks):
+    for default, actual, frame, mask in zip(default_output, reference, frames, masks):
+        np.testing.assert_array_equal(default, actual)
         np.testing.assert_array_equal(actual[mask == 0], frame[mask == 0])
     for item, original in zip(frames + masks, originals):
         np.testing.assert_array_equal(item, original)

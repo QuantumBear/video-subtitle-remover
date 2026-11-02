@@ -34,16 +34,19 @@ def _preprocess_sttn(frames, masks):
 
 
 def _postprocess_sttn(pred_img, neighbor_ids, frames, binary_masks, comp_frames):
-    """原逐帧后处理；输入是已回传 CPU 的 FP32 NCHW 预测。"""
-    pred_img = pred_img.permute(0, 2, 3, 1).numpy() * 255
+    """批量量化和逐帧 mask 合成；输入是 CPU FP32 NCHW 预测。"""
+    images = (pred_img.permute(0, 2, 3, 1).numpy() * 255).astype(np.uint8)
+    # binary_masks 来自预处理，严格为 0/1；未遮罩像素保留原帧值。
+    masks = np.stack([binary_masks[idx] for idx in neighbor_ids])
+    background = np.stack([frames[idx] for idx in neighbor_ids])
+    np.copyto(images, background, where=masks == 0)
     for i, idx in enumerate(neighbor_ids):
-        img = (pred_img[i].astype(np.uint8) * binary_masks[idx]
-               + frames[idx] * (1 - binary_masks[idx]))
         if comp_frames[idx] is None:
-            comp_frames[idx] = img
+            comp_frames[idx] = images[i]
         else:
+            # 跨窗口仍按原先顺序递推，不能改成多次预测的算术平均。
             comp_frames[idx] = (comp_frames[idx].astype(np.float32) * 0.5
-                                + img.astype(np.float32) * 0.5)
+                                + images[i].astype(np.float32) * 0.5)
 
 
 class STTNDetInpaint:
