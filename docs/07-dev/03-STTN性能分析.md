@@ -777,8 +777,8 @@ python benchmarks/sttn_finite_sync.py \
   精度回退、非有限值或执行异常直接使 worker 失败。CPU 使用
   `--device cpu --precision fp32` 只验证工具，速度字段为 `null`。
 
-GPU 整带收益待服务器实测；本机没有 CUDA。合成带结果仍不能外推为真实
-视频端到端收益或并发容量。
+本机没有 CUDA，服务器 GPU 实测结果见下一节。合成带结果仍不能外推为
+真实视频端到端收益或并发容量。
 
 本机真实 `sttn.pth` CPU FP32 冒烟使用 3 帧 `240×432`、预热 1 轮、正式
 2 轮，每模式各一个独立进程。所有阶段最大/平均浮点像素差均为 `0`，
@@ -790,3 +790,153 @@ GPU 整带收益待服务器实测；本机没有 CUDA。合成带结果仍不�
 独立进程反转顺序及小数像素差拒绝。八项 CUDA 场景因本机无 GPU 跳过，
 包括同 stream 标志拷贝、非默认 stream 的完整带以及无设备标量读取检查；
 因此当前本地验证不证明 CUDA 路径正确性或收益，服务器执行仍为必要步骤。
+
+### 有限值检查 GPU 结果：小幅差异，保持立即检查
+
+`benchmark_sttn_finite_sync_01` 使用 RTX5880-Ada-24Q、Torch `2.11.0+cu128`、
+NumPy `2.2.5`、cuDNN `91900`，FP16、50 帧 `240×432`、线程数 1、
+首层缓存、八层 QKV 合并及批量 CPU 后处理开启。两组独立进程反转顺序，
+每进程首次 1 轮、预热 3 轮、正式 5 轮，两边后端设置一致。
+
+| 正式热态中位数（s） | immediate | deferred | 耗时减少 |
+| --- | ---: | ---: | ---: |
+| 第一组 | 0.989545 | 0.982270 | 0.74% |
+| 第二组 | 0.982510 | 0.979170 | 0.34% |
+| 合并正式轮 | 0.987693 | 0.979488 | 0.83% |
+
+合并正式轮每 50 帧约少 `8.205 ms`，速度比为 `1.008376`。合并值来自每模式
+10 次正式轮的中位数，不是两组收益的平均值。两组分别少 `7.275 ms` 和
+`3.340 ms`，方向一致，但原版正式轮范围为 `0.979599–0.993010 s`，延后版
+为 `0.976459–0.989427 s`，明显重叠；目前只有每模式两个独立进程，
+尚不足以确认稳定加速，也不支持将原标量读取视为主要瓶颈。
+
+所有首次、预热及正式输出最大/平均浮点像素差均为 `0`，无精度回退。
+每进程两项检查数及完成窗口数均为 `90`，提前标量读取数为 `180/0`，
+标志拷贝数为 `0/180`，符合路径预期。这验证了正常有限输入的 CUDA A/B；
+报告本身没有执行非有限值注入、异常收尾或非默认 stream 的 CUDA 测试。
+
+GPU allocated 峰值均为 `1.653317 GiB`，reserved 均为 `2.048828125 GiB`。
+setup 中位数为 `0.041824 → 2.478100 ms`，延后版包含 pinned 标志缓冲区
+准备；`2` 字节只表示标志载荷，不代表 allocator 实际页占用。首次整带
+中位数为 `1.466190 → 1.443048 s`，包含惰性初始化，不能作为纯检查成本。
+
+本轮建议保留独立实验，生产继续立即检查。当前收益小且范围重叠，暂不值得
+引入 pinned 缓冲区、stream 顺序及异常收尾的生产维护成本。若继续评估，
+应增加独立进程数和正式轮数，并在接入前运行上述 CUDA 错误路径测试；
+仍须单独验证真实视频收益。
+
+### 当前生产路径的第二轮 CUDA Event 结果
+
+`benchmark_sttn_events_02` 使用 RTX5880-Ada-24Q、Torch `2.11.0+cu128`、
+NumPy `2.2.5`，FP16、50 帧 `240×432`、线程数 1、步长 5、参考步长 10，
+首层缓存、八层 QKV 合并及批量 CPU 后处理开启，有限值检查仍立即读取。
+
+```bash
+python benchmarks/sttn_operator_profile.py \
+  --device cuda --precision fp16 --cache on --threads 1 \
+  --frames 50 --warmup 3 --repeats 5 \
+  --timing cuda-event --output-dir benchmark_sttn_events_02
+```
+
+预热 3 轮，事件校准 1 轮，正式采集 5 轮。无临时包装的整带 wall 中位数为
+`0.997075 s`，事件采集整带 wall 中位数为 `0.987848 s`，band stream 区间
+中位数为 `985.746 ms`。采集轮略快不能解释为优化收益；两组按顺序测量，
+存在运行波动。所有比较的最大/平均浮点像素差均为 `0`，无精度回退。
+
+| 范围 | stream 区间中位数（ms） | 同轮 band 占比的中位数 |
+| --- | ---: | ---: |
+| FFN | 269.023 | 27.29% |
+| attention | 161.803 | 16.42% |
+| decoder | 155.188 | 15.65% |
+| attention 输出卷积及激活 | 101.806 | 10.33% |
+| QKV 投影 | 74.315 | 7.54% |
+| encoder | 13.395 | 1.36% |
+| band self | 127.708 | 12.96% |
+| multihead self | 59.508 | 5.98% |
+| transformer self | 23.428 | 2.38% |
+
+占比先按每轮范围区间除以同轮 band inclusive 区间，再取中位数；与直接用
+两个中位数相除不同。以上列出叶范围及父范围的 self，避免重复累计。
+另有 qkv_cache self 约 `0.003 ms`；其 inclusive `4.246 ms` 已包含缓存构建
+时的 QKV 投影。每轮全部 self 之和等于该轮 band inclusive；表格逐字段
+中位数无须精确相加。Transformer inclusive 中位数为 `684.683 ms`，约占
+整带 69%，已包含其所有子范围，不能再与 FFN、attention 等相加。
+
+每带调用 encoder 1 次、缓存构建 1 次、QKV 投影 71 次、Transformer 10 次、
+multihead/FFN/输出卷积各 80 次、attention 320 次、decoder 10 次，符合
+首层缓存与八层、四路 patch attention 的执行路径。FFN 占比逐轮为
+`25.05–27.88%`；encoder、QKV、输出卷积、FFN、decoder 这些含卷积的范围
+合计占比中位数为 `62.11%`，但范围时间并非卷积 kernel 时间。
+
+CUDA Event 测的是当前 stream 上的区间，包含主机提交间隙与事件开销，
+不是纯 kernel 执行时间。band self 还包含预处理、gather、有限值检查、传输、
+CPU 后处理和间隙，不能把约 13% 全部当作 GPU 合成可节省的时间。
+host band self 约 `904 ms` 含 GPU 等待，也不能解释为 CPU 计算成本，
+更不能与 stream 时间相加。
+
+下一项建议独立验证：最后一个 Transformer block 仅为目标近邻帧执行
+attention 输出卷积、残差和 FFN。前七层以及最后一层的完整 Q/K/V、attention
+保持原计算，参考帧继续提供上下文；只在最后一层输出卷积之前截取目标帧。
+当前引擎只将这些帧交给 decoder，最后一层参考帧的输出卷积和 FFN 结果
+不会被使用，而这两个模块均逐帧计算，不会反向影响同层目标帧的 attention。
+这比同时改 query 形状或 GPU 合成更容易隔离验证。当前 FFN 的约 27% 是
+八层合计，不能作为本实验预期收益；改变卷积 batch 也可能改变浮点结果，
+仍须独立进程反转顺序、完整整带计时及严格像素对照。独立实验见下一节，
+生产计算保持完整末层输出。
+
+### 末层仅目标帧输出卷积与 FFN 独立 A/B
+
+`benchmarks/sttn_last_block.py` 比较 `full` 与 `targets`，所有替换仅在基准
+上下文中的实例方法上生效，不修改生产文件或新增生产开关。
+
+```bash
+python benchmarks/sttn_last_block.py \
+  --device cuda --precision fp16 --cache on --threads 1 \
+  --frames 50 --warmup 3 --repeats 5 --sessions 2 \
+  --output-dir benchmark_sttn_last_block_01
+```
+
+默认真实 `sttn.pth`；输出目录须不存在。两组按 `full/targets`、
+`targets/full` 反转顺序，四个独立进程依次执行。两模式均使用生产首层缓存、
+八层 QKV 合并、批量 CPU 后处理及立即有限值检查，`cudnn.benchmark=false`，
+其余后端设置必须一致。
+
+- `full` 执行生产完整八层，`targets` 保持前七层与最后一层 Q/K/V、四路
+  patch Attention 全部计算，只在末层 `output_linear` 入口取目标帧前缀，
+  随后残差和 FFN 仅处理这些目标帧。目标帧数从生产窗口的 `neighbor_ids`
+  获取，不重新实现窗口采样。参考帧仍在所有层提供 K/V，末层 query 也保留。
+- 两个被裁剪模块的卷积、激活均逐帧执行，没有跨帧归一化或状态更新；
+  末层参考帧的结果不会被 decoder 使用。但改变卷积 batch 可能改变实现选择
+  和浮点结果，数学等价不保证 CUDA 像素完全一致。
+- `last_block_calls`、`last_attention_frame_visits`、`target_frame_visits`、
+  `last_output_frame_visits`、`last_ffn_frame_visits`、`pruned_frame_visits`
+  累计本进程所有计时带。默认每带 10 个窗口、完整末层 140 帧次、目标
+  104 帧次。九带应为 90 次末层调用、1260 次 Attention 帧次、936 次目标
+  帧次；输出卷积与 FFN 应为 `1260/936` 帧次，跳过帧次为 `0/324`。
+  帧次不是 kernel 数或 FLOPs 测量。
+- 两模式保留相同方法包装和轻量计数；裁剪与全部推理、检查、传输、后处理
+  计入同步整带 wall。setup 只安装方法包装，模型加载和导入另列。首次包含
+  剩余惰性初始化。逐带重置 GPU allocated/reserved 峰值，不清 allocator
+  缓存；不使用 profiler/CUDA Events 做正式 A/B 计时。
+- 首次、预热和正式输出全部与第一个独立 `full` 输出严格比较，保留浮点
+  递推混合值，不额外转 uint8。像素差先保存完整报告再失败，速度字段为
+  `null`；精度回退、非有限值或执行错误使 worker 失败。没有可裁剪参考帧
+  时 `pruning_effective=false`，也不宣称速度收益。
+- 方法替换仅支持单线程、无梯度、单带顺序推理；正常或异常退出恢复原有
+  实例属性，包括进入上下文前已有的实例方法覆盖。CUDA 收益仍待服务器
+  实测；CPU 使用 `--device cpu --precision fp32` 只验证工具，不输出速度比。
+  合成带结果不能外推真实视频吞吐或并发容量。
+
+本机真实 `sttn.pth` CPU FP32 冒烟使用 11 帧 `240×432`、不预热、正式
+1 轮，每模式各一个独立进程；所有首次和正式输出最大/平均浮点像素差均
+为 `0`，无精度回退。每模式两带共调用末层 6 次，Attention 均为 50 帧次，
+目标 46 帧次；输出卷积与 FFN 从 `50` 降为 `46` 帧次，跳过 `4` 帧次。
+`pruning_effective=true`，CPU 速度字段为 `null`，此次仅证明该输入上的
+工具和输出对照可用。
+
+全量回归 `595 passed, 46 skipped`，本项新增测试 `18 passed, 2 skipped`。
+覆盖缓存开/关、前七层与末层 Attention 完整帧数、末层实际卷积/FFN 帧数、
+量化前特征对照及参考帧影响、无参考窗口、未遮罩像素和输入不变、已有
+实例方法覆盖的正常/异常恢复、非法窗口上下文、精度回退/非有限/执行错误、
+独立进程反转顺序及注入小数像素差后的报告保存。两项缓存开/关的 CUDA
+整带对照因本机无 GPU 跳过，不能据本地结果宣称 CUDA 一致性或加速。
