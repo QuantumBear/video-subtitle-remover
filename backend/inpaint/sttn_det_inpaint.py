@@ -39,9 +39,13 @@ def _check_sttn_finite(tensor, message):
         raise RuntimeError(message)
 
 
-def _postprocess_sttn(pred_img, neighbor_ids, frames, binary_masks, comp_frames):
-    """批量量化和逐帧 mask 合成；输入是 CPU FP32 NCHW 预测。"""
-    images = (pred_img.permute(0, 2, 3, 1).numpy() * 255).astype(np.uint8)
+def _download_sttn_prediction(pred_img):
+    """按生产默认路径回传 FP32 NCHW 预测。"""
+    return pred_img.float().cpu()
+
+
+def _composite_sttn(images, neighbor_ids, frames, binary_masks, comp_frames):
+    """将已量化的 uint8 NHWC 预测按原顺序合成。"""
     # binary_masks 来自预处理，严格为 0/1；未遮罩像素保留原帧值。
     masks = np.stack([binary_masks[idx] for idx in neighbor_ids])
     background = np.stack([frames[idx] for idx in neighbor_ids])
@@ -53,6 +57,12 @@ def _postprocess_sttn(pred_img, neighbor_ids, frames, binary_masks, comp_frames)
             # 跨窗口仍按原先顺序递推，不能改成多次预测的算术平均。
             comp_frames[idx] = (comp_frames[idx].astype(np.float32) * 0.5
                                 + images[i].astype(np.float32) * 0.5)
+
+
+def _postprocess_sttn(pred_img, neighbor_ids, frames, binary_masks, comp_frames):
+    """批量量化和逐帧 mask 合成；输入是 CPU FP32 NCHW 预测。"""
+    images = (pred_img.permute(0, 2, 3, 1).numpy() * 255).astype(np.uint8)
+    _composite_sttn(images, neighbor_ids, frames, binary_masks, comp_frames)
 
 
 class STTNDetInpaint:
@@ -346,7 +356,7 @@ class STTNDetInpaint:
                     _check_sttn_finite(pred_img, 'STTN non-finite output')
                     # 将张量移动回CPU并转为NumPy数组
                     with profiler.stage('download', device_work=True):
-                        pred_img = pred_img.float().cpu()
+                        pred_img = _download_sttn_prediction(pred_img)
                     with profiler.stage('postprocess'):
                         _postprocess_sttn(pred_img, neighbor_ids, frames, binary_masks, comp_frames)
         report = profiler.finish()
