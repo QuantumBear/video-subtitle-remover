@@ -640,3 +640,53 @@ reserved 从 `2.5 GiB` 降至 `2.048828125 GiB`（少 `462 MiB`）。后者在�
 显式三卷积基线、首层缓存开/关、检查点兼容、训练梯度及设备/精度迁移。
 真实 `sttn.pth` 在 CPU FP32、3 帧 `240×432` 下，默认合并与三卷积对照
 的最大/平均浮点像素差均为 `0`、精度回退为 `0`，八层均已准备合并权重。
+
+### CPU 后处理批量化独立 A/B
+
+在已默认合并 Q/K/V 的生产路径上，只比较窗口结果下载之后的 CPU 后处理：
+
+```bash
+python benchmarks/sttn_postprocess.py \
+  --device cuda --frames 50 --warmup 3 --repeats 5 --sessions 2 \
+  --output-dir benchmark_sttn_postprocess_01
+```
+
+默认真实 `sttn.pth`、FP16、首层 QKV 缓存开启、PyTorch 线程数 1。
+输出目录须不存在。每模式、每组使用独立进程，按 `legacy/batched`、
+`batched/legacy` 反转顺序，四个进程依次执行。两边均使用八层生产 QKV
+合并，关闭 `cudnn.benchmark`，其他后端设置必须一致。
+
+生产代码只把现有逐帧逻辑抽为 `_postprocess_sttn`，默认仍用原实现。
+基准在上下文中替换该函数，退出或异常时恢复。批量版在每个窗口内完成
+`*255 → uint8` 转换，堆叠逐帧 0/1 mask 和原帧，以 `np.copyto` 恢复
+未遮罩像素；跨窗口仍按原顺序执行 `old.float32 * 0.5 + new.float32 * 0.5`。
+不会把重叠预测改成平均值，也不延迟量化。模型、下载 FP32、有限值检查、
+精度回退、窗口、首层缓存和段外缩放合成均沿用生产路径。
+
+- `first_seconds` 与 `warm_median_seconds` 分列首次和正式热态，均为
+  前后同步的整带 wall。窗口内的批量转换、mask/帧堆叠及分配全部计入；
+  setup 只有函数包装，导入和模型加载另列。没有 profiler/CUDA Events。
+- `postprocess_calls` / `postprocess_frame_visits` 累计本进程全部计时带的
+  窗口数和处理帧次数，两边保留相同轻量计数。50 帧、步长 5 时每带
+  `10` 个窗口、`104` 帧次，默认九带总计应为 `90` 次调用、`936` 帧次。
+- GPU allocated/reserved 峰值每带重置，包含模型和 workspace；带间不清
+  allocator 缓存。`process_peak_rss_gib` 是进程启动以来的 CPU RSS 高水位，
+  包含导入、模型加载、所有带和输出比较；不能重置，也不代表单次后处理
+  分配量。`process_peak_rss_before_gib` 提供计时前高水位供对照。无 resource
+  的平台该值为 `null`，不能用 RSS 差值直接估算批量临时数组大小。
+  批量版会增加窗口级临时数组，首次写入 comp_frames 的帧视图还可能延长
+  整个窗口量化数组的生命周期，需结合实测评估内存代价。
+- 所有首次、预热和正式带都与首个独立 legacy 输出严格比较，保留浮点
+  递推结果，不额外转 uint8。像素差会保存完整报告后失败退出，速度字段
+  置 `null`；精度回退、非有限值或执行错误直接使 worker 失败。
+
+CPU 冒烟使用 `--device cpu --precision fp32`，速度字段为 `null`。
+真实权重 3 帧、预热 1 轮、正式 2 轮、每模式 1 个进程的 CPU 冒烟中，
+最大/平均像素差均为 `0`，无精度回退，八层均保持 QKV 合并。
+服务器需实测包含传输和合成的整带收益；此前 `band` self 还含 gather、
+有限值检查、传输及间隙，不能把它全部视为可节省的后处理时间。
+
+新增测试 `16 passed, 2 skipped`，覆盖量化边界、非连续输入、不同逐帧 mask、
+三次重叠递推、首层缓存开/关、正常及异常恢复、精度回退/非有限拒绝、
+独立进程反转顺序，以及注入小数像素差后先保存报告再失败。两项 CUDA
+整带测试因本机无 GPU 跳过。最终全量回归 `561 passed, 36 skipped`。

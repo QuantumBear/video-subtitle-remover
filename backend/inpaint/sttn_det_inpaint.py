@@ -33,6 +33,19 @@ def _preprocess_sttn(frames, masks):
     return feats, masks_tensor, binary_masks
 
 
+def _postprocess_sttn(pred_img, neighbor_ids, frames, binary_masks, comp_frames):
+    """原逐帧后处理；输入是已回传 CPU 的 FP32 NCHW 预测。"""
+    pred_img = pred_img.permute(0, 2, 3, 1).numpy() * 255
+    for i, idx in enumerate(neighbor_ids):
+        img = (pred_img[i].astype(np.uint8) * binary_masks[idx]
+               + frames[idx] * (1 - binary_masks[idx]))
+        if comp_frames[idx] is None:
+            comp_frames[idx] = img
+        else:
+            comp_frames[idx] = (comp_frames[idx].astype(np.float32) * 0.5
+                                + img.astype(np.float32) * 0.5)
+
+
 class STTNDetInpaint:
     def __init__(self, device, model_path, *, cache_first_qkv=True, profile=False,
                  precision=DEFAULT_STTN_PRECISION, fuse_qkv=True):
@@ -328,16 +341,7 @@ class STTNDetInpaint:
                     with profiler.stage('download', device_work=True):
                         pred_img = pred_img.float().cpu()
                     with profiler.stage('postprocess'):
-                        pred_img = pred_img.permute(0, 2, 3, 1).numpy() * 255
-                        # 遍历邻近帧
-                        for i in range(len(neighbor_ids)):
-                            idx = neighbor_ids[i]
-                            # 将预测的图片转换为无符号8位整数格式
-                            img = pred_img[i].astype(np.uint8) * binary_masks[idx] + frames[idx] * (1 - binary_masks[idx])
-                            if comp_frames[idx] is None:
-                                comp_frames[idx] = img
-                            else:
-                                comp_frames[idx] = comp_frames[idx].astype(np.float32) * 0.5 + img.astype(np.float32) * 0.5
+                        _postprocess_sttn(pred_img, neighbor_ids, frames, binary_masks, comp_frames)
         report = profiler.finish()
         if report is not None:
             report.update(frames=frame_length, windows=windows,
