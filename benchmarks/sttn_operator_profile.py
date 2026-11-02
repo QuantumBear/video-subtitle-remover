@@ -34,11 +34,9 @@ def model_ranges(model, *, range_context=None):
                (model, 'project_first_qkv', 'qkv_cache')]
     for block in model.transformer:
         attention = block.attention
+        targets.append((attention, 'project_qkv', 'qkv_projection'))
         targets.extend((module, 'forward', label) for module, label in (
             (attention, 'multihead'), (attention.attention, 'attention'),
-            (attention.query_embedding, 'qkv_projection'),
-            (attention.key_embedding, 'qkv_projection'),
-            (attention.value_embedding, 'qkv_projection'),
             (attention.output_linear, 'attention_output'),
             (block.feed_forward, 'feed_forward')))
     saved = []

@@ -119,6 +119,11 @@ class InpaintGenerator(BaseNetwork):
         """
         return self.transformer[0].attention.project_qkv(feat)
 
+    def prepare_fused_qkv(self):
+        """加载权重后准备各层推理投影，避免每个滑动窗口重复拼接。"""
+        for block in self.transformer:
+            block.attention.prepare_fused_qkv()
+
     def infer(self, feat, masks, qkv_cache=None):
         t, c, h, w = masks.size()
         masks = masks.view(t, c, h, w)
@@ -178,9 +183,45 @@ class MultiHeadedAttention(nn.Module):
             nn.Conv2d(d_model, d_model, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, inplace=True))
         self.attention = Attention()
+        # 推理缓存跟随 .to()，但不写入检查点，也不参与优化器参数列表。
+        self.register_buffer('_qkv_weight', None, persistent=False)
+        self.register_buffer('_qkv_bias', None, persistent=False)
+
+    def prepare_fused_qkv(self):
+        """保留原检查点的三个投影，额外准备 Q、K、V 顺序的推理权重。"""
+        layers = (self.query_embedding, self.key_embedding, self.value_embedding)
+        with torch.no_grad():
+            # requires_grad 的叶子张量保持原 Parameter 的 autocast 缓存条件；
+            # project_qkv 只在 eval 且无梯度时使用它们。
+            self._qkv_weight = torch.cat([layer.weight.detach() for layer in layers]).requires_grad_(
+                self.query_embedding.weight.requires_grad)
+            self._qkv_bias = torch.cat([layer.bias.detach() for layer in layers]).requires_grad_(
+                self.query_embedding.bias.requires_grad)
+
+    def train(self, mode=True):
+        if mode:
+            self._qkv_weight = self._qkv_bias = None
+        return super().train(mode)
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        # 子投影随后才装载；清掉旧缓存，调用方加载完成后再 prepare。
+        self._qkv_weight = self._qkv_bias = None
+        super()._load_from_state_dict(*args, **kwargs)
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        # Module 的 buffer 迁移可能产生非叶子张量，恢复 autocast 缓存条件。
+        for name in ('_qkv_weight', '_qkv_bias'):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, value.detach().requires_grad_(value.requires_grad))
+        return result
 
     def project_qkv(self, x):
         """返回当前特征的 Q/K/V 投影，供跨窗口缓存使用。"""
+        if self._qkv_weight is not None and not self.training and not torch.is_grad_enabled():
+            return F.conv2d(x, self._qkv_weight, self._qkv_bias).split(
+                self.query_embedding.out_channels, dim=1)
         return (
             self.query_embedding(x),
             self.key_embedding(x),

@@ -35,7 +35,7 @@ def _preprocess_sttn(frames, masks):
 
 class STTNDetInpaint:
     def __init__(self, device, model_path, *, cache_first_qkv=True, profile=False,
-                 precision=DEFAULT_STTN_PRECISION):
+                 precision=DEFAULT_STTN_PRECISION, fuse_qkv=True):
         if precision not in STTN_PRECISIONS:
             raise ValueError(f'未知 STTN precision: {precision}; 可选 {STTN_PRECISIONS}')
         self.device = torch.device(device)
@@ -53,6 +53,8 @@ class STTNDetInpaint:
         self.model.load_state_dict(torch.load(model_path, map_location='cpu')['netG'])
         # 3. # 将模型设置为评估模式
         self.model.eval()
+        if fuse_qkv:
+            self.model.prepare_fused_qkv()
         # 首层 Q/K/V 默认在同一 STTN 段内缓存；关闭后可用于回归和基准对比。
         self.cache_first_qkv = cache_first_qkv
         # 模型输入用的宽和高

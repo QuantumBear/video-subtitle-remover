@@ -63,7 +63,10 @@ def qkv_execution(model, *, mode):
                     return torch.nn.functional.conv2d(x, weight, bias).split(channels, dim=1)
 
             else:
-                target = previous
+                # 生产推理已默认合并，基线须显式执行原来的三个卷积。
+                def target(x, module=module):
+                    return (module.query_embedding(x), module.key_embedding(x),
+                            module.value_embedding(x))
 
             def project(x, target=target):
                 result = target(x)
@@ -128,7 +131,7 @@ def run_worker(options, mode, reference_path):
         raise RuntimeError('CUDA/cuDNN 不可用，不能做 GPU A/B')
     started = time.perf_counter()
     engine = STTNDetInpaint(device, options['model'], precision=options['precision'],
-                           cache_first_qkv=options['cache'] == 'on', profile=False)
+                           cache_first_qkv=options['cache'] == 'on', profile=False, fuse_qkv=False)
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
     load_seconds = time.perf_counter() - started

@@ -33,6 +33,7 @@ def small_engine():
     engine.model = InpaintGenerator(init_weights=False).eval()
     for block in engine.model.transformer:
         block.attention.patchsize = [(8, 8), (4, 4), (2, 2), (1, 1)]
+    engine.model.prepare_fused_qkv()
     engine.model_input_width = engine.model_input_height = 32
     engine.neighbor_stride, engine.ref_length = 2, 3
     engine.cache_first_qkv = True
@@ -200,7 +201,7 @@ def test_region_timing_does_not_need_torch_profiler_and_preserves_output(tmp_pat
     assert len(report['baseline_seconds']) == 2
     rows = {row['name']: row for row in report['regions']}
     assert rows['attention']['calls'] == 64  # 2 窗口 × 8 层 × 4 路。
-    assert rows['qkv_projection']['calls'] == 45  # 缓存3次 + 两窗口各21次。
+    assert rows['qkv_projection']['calls'] == 15  # 首层缓存1次 + 两窗口各7次投影。
     assert rows['transformer']['inclusive_host_ms'] > 0
     assert rows['feed_forward']['self_host_ms'] > 0
     if device == 'cuda':
