@@ -1215,3 +1215,105 @@ CPU 冒烟只验证工具，不输出速度比；合成修复带不能代替真�
 
 本轮全量回归 `637 passed, 55 skipped`，独立只读审查未发现需修复问题。
 本地测试及 CPU 冒烟不证明目标 CUDA 的数值一致性或布局收益。
+
+### Decoder 布局 GPU 结果：像素不一致，保持原布局
+
+用户提供的 `~/Downloads/report.json` 使用 RTX5880-Ada-24Q、PyTorch
+`2.11.0+cu128`、NumPy `2.2.5`、cuDNN `91900`，FP16、50 帧
+`240×432`、线程数 1、首层缓存和生产 uint8 下载。四个独立进程按
+`contiguous/channels-last`、`channels-last/contiguous` 执行，后端设置
+全部相同，每个进程首次 1、预热 3、正式 5 带，无精度回退。
+
+| 会话 | contiguous 热态中位数 | channels_last 热态中位数 |
+| --- | ---: | ---: |
+| 1 | 0.964842 s | 0.954088 s |
+| 2 | 0.979792 s | 1.373518 s |
+| 合并正式轮次 | 0.971907 s | 1.088815 s |
+
+两组 contiguous 的全部 18 带像素差均为 0；两组 channels_last 的
+全部 18 带最大像素差均为 `1.0`，每带平均差均为
+`7.695151748971193e-5`。顶层平均差 `3.8475758744855966e-5` 同时
+包含基线的零差异，不能将它视为候选单独的平均差。工具正确输出
+`outputs_match=false`，速度比和节时比例均为 `null`。
+
+四个进程均记录 decoder `90` 次调用、`936` 帧次、4 层卷积和 8 层
+QKV 融合，精度始终为 FP16。报告支持候选路径稳定偏离原输出，而非
+一次孤立差异；相同最大值和平均值不足以证明每轮差异坐标完全相同。
+布局变换可能改变卷积及上采样的执行实现，浮点误差再跨过 uint8 截断
+边界是合理解释，但本报告未保存量化前的逐阶段张量，尚不能确定具体
+算子及误差来源。数学等价不保证 FP16/CUDA 输出逐像素相同。
+
+第 2 组 channels_last 的正式轮次范围为 `1.212330–1.556447 s`，明显
+高于第 1 组的 `0.945057–0.965300 s`；随后 contiguous 也有
+`1.216473 / 1.291643 s` 的慢轮次。没有 GPU 频率、功耗或竞争负载
+遥测，不能确定波动原因，也不能将合并时差全部归因于布局。
+
+整带峰值 allocated 为 `1.653317 → 1.427135 GiB`，少约 `231.61 MiB`；
+reserved 为 `2.048828 → 1.828125 GiB`，少 `226 MiB`。这是整带
+模型/workspace/allocator 峰值，不是 decoder 单独显存或并发容量。
+布局准备中位数为 `0.037990 → 13.721726 ms`，单列于首次整带之外。
+
+本轮未通过严格像素一致性要求，也没有稳定的耗时收益，建议不采用
+decoder channels_last。生产保持原布局及全部数值检查，不放宽验收阈值。
+
+### 独立实验：Attention 输出直接写入拼接缓冲区
+
+下一项只改变四路 Attention 结果的整理和拼接。原实现每路先
+`permute().contiguous()` 得到连续 NCHW 张量，再用 `torch.cat(..., 1)`
+复制到输出卷积的输入。候选每次调用新建一份连续 NCHW 缓冲区，把各路
+重排视图直接复制到对应通道切片，省去逐路连续副本和最后的 cat。
+目标缓冲区使用实际 Attention 结果的 dtype/device，避免 autocast 下
+输入仍为 FP32、结果为 FP16 时改变输出卷积的入口类型。
+
+```bash
+python benchmarks/sttn_attention_output.py \
+  --device cuda --precision fp16 --cache on \
+  --frames 50 --warmup 3 --repeats 5 --sessions 2 --threads 1 \
+  --output-dir benchmark_sttn_attention_output_01
+```
+
+输出目录须不存在。默认四个独立顺序进程按 `cat/direct`、`direct/cat`
+执行，每个进程重新加载同一模型。基线调用原 MultiHeadedAttention；
+候选仅在基准实例上替换 forward，正常或异常退出都恢复原方法，保留
+既有实例覆盖和参数身份，不修改生产源码或默认行为。
+
+- Q/K/V 投影、输入重排、缩放、矩阵乘、softmax、输出卷积均保持原样。
+  八层 QKV 融合、首层缓存、完整末层、decoder 原布局、立即有限值检查、
+  批量合成和当前 CUDA uint8 下载也不变；CPU 继续 FP32 下载。
+- 缓冲区每次调用重新分配，不跨窗口复用。分配、切片、带 stride 的
+  分支复制和两模式相同的轻量计数都在同步整带 wall 内；setup 只安装
+  方法包装，不提前准备输出缓冲区。不假定去掉 cat 就能缩短整带耗时。
+- `multihead_calls`、`multihead_frame_visits`、`attention_branch_calls`
+  包含首次、预热和正式带；默认每进程应为 `720`、`10080`、`2880`。
+  基线 `output_cat_calls=720`，候选 `direct_branch_copy_calls=2880`，
+  另一模式对应字段为 0。它们是 Python 路径计数，不是实测 kernel、
+  allocator 调用、FLOPs 或显存流量。
+- 两模式均关闭 cuDNN benchmark。正式 A/B 不使用 profiler/CUDA Events，
+  带前后同步、每带重置 GPU 峰值，带间不执行 `empty_cache()`。峰值包括
+  模型、workspace 和 allocator 状态，不能视为 Attention 单独占用。
+  首次整带不含导入、加载和包装，包含剩余惰性初始化。
+- 所有阶段与第一份独立 cat 参考逐像素严格比较，保留浮点合成值，
+  不再转 uint8 掩盖差异。像素差异使速度字段为 `null`，保存报告后
+  失败退出；精度回退、非有限值或执行异常使 worker 失败并保留日志。
+
+CPU 冒烟只验证工具，不输出速度比；合成修复带不能代替真实视频质量、
+吞吐或并发容量验收。生产保持原拼接路径，CUDA 的一致性和收益待实测。
+
+本地真实 `sttn.pth` CPU FP32 冒烟使用 3 帧 `240×432`，每模式一个
+独立进程、首次和正式各一带。全部四带输出最大/平均差均为 `0`，无精度
+回退，速度字段均为 `null`。每进程记录 8 个 Attention、8 层 QKV 融合，
+`16` 次调用、`48` 帧次和 `64` 路 Attention；本例帧数未超过步幅，
+首层缓存未激活，缓存路径另由专项整带用例覆盖。
+
+专项回归为 `23 passed, 2 skipped`，覆盖多 batch、矩形 patch、非连续
+输入、独立/融合/缓存 QKV、卷积入口逐值/stride/dtype 一致、权重与方法
+恢复、缓存开/关、当前下载类型、干净像素及输入保护，以及四个独立反转
+进程中小数像素差落盘后失败。仅结构测试使用 profiler 确认原路径有
+一个输出 cat、候选为零，正式 A/B 不使用 profiler。两项 CUDA FP16
+整带测试因本机无 GPU 跳过。本机另用 CPU BF16 autocast 验证输入仍为
+FP32 时，候选输出缓冲区保持低精度结果的类型、值与 stride，不发生
+隐式提升。独立只读审查未发现需修复的问题。
+
+全量回归为 `659 passed, 57 skipped`；上述补充的 CPU autocast 用例在
+全量采集后加入，已单独通过并包含在最终专项结果中。本机验证不证明
+目标 CUDA 的数值一致性或速度收益，需使用上面的命令在服务器实测。
