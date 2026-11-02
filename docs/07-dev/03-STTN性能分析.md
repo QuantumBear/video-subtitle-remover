@@ -1156,3 +1156,62 @@ uint8 会掩盖非有限值而省略。设备量化不新增 clamp/round，不�
 不重复量化、历史 FP32 对照不随默认值漂移、量化/下载错误后的完整重试
 以及 OOM 不重试；CUDA 整带对照同时覆盖 FP16/FP32、缓存开/关，但本机
 无 CUDA，相关用例跳过。
+
+### 独立实验：仅 decoder 使用 channels_last
+
+量化下载接入后，下一项只验证 decoder 的内存布局。此前第二轮 CUDA
+Event 中 decoder 区间约 `155 ms`；这是含提交间隙的 stream 区间，且测于
+量化下载接入前，不能当作本项可节省时间。已有 FFN channels_last 实验
+没有收益，decoder 的连续卷积和两次上采样仍需独立验证。
+
+新增工具：
+
+```bash
+python benchmarks/sttn_decoder_layout.py \
+  --device cuda --precision fp16 --cache on \
+  --frames 50 --warmup 3 --repeats 5 --sessions 2 --threads 1 \
+  --output-dir benchmark_sttn_decoder_layout_01
+```
+
+输出目录须不存在。默认四个独立顺序进程按
+`contiguous/channels-last`、`channels-last/contiguous` 执行，每个进程重新
+加载同一模型。两模式都关闭 cuDNN benchmark，沿用生产八层 QKV 合并、
+首层缓存、完整末层、立即有限值检查、批量 CPU 合成和 CUDA uint8 下载。
+
+- 基线直接调用原 decoder；候选只把 decoder 的四层 Conv2d 权重预先转为
+  `torch.channels_last`。每窗输入转入该布局，decoder 输出转回连续 NCHW，
+  然后进入原有限值检查、tanh、归一化与下载。两次 bilinear 上采样及
+  `align_corners=True` 不变，不改变精度、窗口、mask 或递推混合。
+- 权重转换的同步时间单列为 `layout_setup_seconds`，同时记录 setup 的
+  allocated/reserved 峰值。每窗输入、输出布局转换都在整带 wall 内；
+  权重布局恢复位于带计时之后。上下文只保存原 stride，不长期保留额外
+  GPU 权重副本；正常和异常退出都恢复原权重布局及已有实例 forward。
+- 两模式均保留轻量 `decoder_calls`、`decoder_frame_visits` 计数。默认
+  首次 1、预热 3、正式 5 带累计应为 `90` 次调用、`936` 帧次；它们不是
+  GPU kernel 次数或 FLOPs。
+- 首次整带不含导入、模型加载和权重布局准备，包含剩余惰性初始化。
+  正式 A/B 不使用 profiler/CUDA Events，整带前后同步；每带重置 GPU
+  峰值，不在带间执行 `empty_cache()`。峰值包含模型、workspace 和
+  allocator 状态，不能视为 decoder 单独占用。
+- 所有首次、预热、正式输出均以浮点合成值与第一份独立 contiguous
+  参考比较，不再转 uint8 掩盖差异。像素差异会让速度字段为 `null`，
+  保存 `report.json` 后失败退出。精度回退、非有限值或执行错误会让
+  worker 失败，保留日志，不把失败路径算作性能收益。
+
+CPU 冒烟只验证工具，不输出速度比；合成修复带不能代替真实视频质量、
+吞吐或并发容量验收。生产 decoder 布局保持原样，目标 GPU 结果待实测。
+
+本地真实 `sttn.pth` CPU FP32 冒烟使用 3 帧 `240×432`、每模式一个
+独立进程、首次和正式各一带。contiguous 输出一致；channels_last 对照
+出现最大像素差 `1.0`、平均差约 `1.07e-6`。工具保存报告后失败退出，
+速度字段均为 `null`。布局改变可影响浮点实现及 uint8 边界，本次 CPU
+结果不推断 CUDA 的差异或收益，也不放宽后续 GPU 的严格比较标准。
+
+新增专项回归为 `15 passed, 2 skipped`，覆盖只修改 decoder、两模式调用
+计数、输入输出布局、原参数身份及 stride/forward 恢复、缓存开/关、
+当前下载 dtype、干净像素和输入保护、精度回退/非有限/执行异常拒绝，
+以及四个独立反转进程中的小数像素差落盘。两项 CUDA FP16 整带用例
+因本机无 GPU 跳过。
+
+本轮全量回归 `637 passed, 55 skipped`，独立只读审查未发现需修复问题。
+本地测试及 CPU 冒烟不证明目标 CUDA 的数值一致性或布局收益。
