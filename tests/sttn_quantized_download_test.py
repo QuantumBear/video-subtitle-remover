@@ -52,7 +52,6 @@ def band():
 @pytest.mark.parametrize('device', DEVICES)
 @pytest.mark.parametrize('dtype', ['fp16', 'fp32'])
 def test_quantization_boundaries_match_numpy_without_mutating_strided_input(device, dtype):
-    from benchmarks import sttn_quantized_download as benchmark
     if dtype == 'fp16':
         # 穷举 [0, 1] 内所有正 FP16 位模式，包括次正规数。
         values = np.arange(0x3c01, dtype=np.uint16).view(np.float16)
@@ -65,7 +64,7 @@ def test_quantization_boundaries_match_numpy_without_mutating_strided_input(devi
     assert not prediction.is_contiguous()
     before = prediction.clone()
     expected = (prediction.float().cpu().numpy() * 255).astype(np.uint8)
-    actual = benchmark.quantized_download(prediction)
+    actual = sttn_det_inpaint._quantize_sttn_prediction(prediction)
     assert actual.dtype == torch.uint8 and actual.device.type == 'cpu'
     assert actual.shape == prediction.shape
     np.testing.assert_array_equal(actual.numpy(), expected)
@@ -104,13 +103,15 @@ def test_context_restores_both_helpers_on_success_or_error(mode, raise_inside):
     assert sttn_det_inpaint._postprocess_sttn is process
 
 
-@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('device,precision', [('cpu', 'fp32'),
+    pytest.param('cuda', 'fp32', marks=pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')),
+    pytest.param('cuda', 'fp16', marks=pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA'))])
 @pytest.mark.parametrize('cached', [False, True])
-def test_band_keeps_default_fp32_download_and_matches_quantized_path(engine, monkeypatch, device, cached):
+def test_band_uses_uint8_on_cuda_and_matches_frozen_fp32_path(engine, monkeypatch, device, precision, cached):
     from benchmarks import sttn_quantized_download as benchmark
     engine.device = torch.device(device)
     engine.model.to(engine.device)
-    engine.precision = engine.requested_precision = 'fp16' if device == 'cuda' else 'fp32'
+    engine.precision = engine.requested_precision = precision
     engine.cache_first_qkv = cached
     frames, masks = band()
     originals = [item.copy() for item in frames + masks]
@@ -124,7 +125,7 @@ def test_band_keeps_default_fp32_download_and_matches_quantized_path(engine, mon
     with monkeypatch.context() as patch:
         patch.setattr(sttn_det_inpaint, '_postprocess_sttn', observe)
         default_output = engine.inpaint(frames, masks)
-    assert dtypes == [(torch.float32, 'cpu')] * 3
+    assert dtypes == [(torch.uint8 if device == 'cuda' else torch.float32, 'cpu')] * 3
     baseline, reference = benchmark.measure_download(engine, frames, masks, mode='fp32',
                                                      warmup=0, repeats=1)
     selected, returned = benchmark.measure_download(engine, frames, masks, mode='uint8',
@@ -150,6 +151,80 @@ def test_band_keeps_default_fp32_download_and_matches_quantized_path(engine, mon
         np.testing.assert_array_equal(actual[mask == 0], frame[mask == 0])
     for item, before in zip(frames + masks, originals):
         np.testing.assert_array_equal(item, before)
+
+
+def test_production_uint8_postprocess_does_not_quantize_again():
+    frames = [np.full((1, 2, 3), 123, dtype=np.uint8)]
+    masks = [np.array([[[1], [0]]], dtype=np.uint8)]
+    composites = [None]
+    for value, expected in [(20, 20), (41, 30.5), (80, 55.25)]:
+        prediction = torch.full((1, 3, 1, 2), value, dtype=torch.uint8)
+        sttn_det_inpaint._postprocess_sttn(prediction, [0], frames, masks, composites)
+        np.testing.assert_array_equal(composites[0][0, 0], [expected] * 3)
+        np.testing.assert_array_equal(composites[0][0, 1], [123] * 3)
+
+
+@pytest.mark.parametrize('failure', ['kernel', 'oom'])
+def test_download_error_keeps_whole_band_retry_and_oom_policy(engine, monkeypatch, failure):
+    from benchmarks.sttn_quantized_download import download_execution
+    frames, masks = band()
+    with download_execution(mode='fp32'):
+        expected = np.stack(engine.inpaint(frames, masks))
+    engine.precision = engine.requested_precision = 'fp16'
+    attempts = []
+
+    @contextmanager
+    def autocast(precision):
+        attempts.append(precision)
+        yield
+
+    monkeypatch.setattr(engine, '_autocast_context', autocast)
+    downloads = 0
+
+    def fail_second_download(prediction):
+        nonlocal downloads
+        downloads += 1
+        if downloads == 1:
+            return torch.zeros_like(prediction, device='cpu', dtype=torch.uint8)
+        if downloads == 2:
+            if failure == 'oom':
+                raise torch.cuda.OutOfMemoryError('injected quantization OOM')
+            raise RuntimeError('injected quantization kernel failure')
+        return sttn_det_inpaint._quantize_sttn_prediction(prediction)
+
+    monkeypatch.setattr(sttn_det_inpaint, '_download_sttn_prediction', fail_second_download)
+    if failure == 'oom':
+        with pytest.raises(torch.cuda.OutOfMemoryError, match='quantization OOM'):
+            engine.inpaint(frames, masks)
+        assert attempts == ['fp16'] and engine.precision_fallbacks == 0
+    else:
+        actual = np.stack(engine.inpaint(frames, masks))
+        assert attempts == ['fp16', 'fp32'] and engine.precision_fallbacks == 1
+        assert downloads == 5
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize('benchmark_name', ['sttn_quantized_download', 'sttn_postprocess', 'sttn_finite_sync'])
+def test_historical_fp32_paths_survive_a_changed_production_download(engine, monkeypatch, benchmark_name):
+    from importlib import import_module
+    benchmark = import_module(f'benchmarks.{benchmark_name}')
+    # CPU 上模拟生产下载默认已量化，验证各基准的 FP32 对照不随默认值漂移。
+    def quantized(prediction):
+        return (prediction.float() * 255).to(torch.uint8).cpu()
+
+    monkeypatch.setattr(sttn_det_inpaint, '_download_sttn_prediction', quantized)
+    prediction = torch.full((1, 3, 1, 1), 20.75 / 255)
+    if benchmark_name == 'sttn_quantized_download':
+        context = benchmark.download_execution(mode='fp32')
+    elif benchmark_name == 'sttn_postprocess':
+        context = benchmark.postprocess_execution(mode='legacy')
+    else:
+        context = benchmark.finite_execution(engine, mode='immediate')
+    with context:
+        downloaded = sttn_det_inpaint._download_sttn_prediction(prediction)
+        assert downloaded.dtype == torch.float32
+        np.testing.assert_array_equal(downloaded.numpy(), prediction.numpy())
+    assert sttn_det_inpaint._download_sttn_prediction is quantized
 
 
 @pytest.mark.parametrize('failure', ['decoder_inf', 'decoder_nan', 'prediction_nan'])

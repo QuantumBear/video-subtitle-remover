@@ -39,8 +39,15 @@ def _check_sttn_finite(tensor, message):
         raise RuntimeError(message)
 
 
+def _quantize_sttn_prediction(pred_img):
+    """以 FP32 乘 255 后截断，回传 uint8 NCHW；不原地修改预测。"""
+    return (pred_img.float() * 255).to(torch.uint8).cpu()
+
+
 def _download_sttn_prediction(pred_img):
-    """按生产默认路径回传 FP32 NCHW 预测。"""
+    """CUDA 默认量化后回传；CPU 保持 FP32 交给 NumPy 量化。"""
+    if pred_img.device.type == 'cuda':
+        return _quantize_sttn_prediction(pred_img)
     return pred_img.float().cpu()
 
 
@@ -60,8 +67,10 @@ def _composite_sttn(images, neighbor_ids, frames, binary_masks, comp_frames):
 
 
 def _postprocess_sttn(pred_img, neighbor_ids, frames, binary_masks, comp_frames):
-    """批量量化和逐帧 mask 合成；输入是 CPU FP32 NCHW 预测。"""
-    images = (pred_img.permute(0, 2, 3, 1).numpy() * 255).astype(np.uint8)
+    """合成 CPU NCHW 预测；CUDA 已量化的 uint8 不再重复量化。"""
+    images = pred_img.permute(0, 2, 3, 1).numpy()
+    if pred_img.dtype != torch.uint8:
+        images = (images * 255).astype(np.uint8)
     _composite_sttn(images, neighbor_ids, frames, binary_masks, comp_frames)
 
 

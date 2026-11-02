@@ -1,7 +1,7 @@
 """独立进程比较 STTN 有限值检查立即读取与预测下载后读取。
 
 生产仍立即检查；实验保留两次 GPU reduction，将两个 bool 异步拷到 pinned
-CPU 缓冲区，由原预测 .float().cpu() 等待后读取。父进程只用标准库。
+CPU 缓冲区，由冻结的原预测 .float().cpu() 等待后读取。父进程只用标准库。
 """
 
 import argparse
@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from benchmarks.sttn_cudnn_benchmark import backend_settings, measure_mode
+from benchmarks.sttn_quantized_download import fp32_download
 
 
 @contextmanager
@@ -40,6 +41,7 @@ def finite_execution(engine, *, mode):
                  pinned_flag_bytes=2 if deferred and cuda else 0)
     previous_check = sttn_det_inpaint._check_sttn_finite
     previous_post = sttn_det_inpaint._postprocess_sttn
+    previous_download = sttn_det_inpaint._download_sttn_prediction
     pending = []
     pending_stream = None
 
@@ -82,7 +84,7 @@ def finite_execution(engine, *, mode):
                 raise RuntimeError('必须在原预测 CPU 下载完成后验证两项检查')
             if cuda and torch.cuda.current_stream(engine.device) != pending_stream:
                 raise RuntimeError('检查标志与预测下载必须使用同一 stream')
-            # 生产 .float().cpu() 已等待同 stream 的两次标志拷贝，无需新增同步。
+            # 冻结的 FP32 下载已等待同 stream 的两次标志拷贝，无需新增同步。
             values = flags.tolist()
             pending_stream = None
             pending.clear()
@@ -94,12 +96,15 @@ def finite_execution(engine, *, mode):
 
     sttn_det_inpaint._check_sttn_finite = check
     sttn_det_inpaint._postprocess_sttn = postprocess
+    # 保持历史实验语义：先读有限值标志，再在 CPU 量化，避免坏值先转 uint8。
+    sttn_det_inpaint._download_sttn_prediction = fp32_download
     try:
         yield state
     finally:
         # 先恢复函数，即使 CUDA 在错误收尾中抛错也不泄漏全局替换。
         sttn_det_inpaint._check_sttn_finite = previous_check
         sttn_det_inpaint._postprocess_sttn = previous_post
+        sttn_det_inpaint._download_sttn_prediction = previous_download
         drain()
 
 
@@ -253,7 +258,7 @@ def main(argv=None):
             'Fresh sequential processes per mode/session; production fused QKV, batched CPU postprocess and cuDNN benchmark=false.',
             'Both modes keep decoder and normalized prediction finite reductions; only host reading time changes.',
             'Deferred mode enqueues two non-blocking bool copies into a reusable pinned CPU buffer on the current stream.',
-            'Original prediction float().cpu() is unchanged and waits for those copies; flags are read before quantization/compositing.',
+            'Both modes freeze the historical prediction float().cpu() download and wait for flag copies; flags are read before quantization/compositing.',
             'Pinned buffer payload is two bytes, not its allocator page footprint; allocation is setup, copies and validation are inside timed bands.',
             'No added synchronize in successful timed windows; aborted pending copies are drained only during retry/context cleanup.',
             'early_scalar_reads and flag_d2h_copies are path counters, not measured CUDA synchronization or kernel counts.',

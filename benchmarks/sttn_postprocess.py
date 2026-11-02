@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from benchmarks.sttn_cudnn_benchmark import backend_settings, measure_mode
+from benchmarks.sttn_quantized_download import fp32_download
 
 
 def legacy_postprocess(pred_img, neighbor_ids, frames, binary_masks, comp_frames):
@@ -44,6 +45,7 @@ def postprocess_execution(*, mode):
     if mode not in ('legacy', 'batched'):
         raise ValueError(f'未知后处理模式: {mode}')
     previous = sttn_det_inpaint._postprocess_sttn
+    previous_download = sttn_det_inpaint._download_sttn_prediction
     target = legacy_postprocess if mode == 'legacy' else previous
     state = dict(postprocess_calls=0, postprocess_frame_visits=0)
 
@@ -53,10 +55,13 @@ def postprocess_execution(*, mode):
         state['postprocess_frame_visits'] += len(ids)
 
     sttn_det_inpaint._postprocess_sttn = process
+    # 历史实验只比较 CPU 后处理，固定 FP32 下载以免重复量化 uint8。
+    sttn_det_inpaint._download_sttn_prediction = fp32_download
     try:
         yield state
     finally:
         sttn_det_inpaint._postprocess_sttn = previous
+        sttn_det_inpaint._download_sttn_prediction = previous_download
 
 
 def process_peak_rss_gib():
@@ -221,7 +226,7 @@ def main(argv=None):
         mean_pixel_difference=statistics.mean(row['mean_pixel_difference'] for row in sessions),
         timing_notes=[
             'Fresh sequential processes per mode/session; both use production fused QKV and cuDNN benchmark=false.',
-            'Only the CPU postprocess helper changes; tensors are downloaded as FP32 using the production path.',
+            'Only the CPU postprocess helper changes; both modes freeze the historical FP32 download path.',
             'Batched mode quantizes the window before applying per-frame binary masks; recursive 0.5 mixing order is unchanged.',
             'Batched NumPy allocations, frame/mask stacking, conversion and compositing are inside synchronized band wall.',
             'Setup only wraps the helper; first band excludes model loading and setup, includes remaining lazy initialization.',

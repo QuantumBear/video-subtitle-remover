@@ -21,17 +21,16 @@ sys.path.insert(0, str(ROOT))
 from benchmarks.sttn_cudnn_benchmark import backend_settings, measure_mode
 
 
+def fp32_download(prediction):
+    """冻结接入前的下载路径，不随生产默认 dtype 改变。"""
+    return prediction.float().cpu()
+
+
 def quantized_download(prediction):
-    """先转 FP32 再乘 255/截断为 uint8，保持 NCHW 布局与原预测不变。"""
-    import torch
+    """使用生产量化实现，CPU 模式也可验证工具与数值。"""
+    from backend.inpaint.sttn_det_inpaint import _quantize_sttn_prediction
 
-    return (prediction.float() * 255).to(torch.uint8).cpu()
-
-
-def quantized_postprocess(prediction, ids, frames, masks, composites):
-    from backend.inpaint.sttn_det_inpaint import _composite_sttn
-
-    _composite_sttn(prediction.permute(0, 2, 3, 1).numpy(), ids, frames, masks, composites)
+    return _quantize_sttn_prediction(prediction)
 
 
 @contextmanager
@@ -43,7 +42,7 @@ def download_execution(*, mode):
         raise ValueError(f'未知下载模式: {mode}')
     previous_download = sttn_det_inpaint._download_sttn_prediction
     previous_process = sttn_det_inpaint._postprocess_sttn
-    target = previous_download if mode == 'fp32' else quantized_download
+    target = fp32_download if mode == 'fp32' else quantized_download
     state = dict(download_calls=0, download_frame_visits=0, download_payload_bytes=0)
 
     def download(prediction):
@@ -54,7 +53,6 @@ def download_execution(*, mode):
         return result
 
     sttn_det_inpaint._download_sttn_prediction = download
-    sttn_det_inpaint._postprocess_sttn = previous_process if mode == 'fp32' else quantized_postprocess
     try:
         yield state
     finally:
