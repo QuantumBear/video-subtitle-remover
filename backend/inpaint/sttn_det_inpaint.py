@@ -33,6 +33,12 @@ def _preprocess_sttn(frames, masks):
     return feats, masks_tensor, binary_masks
 
 
+def _check_sttn_finite(tensor, message):
+    """生产路径立即读取检查结果；独立基准可替换此边界。"""
+    if not torch.isfinite(tensor).all().item():
+        raise RuntimeError(message)
+
+
 def _postprocess_sttn(pred_img, neighbor_ids, frames, binary_masks, comp_frames):
     """批量量化和逐帧 mask 合成；输入是 CPU FP32 NCHW 预测。"""
     images = (pred_img.permute(0, 2, 3, 1).numpy() * 255).astype(np.uint8)
@@ -334,12 +340,10 @@ class STTNDetInpaint:
                     # 将预测的特征通过解码器生成图片，并应用激活函数tanh
                     with profiler.stage('decoder', device_work=True):
                         decoded = self.model.decoder(pred_feat[:len(neighbor_ids), :, :, :])
-                        if not torch.isfinite(decoded).all().item():
-                            raise RuntimeError('STTN non-finite decoder output')
+                        _check_sttn_finite(decoded, 'STTN non-finite decoder output')
                         pred_img = torch.tanh(decoded)
                         pred_img = (pred_img + 1) / 2
-                    if not torch.isfinite(pred_img).all().item():
-                        raise RuntimeError('STTN non-finite output')
+                    _check_sttn_finite(pred_img, 'STTN non-finite output')
                     # 将张量移动回CPU并转为NumPy数组
                     with profiler.stage('download', device_work=True):
                         pred_img = pred_img.float().cpu()

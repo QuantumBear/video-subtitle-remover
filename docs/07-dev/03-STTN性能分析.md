@@ -732,3 +732,61 @@ CPU RSS 生命周期峰值分别落在 `1.814041–1.828205 GiB` 和
 
 接入后全量回归为 `562 passed, 36 skipped`。后处理测试为
 `17 passed, 2 skipped`；其中两项 CUDA 整带测试因本机无 GPU 跳过。
+
+### 有限值检查延后读取独立 A/B
+
+后处理批量化后，下一项仅验证数值检查的主机等待能否与现有预测回传共用。
+每窗口原有两次 `torch.isfinite(...).all().item()`，分别检查 decoder 原始
+输出及 `tanh`、归一化后的预测；50 帧、步长 5 时每带 10 窗，共 20 次
+标量读取。这是代码路径次数，不能据此认定发生 20 次互不重叠的 GPU 等待，
+或把此前 `band` self 的全部时间归给它们。
+
+```bash
+python benchmarks/sttn_finite_sync.py \
+  --device cuda --frames 50 --warmup 3 --repeats 5 --sessions 2 \
+  --output-dir benchmark_sttn_finite_sync_01
+```
+
+默认真实 `sttn.pth`、FP16、线程数 1、首层缓存、八层 QKV 合并及批量 CPU
+后处理开启，`cudnn.benchmark=false`。输出目录须不存在。每模式、每组使用
+独立进程，按 `immediate/deferred`、`deferred/immediate` 顺序依次执行。
+
+- `immediate` 沿用生产立即读取。生产只抽出 `_check_sttn_finite` 函数边界，
+  默认行为、检查位置及报错不变，不新增生产配置开关。
+- `deferred` 保留两个原始张量的 `isfinite().all()`，分别将 bool 结果以
+  `non_blocking=True` 拷到同一当前 CUDA stream 上的 pinned CPU 缓冲区。
+  原有 `pred_img.float().cpu()` 完全不改；它的阻塞下载等待前面两项标志拷贝
+  完成，再于后处理入口读取，任何失败均先于量化与合成抛出原异常。
+- 缓冲区一次准备、按窗口复用。`pinned_flag_bytes=2` 仅表示两个 bool 的
+  有效载荷，不代表 pinned allocator 实际页占用。标志源张量保持存活到下载
+  完成；若执行异常导致下载未发生，在重试复用或上下文退出时等待未完成拷贝。
+  正常计时窗口不增加显式同步，不支持单窗口中途切换 stream 或并发调用。
+- decoder 的 `Inf` 可被 `tanh` 饱和为有限值，因此不能只检查归一化预测。
+  实验延迟读取两项原检查，保留 decoder 错误优先级、坏窗口拒绝和 FP32
+  整带重算；更晚发现坏 decoder 时可能多做激活与下载，不发布该窗口结果。
+- `decoder_checks`、`prediction_checks`、`completed_windows` 累计进程内所有
+  计时带；默认九带均应为 `90`。`early_scalar_reads` 应为 `180/0`，CUDA
+  `flag_d2h_copies` 应为 `0/180`，前者是原标量读取路径计数，后者是新标志
+  拷贝路径计数，均不是实测同步次数或 kernel 数。两模式均保留轻量计数。
+- 固定标志缓冲区准备计入 `setup_seconds`；两次 reduction、标志拷贝、验证、
+  原模型、下载、量化和合成都在整带 wall 内。首次仍含其余惰性初始化，
+  模型加载与导入另列。逐带前后同步并重置 allocated/reserved 峰值，不清
+  allocator 缓存，不使用 profiler/CUDA Events 做正式计时。
+- 所有首次、预热及正式输出均与首个独立 immediate 参考逐像素比较，保留
+  浮点递推结果。像素差使速度字段为 `null`，保存完整报告后失败退出；
+  精度回退、非有限值或执行异常直接使 worker 失败。CPU 使用
+  `--device cpu --precision fp32` 只验证工具，速度字段为 `null`。
+
+GPU 整带收益待服务器实测；本机没有 CUDA。合成带结果仍不能外推为真实
+视频端到端收益或并发容量。
+
+本机真实 `sttn.pth` CPU FP32 冒烟使用 3 帧 `240×432`、预热 1 轮、正式
+2 轮，每模式各一个独立进程。所有阶段最大/平均浮点像素差均为 `0`，
+精度回退为 `0`，八层 QKV 合并保持启用；CPU 速度字段为 `null`。
+
+全量回归为 `577 passed, 44 skipped`，新增本项测试 `15 passed, 8 skipped`。
+覆盖原始 decoder `Inf/NaN`、归一化预测非有限值、第二窗失败后的整带重试、
+标志已提交而激活失败后的缓冲复用、缓存开/关、输入不变、异常恢复、
+独立进程反转顺序及小数像素差拒绝。八项 CUDA 场景因本机无 GPU 跳过，
+包括同 stream 标志拷贝、非默认 stream 的完整带以及无设备标量读取检查；
+因此当前本地验证不证明 CUDA 路径正确性或收益，服务器执行仍为必要步骤。
