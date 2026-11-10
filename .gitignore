@@ -384,5 +384,8 @@ test_openai_client.sh
 # 本地 GroundingDINO 贴纸检测权重
 /backend/models/grounding-dino-tiny/model.safetensors
 
+# 本地 SAM3 权重与官方源码（通过路径配置，避免将大模型/外部仓库提交）
+/backend/models/sam3/
+
 # Superpowers isolated worktrees
 /.worktrees/

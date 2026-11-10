@@ -2,10 +2,10 @@
 """VSR 生产流水线:实测验证的去字幕最佳流程,作为对外服务的处理核心。
 
 流程:
-  1. PaddleOCR 按检测反馈调整采样间隔，物化独立的逐帧字幕轨迹
-  2. 可选贴纸定位(DashScope VLM 或本地 GroundingDINO)，经时间/空间关联后生成独立遮罩
+  1. 旧后端用 PaddleOCR 自适应抽帧＋可选贴纸检测；SAM3 后端逐帧生成统一 mask
+  2. SAM3 mask 保留分割轮廓；旧后端物化独立字幕/贴纸轨迹
   3. LAMA 单帧、ProPainter 分段或 STTN 带级修复，受限白字残留复核
-     (字形级遮罩与残留复核仅 ProPainter/LAMA 适用;STTN 走整框矩形遮罩)
+     (STTN 旧后端使用矩形遮罩，SAM3 后端直接使用逐帧分割遮罩)
   4. 合回源音频；最终画质仍需关键帧验收
 
 与 backend/main.py 的区别:
@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from bisect import bisect_right
 from collections import deque
@@ -379,7 +380,20 @@ class Pipeline:
                  sticker_backend=DEFAULT_STICKER_BACKEND, sticker_model_id=None,
                  sttn_profile=False, sttn_precision='fp16', sticker_profile=False,
                  sticker_batch_size=sticker_detect.DEFAULT_BATCH_SIZE,
-                 sticker_precision=sticker_detect.DEFAULT_PRECISION):
+                 sticker_precision=sticker_detect.DEFAULT_PRECISION,
+                 mask_backend='legacy', sam3_checkpoint=None, sam3_code_dir=None,
+                 sam3_prompts=None, sam3_score=0.5, sam3_dilate=0):
+        if mask_backend not in ('legacy', 'sam3'):
+            raise ValueError(f'未知 mask_backend: {mask_backend}')
+        if mask_backend == 'sam3' and inpaint_mode != 'sttn':
+            raise ValueError('SAM3 mask 当前仅支持 STTN（含 ProPainter 残留补修）')
+        if not 0 < sam3_score < 1 or not isinstance(sam3_dilate, int) or sam3_dilate < 0:
+            raise ValueError('SAM3 score 必须介于 0 和 1，dilate 必须为非负整数')
+        self.mask_backend = mask_backend
+        self._sam3_options = dict(code_dir=sam3_code_dir, device=device,
+                                  prompts=sam3_prompts, score=sam3_score, dilate=sam3_dilate)
+        if sam3_checkpoint is not None:
+            self._sam3_options['checkpoint'] = sam3_checkpoint
         if sticker_precision not in sticker_detect.PRECISIONS:
             raise ValueError(f'未知 sticker_precision: {sticker_precision}')
         if threads:
@@ -399,16 +413,17 @@ class Pipeline:
         self._sticker_model_id = sticker_model_id
         # 贴纸检测器惰性加载:关闭贴纸层或走 VLM 后端时不应付出权重加载成本
         self._sticker_detector = None
-        print(f'[init] 加载 OCR 检测模型: {det_model_dir}')
-        from paddleocr import TextDetection
-        # OCR 固定 CPU:占比小(~13%),不值得为它装 paddle-gpu
-        self.ocr = TextDetection(
-            model_name=det_model_name,
-            model_dir=det_model_dir,
-            device='cpu',
-            enable_hpi=False,
-        )
-        cuda_memory_snapshot('after OCR init')
+        self.ocr = None
+        if mask_backend == 'legacy':
+            print(f'[init] 加载 OCR 检测模型: {det_model_dir}')
+            from paddleocr import TextDetection
+            # OCR 固定 CPU:占比小(~13%),不值得为它装 paddle-gpu
+            self.ocr = TextDetection(
+                model_name=det_model_name, model_dir=det_model_dir,
+                device='cpu', enable_hpi=False)
+            cuda_memory_snapshot('after OCR init')
+        else:
+            print('[init] SAM3 统一 mask；不加载 OCR 或贴纸检测器')
         if inpaint_mode == 'lama':
             print(f'[init] 加载 LAMA: {lama_pt}')
             self.inpainter = LamaEngine(lama_pt, device='cpu')
@@ -913,7 +928,20 @@ class Pipeline:
         print(f'[auto-region] 采样检出 {len(boxes_all)} 框 → region: {(ymin, ymax, xmin, xmax)}')
         return (ymin, ymax, xmin, xmax)
 
-    def process_video(self, input_path, output_path, region=None,
+    def process_video(self, input_path, output_path, *args, **kwargs):
+        """处理视频；SAM3 的逐帧 mask 临时缓存随成功或异常退出清理。"""
+        if getattr(self, 'mask_backend', 'legacy') != 'sam3':
+            return self._process_video(input_path, output_path, *args, **kwargs)
+        with tempfile.TemporaryDirectory(prefix='vsr-sam3-') as directory:
+            self._sam3_mask_directory = directory
+            self._sam3_masks = None
+            try:
+                return self._process_video(input_path, output_path, *args, **kwargs)
+            finally:
+                self._sam3_masks = None
+                self._sam3_mask_directory = None
+
+    def _process_video(self, input_path, output_path, region=None,
                       template_refine=False, white_glyph_check=False,
                       progress=None, locate_stickers=True,
                       ocr_stride=OCR_STRIDE, ocr_refine_radius=OCR_REFINE_RADIUS,
@@ -1007,7 +1035,10 @@ class Pipeline:
         fps = float(rate)
         # region=None 时用全屏 OCR 采样自动推断字幕带;推断失败回退全屏。
         # 人工指定 region 则直接使用(精确场景)。
-        if region is None:
+        sam3_enabled = getattr(self, 'mask_backend', 'legacy') == 'sam3'
+        if region is None and sam3_enabled:
+            region = (0, h, 0, w)
+        elif region is None:
             inferred = self.auto_region(input_path, samples=24)
             region = inferred if inferred else (0, h, 0, w)
             print(f'[detect] auto-region={"inferred" if inferred else "fallback-full"} roi={region}')
@@ -1024,17 +1055,27 @@ class Pipeline:
         sttn_profile = self.inpaint_mode == 'sttn' and getattr(self, 'sttn_profile', False)
         pipeline_profiler = PipelineProfiler(sttn_profile)
         t0 = time.time()
-        print(f'[detect] mode={mode} roi={region} stride={ocr_stride} adaptive=feedback')
-        all_boxes, detection = pipeline_profiler.call(
-            'ocr_timeline', self._detect_timeline,
-            input_path, region, ocr_stride, ocr_refine_radius, progress)
-        cuda_memory_snapshot('after OCR timeline')
+        if sam3_enabled:
+            from backend.sam3_mask import detect_timeline
+            print(f'[detect] backend=sam3 mode={mode} roi={region} sampling=every-frame')
+            all_boxes, detection, self._sam3_masks = pipeline_profiler.call(
+                'sam3_timeline', detect_timeline, input_path, region,
+                self._sam3_mask_directory, progress=progress,
+                scene_thumb_size=SCENE_THUMB_SIZE, scene_mean_diff=SCENE_MEAN_DIFF,
+                **self._sam3_options)
+            cuda_memory_snapshot('after SAM3 release')
+        else:
+            print(f'[detect] mode={mode} roi={region} stride={ocr_stride} adaptive=feedback')
+            all_boxes, detection = pipeline_profiler.call(
+                'ocr_timeline', self._detect_timeline,
+                input_path, region, ocr_stride, ocr_refine_radius, progress)
+            cuda_memory_snapshot('after OCR timeline')
         total = len(all_boxes)
         print(f'[detect] sampled={detection["sampled"]} refined={detection["refined"]} '
               f'ocr_calls={detection["ocr_calls"]} tracks={detection["tracks"]} '
               f'discarded={detection["discarded"]}')
         sticker_boxes = {}
-        if locate_stickers:
+        if locate_stickers and not sam3_enabled:
             detector = None
             try:
                 if self.sticker_backend == 'gdino':
@@ -1114,6 +1155,17 @@ class Pipeline:
         deferred_propainter_candidates = []
         roi_mask = self.boxes_to_mask([region], h, w)
         scene_changes = set(detection['scene_change_frames'])
+
+        def frame_mask(pts, boxes):
+            if sam3_enabled:
+                return self._sam3_masks[pts]
+            return self.boxes_to_mask(boxes, h, w)
+
+        def residual_probe(fixed, original, boxes, pts):
+            residual = self._residual_mask(fixed, original, boxes)
+            if sam3_enabled:
+                residual = cv2.bitwise_and(residual, self._sam3_masks[pts])
+            return residual
 
         if self.inpaint_mode == 'propainter':
             # ---- ProPainter 分支:按连续字幕段批处理(时序模型,不可逐帧) ----
@@ -1229,7 +1281,7 @@ class Pipeline:
                 dst.mux(pkt)
             dst.close()
         elif self.inpaint_mode == 'sttn':
-            # ---- STTN 分支:按连续字幕段批处理,整框矩形遮罩 ----
+            # ---- STTN 分支:按连续字幕段批处理；SAM3 直接使用逐帧分割 mask ----
             # 与 ProPainter 分支的两点差异:
             #   1. 遮罩是整框矩形而非字形级——笔画宽度只有数像素,在
             #      432x240 的横向 1.67 倍压缩中必然与相邻背景混入同一像素
@@ -1338,10 +1390,13 @@ class Pipeline:
                             if not seg_core[i]:
                                 masks.append(np.zeros((h, w), dtype='uint8'))
                                 continue
-                            local_boxes = [box
-                                           for boxes in seg_boxes[max(0, i - radius):i + radius + 1]
-                                           for box in boxes]
-                            masks.append(self.boxes_to_mask(local_boxes, h, w))
+                            if sam3_enabled:
+                                masks.append(frame_mask(seg_pts[i], seg_boxes[i]))
+                            else:
+                                local_boxes = [box
+                                               for boxes in seg_boxes[max(0, i - radius):i + radius + 1]
+                                               for box in boxes]
+                                masks.append(self.boxes_to_mask(local_boxes, h, w))
                         x_min = max(0, min(box[2] for boxes in seg_boxes for box in boxes)
                                     - STTN_ROI_PAD)
                         x_max = min(w, max(box[3] for boxes in seg_boxes for box in boxes)
@@ -1373,7 +1428,7 @@ class Pipeline:
                         if not seg_core[idx] or not boxes:
                             continue
                         residual = pipeline_profiler.call(
-                            'residual_probe', self._residual_mask, comp, seg_frames[idx], boxes)
+                            'residual_probe', residual_probe, comp, seg_frames[idx], boxes, seg_pts[idx])
                         count = int(np.count_nonzero(residual))
                         if count >= RESID_MIN_PX:
                             residual_indices.append(idx)
@@ -1429,7 +1484,7 @@ class Pipeline:
                         for (candidate_lo, candidate_hi), (lo, hi), _, _ in runs:
                             pp_frames = [comps[i].copy() for i in range(lo, hi + 1)]
                             pp_masks = [
-                                self.boxes_to_mask(seg_boxes[i], h, w)
+                                frame_mask(seg_pts[i], seg_boxes[i])
                                 if i in residual_indices else np.zeros((h, w), dtype='uint8')
                                 for i in range(lo, hi + 1)]
                             pp_boxes = [seg_boxes[i] for i in range(lo, hi + 1)]
@@ -1452,7 +1507,8 @@ class Pipeline:
                         continue
                     # ROI 之外严格保留原帧,与 ProPainter 分支同一约定
                     with pipeline_profiler.stage('roi_composite'):
-                        out_bgr = np.where(roi_mask[:, :, None] > 0, comp, seg_frames[idx])
+                        allowed = masks[idx] if sam3_enabled else roi_mask
+                        out_bgr = np.where(allowed[:, :, None] > 0, comp, seg_frames[idx])
                     # 残留探测(检测+计数，不修复):实测证明 STTN 在已覆盖区域内
                     # 生成质量本身不稳定(偶发发白/发糊)，是引擎能力问题而非遮罩
                     # 形状问题——两种独立的后处理修复尝试都不能稳定改善，因此
@@ -1461,8 +1517,8 @@ class Pipeline:
                     # 纯诊断；上面用于选择 ProPainter 窗口的候选检测仍保留。
                     if sttn_residual_check_enabled and np.count_nonzero(
                             pipeline_profiler.call(
-                                'residual_probe', self._residual_mask,
-                                out_bgr, seg_frames[idx], seg_boxes[idx])) >= RESID_MIN_PX:
+                                'residual_probe', residual_probe,
+                                out_bgr, seg_frames[idx], seg_boxes[idx], pts)) >= RESID_MIN_PX:
                         n_unresolved += 1
                     write_sttn_frame(out_bgr, pts)
                 seg_frames, seg_pts, seg_boxes, seg_core = [], [], [], []
@@ -1557,7 +1613,7 @@ class Pipeline:
                     pp_boxes = [candidate['boxes_by_pt'].get(pt, [])
                                 for pt in range(lo, hi + 1)]
                     pp_masks = [
-                        self.boxes_to_mask(boxes, h, w)
+                        frame_mask(pt, boxes)
                         if pt in core_pts else np.zeros((h, w), dtype='uint8')
                         for pt, boxes in zip(range(lo, hi + 1), pp_boxes)]
                     repaired = run_propainter_window(
@@ -1573,8 +1629,8 @@ class Pipeline:
                                 repaired[offset], output_frame)
                             if sttn_residual_check_enabled:
                                 remaining = np.count_nonzero(pipeline_profiler.call(
-                                    'residual_probe', self._residual_mask,
-                                    output_frame, original_pp_frames[offset], pp_boxes[offset]))
+                                    'residual_probe', residual_probe,
+                                    output_frame, original_pp_frames[offset], pp_boxes[offset], pt))
                                 if remaining < RESID_MIN_PX:
                                     n_unresolved -= 1
                         write_second_pass(output_frame, pt)
@@ -1745,6 +1801,9 @@ class Pipeline:
               f'耗时 {time.time() - t0:.0f}s → {output_path}')
         cuda_memory_snapshot('after process_video')
         stats = {'frames': n, 'inpainted': n_fixed, 'repaired': n_repair,
+                'mask_backend': 'sam3' if sam3_enabled else 'legacy',
+                'sam3_calls': detection.get('sam3_calls', 0),
+                'sam3_prompt_calls': detection.get('sam3_prompt_calls', 0),
                 'template_recovered': int(n_recovered), 'unresolved': n_unresolved,
                 'residual_check_failed': n_check_failed,
                 'residual_check_enabled': bool(white_glyph_check),
@@ -1779,6 +1838,18 @@ def main():
     ap = argparse.ArgumentParser(description='去字幕生产流水线(实测验证版)')
     ap.add_argument('-i', '--input', required=True)
     ap.add_argument('-o', '--output', required=True)
+    ap.add_argument('--mask-backend', choices=('legacy', 'sam3'), default='legacy',
+                    help='legacy=OCR＋贴纸检测；sam3=统一逐帧 SAM3 mask（仅 STTN）')
+    ap.add_argument('--sam3-checkpoint', default=os.environ.get('SAM3_CHECKPOINT'),
+                    help='本地 SAM3 sam3.pt 路径，不自动下载')
+    ap.add_argument('--sam3-code-dir', default=os.environ.get('SAM3_CODE_DIR'),
+                    help='官方 SAM3 源码根目录（或预先安装 sam3）')
+    ap.add_argument('--sam3-prompt', action='append', default=None,
+                    help='SAM3 通用概念，可重复传入取并集；默认仅 caption')
+    ap.add_argument('--sam3-score', type=float, default=0.5,
+                    help='SAM3 实例置信度阈值，默认0.5')
+    ap.add_argument('--sam3-dilate', type=int, default=0,
+                    help='SAM3 mask 统一外扩半径（原视频像素），默认0以保持实测轮廓')
     ap.add_argument('-c', '--region', nargs=4, type=int, metavar=('YMIN', 'YMAX', 'XMIN', 'XMAX'),
                     help='手动检测区域;不传则全屏自适应检测')
     ap.add_argument('--ocr-stride', type=int, default=OCR_STRIDE,
@@ -1850,6 +1921,10 @@ def main():
                          '整幅物体误检的关键判据;用绝对像素而非相对比例,避免 ROI '
                          '尺寸变化时判据漂移')
     args = ap.parse_args()
+    if args.mask_backend == 'sam3' and args.inpaint_mode != 'sttn':
+        ap.error('--mask-backend sam3 仅支持 --inpaint-mode sttn（含 ProPainter 补修）')
+    if not 0 < args.sam3_score < 1 or args.sam3_dilate < 0:
+        ap.error('--sam3-score 必须介于0和1，--sam3-dilate 必须为非负整数')
     if args.sttn_skip_residual_check and args.inpaint_mode != 'sttn':
         ap.error('--sttn-skip-residual-check 仅支持 --inpaint-mode sttn')
     if args.sttn_residual_propaint_max_frames < 0 or args.sttn_residual_propaint_max_frames == 1:
@@ -1876,7 +1951,10 @@ def main():
                     sttn_precision=args.sttn_precision,
                     sticker_profile=args.sticker_profile,
                     sticker_batch_size=args.sticker_batch_size,
-                    sticker_precision=args.sticker_precision)
+                    sticker_precision=args.sticker_precision,
+                    mask_backend=args.mask_backend, sam3_checkpoint=args.sam3_checkpoint,
+                    sam3_code_dir=args.sam3_code_dir, sam3_prompts=args.sam3_prompt,
+                    sam3_score=args.sam3_score, sam3_dilate=args.sam3_dilate)
     stat = pipe.process_video(
         args.input, args.output,
         region=tuple(args.region) if args.region else None,
