@@ -47,15 +47,20 @@ class Sam3MaskDetector:
     """Official SAM3 image model; prompts share one image embedding."""
 
     def __init__(self, checkpoint=DEFAULT_CHECKPOINT, code_dir=None,
-                 device='auto', prompts=None, score=0.5, dilate=0):
+                 device='auto', prompts=None, score=0.5, dilate=0, empty_score=0):
         self.prompts = tuple(prompts or ('caption',))
         if not self.prompts or any(not p.strip() for p in self.prompts):
             raise ValueError('SAM3 prompt 不能为空')
         if not 0 < score < 1:
             raise ValueError('SAM3 score 必须介于 0 和 1 之间')
+        if not 0 <= empty_score <= score:
+            raise ValueError('SAM3 empty_score 必须介于 0 和 score 之间（0 禁用）')
         if not isinstance(dilate, int) or dilate < 0:
             raise ValueError('SAM3 dilate 必须为非负整数')
         self.dilate = dilate
+        self.score = score
+        self.empty_score = empty_score
+        self.empty_frames = self.fallback_frames = self.recovered_frames = 0
         checkpoint = Path(checkpoint).expanduser().resolve()
         if not checkpoint.is_file():
             raise FileNotFoundError(f'SAM3 权重不存在: {checkpoint}；请设置 SAM3_CHECKPOINT 或 --sam3-checkpoint')
@@ -91,16 +96,20 @@ class Sam3MaskDetector:
         model.load_state_dict({k: v for k, v in weights.items() if k not in unused}, strict=True)
         del state, weights
         self.model = model.eval().to(self.device)
-        self.processor = Sam3Processor(self.model, device=str(self.device), confidence_threshold=score)
+        # Keep lower-score instances from the same forward; no second image encoding or prompt call.
+        capture_score = empty_score if empty_score else score
+        self.processor = Sam3Processor(self.model, device=str(self.device), confidence_threshold=capture_score)
         print(f'[sam3] device={self.device} autocast={self.amp_dtype} '
-              f'prompts={self.prompts} score={score} dilate={dilate}px checkpoint={checkpoint}')
+              f'prompts={self.prompts} score={score} empty_score={empty_score} '
+              f'dilate={dilate}px checkpoint={checkpoint}')
 
     def predict(self, image_rgb):
         from PIL import Image
 
         amp = (torch.autocast('cuda', dtype=self.amp_dtype)
                if self.amp_dtype is not None else nullcontext())
-        union = np.zeros(image_rgb.shape[:2], dtype=bool)
+        union = torch.zeros(image_rgb.shape[:2], dtype=torch.bool, device=self.device)
+        low_union = torch.zeros_like(union) if self.empty_score else None
         with torch.inference_mode(), amp:
             state = self.processor.set_image(Image.fromarray(image_rgb))
             for prompt in self.prompts:
@@ -111,8 +120,19 @@ class Sam3MaskDetector:
                     raise ValueError('SAM3 输出 mask 尺寸不正确')
                 if not torch.isfinite(result['scores']).all():
                     raise ValueError('SAM3 输出非有限置信度')
-                union |= masks.any(dim=0).cpu().numpy().astype(bool)
-        mask = union.astype(np.uint8) * 255
+                if self.empty_score:
+                    union |= masks[result['scores'] > self.score].any(dim=0)
+                    low_union |= masks.any(dim=0)
+                else:
+                    union |= masks.any(dim=0)
+        # Decide after all prompts. Never append low-score instances to a nonempty primary mask.
+        if not union.any().item():
+            self.empty_frames += 1
+            if low_union is not None:
+                self.fallback_frames += 1
+                union = low_union
+                self.recovered_frames += int(union.any().item())
+        mask = union.cpu().numpy().astype(np.uint8) * 255
         if self.dilate:
             size = 2 * self.dilate + 1
             mask = cv2.dilate(mask, np.ones((size, size), np.uint8))
@@ -129,12 +149,12 @@ class Sam3MaskDetector:
 
 def detect_timeline(input_path, region, directory, *, checkpoint=DEFAULT_CHECKPOINT,
                     code_dir=None, device='auto', prompts=None, score=0.5, dilate=0,
-                    progress=None, scene_thumb_size=32, scene_mean_diff=18.0):
+                    empty_score=0, progress=None, scene_thumb_size=32, scene_mean_diff=18.0):
     """Infer every original frame; boxes serve scheduling/diagnostics only."""
     y1, y2, x1, x2 = region
     boxes, cuts, store, previous = [], [], None, None
     detector = Sam3MaskDetector(checkpoint=checkpoint, code_dir=code_dir, device=device,
-                               prompts=prompts, score=score, dilate=dilate)
+                               prompts=prompts, score=score, dilate=dilate, empty_score=empty_score)
     try:
         with av.open(os.fspath(input_path)) as src:
             estimate = src.streams.video[0].frames or 0
@@ -165,6 +185,11 @@ def detect_timeline(input_path, region, directory, *, checkpoint=DEFAULT_CHECKPO
         detector.close()
     if store is None:
         raise ValueError('输入视频没有可解码帧')
+    print(f'[sam3] 主阈值空帧={detector.empty_frames} '
+          f'低阈值候选启用帧={detector.fallback_frames} 恢复非空帧={detector.recovered_frames}')
     return boxes, {'ocr_calls': 0, 'sampled': len(boxes), 'refined': 0,
                    'tracks': 0, 'discarded': 0, 'scene_change_frames': cuts,
-                   'sam3_calls': len(boxes), 'sam3_prompt_calls': len(boxes) * len(prompts or ('caption',))}, store
+                   'sam3_calls': len(boxes), 'sam3_prompt_calls': len(boxes) * len(prompts or ('caption',)),
+                   'sam3_empty_frames': detector.empty_frames,
+                   'sam3_fallback_frames': detector.fallback_frames,
+                   'sam3_recovered_frames': detector.recovered_frames}, store

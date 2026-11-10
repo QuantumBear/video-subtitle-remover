@@ -52,18 +52,23 @@ def test_sam3_masks_reach_sttn_and_deferred_repair_without_box_fill(tmp_path, mo
     make_video(source)
     mask = mask_fixture()
     calls = []
+    detector_options = []
     class Detector:
         def __init__(self, **options):
-            pass
+            detector_options.append(options)
+            self.empty_frames = self.fallback_frames = self.recovered_frames = 0
         def predict(self, image):
             calls.append('sam3')
             # Last frame has no overlay: it must not inherit the previous mask.
+            if len(calls) == 3:
+                self.empty_frames += 1
+                self.fallback_frames += 1
             return mask.copy() if len(calls) < 3 else np.zeros_like(mask)
         def close(self):
             calls.append('released')
     monkeypatch.setattr(sam3_mask, 'Sam3MaskDetector', Detector)
     monkeypatch.setattr('vsr_pipeline.cuda_memory_snapshot', lambda *a, **kw: None)
-    pipe = Pipeline(mask_backend='sam3', device='cpu', inpaint_mode='sttn')
+    pipe = Pipeline(mask_backend='sam3', device='cpu', inpaint_mode='sttn', sam3_empty_score=.3)
     def forbidden(*args, **kwargs):
         pytest.fail('legacy mask code reached')
     pipe.detect = pipe.auto_region = pipe._detect_timeline = pipe._ensure_sticker_detector = forbidden
@@ -87,6 +92,8 @@ def test_sam3_masks_reach_sttn_and_deferred_repair_without_box_fill(tmp_path, mo
                                sttn_residual_propainter_max_frames=3)
     assert stats['frames'] == 3 and stats['ocr_calls'] == 0
     assert stats['mask_backend'] == 'sam3' and stats['sam3_calls'] == 3
+    assert detector_options[0]['empty_score'] == .3
+    assert (stats['sam3_empty_frames'], stats['sam3_fallback_frames'], stats['sam3_recovered_frames']) == (1, 1, 0)
     assert len(seen_sttn) == 3
     for actual in seen_sttn[:2]:
         np.testing.assert_array_equal(actual, mask)
@@ -157,3 +164,50 @@ def test_launchers_use_sam3_and_forward_extra_arguments(tmp_path, script, repair
     assert args[-1] == '--sttn-profile'
     assert '--sticker-backend' not in args
     assert ('--sttn-residual-propaint' in args) is repair
+
+
+@pytest.mark.parametrize('script', ['run_sttn.sh', 'run_sttn_propainter.sh'])
+@pytest.mark.parametrize('rollback', [False, True])
+def test_launchers_enable_mask_options_with_explicit_rollback(tmp_path, script, rollback):
+    root = Path(__file__).resolve().parents[1]
+    fake = tmp_path/'python'
+    fake.write_text('#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n')
+    fake.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k not in ('SAM3_SCORE', 'SAM3_DILATE', 'SAM3_EMPTY_SCORE')}
+    env['SAM3_PYTHON'] = str(fake)
+    if rollback:
+        env.update(SAM3_DILATE='0', SAM3_EMPTY_SCORE='0')
+    result = subprocess.run(['bash', str(root/script), 'input.mp4', 'output.mp4'],
+                            env=env, text=True, capture_output=True, check=True)
+    args = json.loads(result.stdout.strip().splitlines()[-1])
+    assert args[args.index('--sam3-score')+1] == '0.5'
+    assert args[args.index('--sam3-dilate')+1] == ('0' if rollback else '3')
+    assert args[args.index('--sam3-empty-score')+1] == ('0' if rollback else '0.3')
+
+
+def test_cli_passes_empty_score_to_sam3_and_can_disable_it(monkeypatch):
+    import vsr_pipeline
+    observed = []
+    class DetectorPipeline:
+        def __init__(self, **options):
+            observed.append(options)
+        def process_video(self, *args, **options):
+            return {}
+    monkeypatch.setattr(vsr_pipeline, 'Pipeline', DetectorPipeline)
+    for score in ['0.3', '0']:
+        monkeypatch.setattr(sys, 'argv', ['vsr_pipeline.py', '-i', 'in.mp4', '-o', 'out.mp4',
+                                        '--mask-backend', 'sam3', '--inpaint-mode', 'sttn',
+                                        '--sam3-empty-score', score])
+        vsr_pipeline.main()
+    assert [options['sam3_empty_score'] for options in observed] == [.3, 0]
+
+
+@pytest.mark.parametrize('value', ['-0.1', '0.6', 'nan'])
+def test_cli_rejects_invalid_empty_score_before_opening_video(monkeypatch, value):
+    import vsr_pipeline
+    monkeypatch.setattr(sys, 'argv', ['vsr_pipeline.py', '-i', 'missing.mp4', '-o', 'out.mp4',
+                                    '--mask-backend', 'sam3', '--inpaint-mode', 'sttn',
+                                    '--sam3-empty-score', value])
+    with pytest.raises(SystemExit) as result:
+        vsr_pipeline.main()
+    assert result.value.code == 2

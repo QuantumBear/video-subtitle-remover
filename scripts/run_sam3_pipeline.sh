@@ -29,5 +29,6 @@ exec "$sam3_python" -u "$project_dir/vsr_pipeline.py" \
   --device cuda --inpaint-mode sttn --sttn-precision fp16 \
   --mask-backend sam3 --sam3-checkpoint "$sam3_checkpoint" \
   --sam3-code-dir "$sam3_code" --sam3-score "${SAM3_SCORE:-0.5}" \
-  --sam3-dilate "${SAM3_DILATE:-0}" --no-locate-stickers --threads 1 \
+  --sam3-dilate "${SAM3_DILATE:-3}" --sam3-empty-score "${SAM3_EMPTY_SCORE:-0.3}" \
+  --no-locate-stickers --threads 1 \
   "$@"

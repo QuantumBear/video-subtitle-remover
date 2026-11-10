@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # SAM3 caption mask + STTN + ProPainter 残留补修。
+# 默认外扩 3px；主阈值整帧为空时采用当前帧 0.3 候选。
 # 用法：./run_sttn_propainter.sh [输入视频] [输出视频] [额外流水线参数...]
 # ProPainter 补修预算：全片最多 8 窗，每窗最多 30 帧（包含上下文）。
 input_video="${1:-input.mp4}"

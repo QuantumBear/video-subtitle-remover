@@ -382,16 +382,19 @@ class Pipeline:
                  sticker_batch_size=sticker_detect.DEFAULT_BATCH_SIZE,
                  sticker_precision=sticker_detect.DEFAULT_PRECISION,
                  mask_backend='legacy', sam3_checkpoint=None, sam3_code_dir=None,
-                 sam3_prompts=None, sam3_score=0.5, sam3_dilate=0):
+                 sam3_prompts=None, sam3_score=0.5, sam3_dilate=0, sam3_empty_score=0):
         if mask_backend not in ('legacy', 'sam3'):
             raise ValueError(f'未知 mask_backend: {mask_backend}')
         if mask_backend == 'sam3' and inpaint_mode != 'sttn':
             raise ValueError('SAM3 mask 当前仅支持 STTN（含 ProPainter 残留补修）')
         if not 0 < sam3_score < 1 or not isinstance(sam3_dilate, int) or sam3_dilate < 0:
             raise ValueError('SAM3 score 必须介于 0 和 1，dilate 必须为非负整数')
+        if not 0 <= sam3_empty_score <= sam3_score:
+            raise ValueError('SAM3 empty_score 必须介于 0 和 score 之间（0 禁用）')
         self.mask_backend = mask_backend
         self._sam3_options = dict(code_dir=sam3_code_dir, device=device,
-                                  prompts=sam3_prompts, score=sam3_score, dilate=sam3_dilate)
+                                  prompts=sam3_prompts, score=sam3_score, dilate=sam3_dilate,
+                                  empty_score=sam3_empty_score)
         if sam3_checkpoint is not None:
             self._sam3_options['checkpoint'] = sam3_checkpoint
         if sticker_precision not in sticker_detect.PRECISIONS:
@@ -1804,6 +1807,9 @@ class Pipeline:
                 'mask_backend': 'sam3' if sam3_enabled else 'legacy',
                 'sam3_calls': detection.get('sam3_calls', 0),
                 'sam3_prompt_calls': detection.get('sam3_prompt_calls', 0),
+                'sam3_empty_frames': detection.get('sam3_empty_frames', 0),
+                'sam3_fallback_frames': detection.get('sam3_fallback_frames', 0),
+                'sam3_recovered_frames': detection.get('sam3_recovered_frames', 0),
                 'template_recovered': int(n_recovered), 'unresolved': n_unresolved,
                 'residual_check_failed': n_check_failed,
                 'residual_check_enabled': bool(white_glyph_check),
@@ -1848,6 +1854,8 @@ def main():
                     help='SAM3 通用概念，可重复传入取并集；默认仅 caption')
     ap.add_argument('--sam3-score', type=float, default=0.5,
                     help='SAM3 实例置信度阈值，默认0.5')
+    ap.add_argument('--sam3-empty-score', type=float, default=0,
+                    help='仅主阈值 mask 整帧为空时采用的当前帧候选阈值；0 禁用（默认），不得高于主阈值')
     ap.add_argument('--sam3-dilate', type=int, default=0,
                     help='SAM3 mask 统一外扩半径（原视频像素），默认0以保持实测轮廓')
     ap.add_argument('-c', '--region', nargs=4, type=int, metavar=('YMIN', 'YMAX', 'XMIN', 'XMAX'),
@@ -1925,6 +1933,8 @@ def main():
         ap.error('--mask-backend sam3 仅支持 --inpaint-mode sttn（含 ProPainter 补修）')
     if not 0 < args.sam3_score < 1 or args.sam3_dilate < 0:
         ap.error('--sam3-score 必须介于0和1，--sam3-dilate 必须为非负整数')
+    if not 0 <= args.sam3_empty_score <= args.sam3_score:
+        ap.error('--sam3-empty-score 必须介于0和 --sam3-score 之间（0 禁用）')
     if args.sttn_skip_residual_check and args.inpaint_mode != 'sttn':
         ap.error('--sttn-skip-residual-check 仅支持 --inpaint-mode sttn')
     if args.sttn_residual_propaint_max_frames < 0 or args.sttn_residual_propaint_max_frames == 1:
@@ -1954,7 +1964,8 @@ def main():
                     sticker_precision=args.sticker_precision,
                     mask_backend=args.mask_backend, sam3_checkpoint=args.sam3_checkpoint,
                     sam3_code_dir=args.sam3_code_dir, sam3_prompts=args.sam3_prompt,
-                    sam3_score=args.sam3_score, sam3_dilate=args.sam3_dilate)
+                    sam3_score=args.sam3_score, sam3_dilate=args.sam3_dilate,
+                    sam3_empty_score=args.sam3_empty_score)
     stat = pipe.process_video(
         args.input, args.output,
         region=tuple(args.region) if args.region else None,
