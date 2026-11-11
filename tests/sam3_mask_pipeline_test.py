@@ -138,6 +138,33 @@ def test_mask_workspace_cleans_up_after_detection_error(tmp_path, monkeypatch):
     assert not (tmp_path/'out.mp4').exists()
 
 
+def test_emoji_mask_changes_reschedule_sttn_and_detection_releases_text_model(tmp_path, monkeypatch):
+    import backend.sam3_mask as sam3_mask
+    import backend.sam3_emoji as sam3_emoji
+    source = tmp_path/'input.mp4'
+    make_video(source)
+    released = []
+    class Detector:
+        empty_frames = fallback_frames = recovered_frames = 0
+        def __init__(self, **options):
+            pass
+        def predict(self, image):
+            return np.zeros(image.shape[:2], np.uint8)
+        def close(self):
+            released.append(True)
+    monkeypatch.setattr(sam3_mask, 'Sam3MaskDetector', Detector)
+    def emoji(input_path, store, cuts, region, directory, **options):
+        assert released and options['score'] == .3 and options['confirm'] is True
+        mask = np.zeros(store.shape, np.uint8)
+        mask[5:7, 8:10] = 255
+        store.replace(1, mask)
+        return {'sam3_emoji_frames': 3, 'sam3_emoji_nonempty_frames': 1}
+    monkeypatch.setattr(sam3_emoji, 'add_emoji_timeline', emoji)
+    boxes, stats, masks = sam3_mask.detect_timeline(source, (0, 48, 0, 64), tmp_path/'masks', emoji_score=.3)
+    assert boxes == [[], [(5, 7, 8, 10)], []]
+    assert stats['sam3_emoji_nonempty_frames'] == 1 and masks[1][5, 8] == 255
+
+
 def test_mask_timeline_fails_on_missing_cache_frame(tmp_path):
     from backend.sam3_mask import MaskTimeline
     store = MaskTimeline(tmp_path, (48, 64))
@@ -162,7 +189,7 @@ def test_launchers_use_sam3_and_forward_extra_arguments(tmp_path, script, repair
     assert args[args.index('--sam3-score')+1] == '0.3'
     assert args[args.index('-i')+1] == 'my input.mp4'
     assert args[-1] == '--sttn-profile'
-    assert '--sticker-backend' not in args
+    assert args[args.index('--sticker-backend')+1] == 'gdino'
     assert ('--sttn-residual-propaint' in args) is repair
 
 
@@ -183,6 +210,55 @@ def test_launchers_enable_mask_options_with_explicit_rollback(tmp_path, script, 
     assert args[args.index('--sam3-score')+1] == '0.5'
     assert args[args.index('--sam3-dilate')+1] == ('0' if rollback else '3')
     assert args[args.index('--sam3-empty-score')+1] == ('0' if rollback else '0.3')
+
+
+@pytest.mark.parametrize('script', ['run_sttn.sh', 'run_sttn_propainter.sh'])
+def test_launchers_use_sparse_dino_and_disable_sam3_video_by_default(tmp_path, script):
+    root = Path(__file__).resolve().parents[1]
+    fake = tmp_path/'python'
+    fake.write_text('#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n')
+    fake.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('SAM3_', 'STICKER_'))}
+    env['SAM3_PYTHON'] = str(fake)
+    result = subprocess.run(['bash', str(root/script), 'input.mp4', 'output.mp4', '--no-locate-stickers'],
+                            env=env, text=True, capture_output=True, check=True)
+    args = json.loads(result.stdout.strip().splitlines()[-1])
+    assert args[args.index('--sam3-emoji-score')+1] == '0'
+    assert args[args.index('--sticker-backend')+1] == 'gdino'
+    assert args[args.index('--sticker-prompt')+1] == 'emoji. sticker. cartoon icon.'
+    assert args[args.index('--sticker-score')+1] == '0.22'
+    assert args[args.index('--sticker-model-id')+1] == str(root/'backend/models/grounding-dino-tiny')
+    assert args[-1] == '--no-locate-stickers' and args.count('--no-locate-stickers') == 1
+
+
+def test_cli_passes_video_emoji_options_and_can_disable_them(monkeypatch):
+    import vsr_pipeline
+    observed = []
+    class DetectorPipeline:
+        def __init__(self, **options):
+            observed.append(options)
+        def process_video(self, *args, **options):
+            return {}
+    monkeypatch.setattr(vsr_pipeline, 'Pipeline', DetectorPipeline)
+    for options in [[], ['--sam3-emoji-score', '0.3'],
+                    ['--sam3-emoji-score', '0.3', '--no-sam3-emoji-confirm', '--sam3-emoji-max-frames', '45']]:
+        monkeypatch.setattr(sys, 'argv', ['vsr_pipeline.py', '-i', 'in.mp4', '-o', 'out.mp4',
+                                        '--mask-backend', 'sam3', '--inpaint-mode', 'sttn', *options])
+        vsr_pipeline.main()
+    assert [o['sam3_emoji_score'] for o in observed] == [0, .3, .3]
+    assert [o['sam3_emoji_confirm'] for o in observed] == [True, True, False]
+    assert observed[-1]['sam3_emoji_max_frames'] == 45
+
+
+@pytest.mark.parametrize('options', [['--sam3-emoji-score', '-.1'], ['--sam3-emoji-score', 'nan'],
+                                    ['--sam3-emoji-score', '1'], ['--sam3-emoji-max-frames', '0']])
+def test_cli_rejects_invalid_video_emoji_options(monkeypatch, options):
+    import vsr_pipeline
+    monkeypatch.setattr(sys, 'argv', ['vsr_pipeline.py', '-i', 'missing.mp4', '-o', 'out.mp4',
+                                    '--mask-backend', 'sam3', '--inpaint-mode', 'sttn', *options])
+    with pytest.raises(SystemExit) as result:
+        vsr_pipeline.main()
+    assert result.value.code == 2
 
 
 def test_cli_passes_empty_score_to_sam3_and_can_disable_it(monkeypatch):
@@ -211,3 +287,109 @@ def test_cli_rejects_invalid_empty_score_before_opening_video(monkeypatch, value
     with pytest.raises(SystemExit) as result:
         vsr_pipeline.main()
     assert result.value.code == 2
+
+
+@pytest.mark.parametrize('repair', [False, True])
+def test_sam3_dino_union_reaches_sttn_and_optional_repair(tmp_path, monkeypatch, repair):
+    import backend.sam3_mask as sam3_mask
+    source = tmp_path/'input.mp4'
+    make_video(source)
+    text = mask_fixture()
+    released = []
+    class TextDetector:
+        empty_frames = fallback_frames = recovered_frames = 0
+        def __init__(self, **kwargs):
+            pass
+        def predict(self, image):
+            return text.copy()
+        def close(self):
+            released.append('sam3')
+    monkeypatch.setattr(sam3_mask, 'Sam3MaskDetector', TextDetector)
+    monkeypatch.setattr('vsr_pipeline.cuda_memory_snapshot', lambda *a, **kw: None)
+    pipe = Pipeline(mask_backend='sam3', sticker_backend='gdino', device='cpu', inpaint_mode='sttn')
+    class Dino:
+        def detect_candidates_regions(self, crops, regions, prompt, *args):
+            assert released == ['sam3']
+            assert prompt == 'emoji. sticker. cartoon icon.'
+            # Current text bounds expanded by twice their height, clipped to ROI.
+            assert regions == [(0, 48, 0, 54)] * len(crops)
+            return [[SimpleNamespace(box=(30, 34, 40, 44), score=.8)] for _ in crops]
+        def detect_candidates(self, crop, region, *args):
+            assert region == (0, 48, 0, 54)
+            return [SimpleNamespace(box=(30, 34, 40, 44), score=.8)]
+    pipe._ensure_sticker_detector = lambda: Dino()
+    pipe._release_sticker_detector = lambda: released.append('dino')
+    expected = text.copy()
+    expected[18:46, 28:56] = 255
+    seen, repaired = [], []
+    pipe._ensure_sttn = lambda: None
+    def inpaint(frames, masks, **kwargs):
+        assert released == ['sam3', 'dino']
+        seen.extend(m.copy() for m in masks)
+        return frames
+    pipe.inpainter = inpaint
+    class Repair:
+        def inpaint(self, frames, masks):
+            repaired.extend(m.copy() for m in masks)
+            return frames
+    pipe._propainter_inpainter = Repair()
+    pipe._ensure_propainter = lambda: None
+    pipe._residual_mask = lambda *a: expected.copy()
+    stats = pipe.process_video(source, tmp_path/'out.mp4', sticker_max_frames=3,
+        sttn_residual_propainter=repair, sttn_residual_propainter_max_windows=1,
+        sttn_residual_propainter_max_frames=3)
+    assert len(seen) == 3
+    for mask in seen + repaired:
+        np.testing.assert_array_equal(mask, expected)
+    assert bool(repaired) is repair
+    assert stats['gdino_emoji_frames'] == 3
+    assert stats['gdino_emoji_calls'] == 3  # flat appearance is unknown: feedback confirms middle frame
+    assert stats['sam3_calls'] == 3 and not stats.get('sam3_emoji_frames', 0)
+
+
+def test_requested_sam3_dino_init_failure_is_visible_and_releases_detector(tmp_path, monkeypatch):
+    import backend.sam3_mask as sam3_mask
+    source = tmp_path/'in.mp4'
+    make_video(source, 1)
+    class Text:
+        empty_frames = fallback_frames = recovered_frames = 0
+        def __init__(self, **kwargs): pass
+        def predict(self, image): return mask_fixture()
+        def close(self): pass
+    monkeypatch.setattr(sam3_mask, 'Sam3MaskDetector', Text)
+    pipe = Pipeline(mask_backend='sam3', sticker_backend='gdino', device='cpu', inpaint_mode='sttn')
+    def fail(): raise RuntimeError('missing DINO weights')
+    released = []
+    pipe._ensure_sticker_detector = fail
+    pipe._release_sticker_detector = lambda: released.append(True)
+    with pytest.raises(RuntimeError, match='missing DINO weights'):
+        pipe.process_video(source, tmp_path/'out.mp4')
+    assert released and not (tmp_path/'out.mp4').exists()
+
+
+@pytest.mark.parametrize('video_emoji', [False, True])
+def test_sam3_emoji_backends_are_exclusive_and_zero_budget_does_not_load_dino(tmp_path, monkeypatch, video_emoji):
+    import backend.sam3_mask as sam3_mask
+    import backend.sam3_emoji as sam3_emoji
+    source = tmp_path/'in.mp4'
+    make_video(source, 1)
+    class Text:
+        empty_frames = fallback_frames = recovered_frames = 0
+        def __init__(self, **kwargs): pass
+        def predict(self, image): return mask_fixture()
+        def close(self): pass
+    monkeypatch.setattr(sam3_mask, 'Sam3MaskDetector', Text)
+    video_calls = []
+    def emoji(*args, **kwargs):
+        video_calls.append(True)
+        return {'sam3_emoji_frames': 1}
+    monkeypatch.setattr(sam3_emoji, 'add_emoji_timeline', emoji)
+    pipe = Pipeline(mask_backend='sam3', sticker_backend='gdino', device='cpu', inpaint_mode='sttn',
+                    sam3_emoji_score=.3 if video_emoji else 0)
+    def forbidden(): pytest.fail('DINO should not load for a zero budget or SAM3 video emoji')
+    pipe._ensure_sticker_detector = forbidden
+    pipe._ensure_sttn = lambda: None
+    pipe.inpainter = lambda frames, masks, **kwargs: frames
+    stats = pipe.process_video(source, tmp_path/'out.mp4', sticker_max_frames=200 if video_emoji else 0)
+    assert bool(video_calls) is video_emoji
+    assert stats.get('gdino_emoji_calls', 0) == 0

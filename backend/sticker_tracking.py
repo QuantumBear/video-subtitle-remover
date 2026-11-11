@@ -316,7 +316,7 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
                             text_timeline, total_frames, *, max_calls=200,
                             prompt=None, score_threshold=0.25, max_area_px=1200,
                             scene_change_frames=(), max_gap=60, base_step=30,
-                            profile=False, batch_size=DEFAULT_BATCH_SIZE):
+                            profile=False, batch_size=DEFAULT_BATCH_SIZE, detection_regions=None):
     """Reserve priority calls, then confirm local presence and spend spare calls.
 
     The first decode buffers at most batch_size priority frames, then retains
@@ -346,7 +346,8 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
                              max_gap, scene_change_frames)
     samples = {}
     model_failed = budget_skipped = batch_fallbacks = 0
-    ymin, ymax, xmin, xmax = region
+    if detection_regions is not None and len(detection_regions) != total_frames:
+        raise ValueError('DINO detection_regions 与视频帧数不一致')
     batch_size = max(1, int(batch_size))
 
     def store_candidates(n, rgb, candidates):
@@ -356,8 +357,10 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
     def detect(n, rgb):
         nonlocal model_failed
         try:
+            crop_region = region if detection_regions is None else detection_regions[n]
+            ymin, ymax, xmin, xmax = crop_region
             candidates = detector.detect_candidates(
-                rgb[ymin:ymax, xmin:xmax], region, prompt or DEFAULT_PROMPT,
+                rgb[ymin:ymax, xmin:xmax], crop_region, prompt or DEFAULT_PROMPT,
                 score_threshold, max_area_px)
         except Exception as exc:
             model_failed += 1
@@ -370,16 +373,19 @@ def locate_tracked_stickers(video_path, region, sample_frames, detector,
         nonlocal batch_size, batch_fallbacks
         if not items:
             return
-        batch_detector = getattr(detector, 'detect_candidates_batch', None)
+        batch_detector = getattr(detector, 'detect_candidates_batch' if detection_regions is None
+                                 else 'detect_candidates_regions', None)
         if len(items) == 1 or not callable(batch_detector):
             for n, rgb in items:
                 detect(n, rgb)
             return
         batch_failed = cuda_oom = False
         try:
+            regions = [region if detection_regions is None else detection_regions[n] for n, _ in items]
+            crops = [rgb[y1:y2, x1:x2] for (_, rgb), (y1, y2, x1, x2) in zip(items, regions)]
             candidates = batch_detector(
-                [rgb[ymin:ymax, xmin:xmax] for _, rgb in items],
-                region, prompt or DEFAULT_PROMPT, score_threshold, max_area_px)
+                crops, region if detection_regions is None else regions,
+                prompt or DEFAULT_PROMPT, score_threshold, max_area_px)
             if len(candidates) != len(items):
                 raise RuntimeError(
                     f'GroundingDINO batch 返回数量异常: {len(candidates)} != {len(items)}')

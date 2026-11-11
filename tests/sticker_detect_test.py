@@ -417,3 +417,15 @@ def test_locate_returns_empty_dict_for_empty_schedule():
     detector = sticker_detect.GroundingDinoStickerDetector.__new__(
         sticker_detect.GroundingDinoStickerDetector)
     assert detector.locate('missing.mp4', (0, 48, 0, 64), []) == {}
+
+
+def test_region_batches_restore_each_crops_own_offset():
+    import numpy as np
+    detector = sticker_detect.GroundingDinoStickerDetector.__new__(sticker_detect.GroundingDinoStickerDetector)
+    detector._infer_detections_batch = lambda *args: [
+        [{'score': .8, 'box': [1, 2, 6, 8]}], [{'score': .7, 'box': [2, 3, 7, 9]}]]
+    result = detector.detect_candidates_regions(
+        [np.zeros((10, 10, 3), np.uint8)] * 2,
+        [(20, 30, 40, 50), (60, 70, 80, 90)], 'emoji.', .22, 1200)
+    assert result == [[sticker_detect.StickerCandidate((22, 28, 41, 46), .8)],
+                      [sticker_detect.StickerCandidate((63, 69, 82, 87), .7)]]

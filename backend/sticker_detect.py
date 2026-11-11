@@ -381,10 +381,19 @@ class GroundingDinoStickerDetector:
                                 score_threshold: float,
                                 max_area_px: float) -> List[List[StickerCandidate]]:
         """对多个 RGB crop 批量推理，并保持每个 crop 的候选结果边界。"""
+        return self.detect_candidates_regions(
+            crops, [region] * len(crops), prompt, score_threshold, max_area_px)
+
+    def detect_candidates_regions(self, crops, regions, prompt, score_threshold, max_area_px):
+        """Batch differently cropped frames and restore each frame's own origin."""
+        if len(crops) != len(regions):
+            raise ValueError('DINO crop 与 region 数量不一致')
         detections = self._infer_detections_batch(crops, prompt, score_threshold)
+        if len(detections) != len(crops):
+            raise RuntimeError('DINO batch 返回数量与输入不一致')
         started = time.perf_counter() if getattr(self, 'profile', False) else 0.0
         result = [filter_candidates(items, region, score_threshold, max_area_px)
-                  for items in detections]
+                  for items, region in zip(detections, regions)]
         if getattr(self, 'profile', False):
             self._profile_add(filter_seconds=time.perf_counter() - started)
         return result

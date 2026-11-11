@@ -42,6 +42,16 @@ class MaskTimeline:
             raise ValueError(f'SAM3 mask 缓存损坏或缺失: {path}')
         return mask
 
+    def replace(self, frame, mask):
+        """Update one existing frame after a second detection pass."""
+        if not 0 <= frame < self.count:
+            raise IndexError(f'SAM3 mask 帧索引越界: {frame}/{self.count}')
+        if mask.shape != self.shape or mask.dtype != np.uint8 or not np.isin(mask, [0, 255]).all():
+            raise ValueError('SAM3 mask 尺寸、类型或二值范围不正确')
+        path = self.directory / f'{frame:08d}.png'
+        if not cv2.imwrite(str(path), mask):
+            raise OSError(f'无法写入 SAM3 mask: {path}')
+
 
 class Sam3MaskDetector:
     """Official SAM3 image model; prompts share one image embedding."""
@@ -149,7 +159,8 @@ class Sam3MaskDetector:
 
 def detect_timeline(input_path, region, directory, *, checkpoint=DEFAULT_CHECKPOINT,
                     code_dir=None, device='auto', prompts=None, score=0.5, dilate=0,
-                    empty_score=0, progress=None, scene_thumb_size=32, scene_mean_diff=18.0):
+                    empty_score=0, emoji_score=0, emoji_confirm=True, emoji_max_frames=120,
+                    progress=None, scene_thumb_size=32, scene_mean_diff=18.0):
     """Infer every original frame; boxes serve scheduling/diagnostics only."""
     y1, y2, x1, x2 = region
     boxes, cuts, store, previous = [], [], None, None
@@ -185,6 +196,19 @@ def detect_timeline(input_path, region, directory, *, checkpoint=DEFAULT_CHECKPO
         detector.close()
     if store is None:
         raise ValueError('输入视频没有可解码帧')
+    emoji_stats = {}
+    if emoji_score:
+        from backend.sam3_emoji import add_emoji_timeline
+        emoji_stats = add_emoji_timeline(
+            input_path, store, cuts, region, directory, checkpoint=checkpoint,
+            code_dir=code_dir, device=device, score=emoji_score, confirm=emoji_confirm,
+            max_frames=emoji_max_frames, dilate=dilate, progress=progress)
+        # Scheduling must include newly discovered emoji, while repair consumes the masks.
+        boxes = []
+        for n in range(store.count):
+            contours, _ = cv2.findContours(store[n], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            boxes.append([(y, y+h, x, x+w) for contour in contours
+                          for x, y, w, h in [cv2.boundingRect(contour)]])
     print(f'[sam3] 主阈值空帧={detector.empty_frames} '
           f'低阈值候选启用帧={detector.fallback_frames} 恢复非空帧={detector.recovered_frames}')
     return boxes, {'ocr_calls': 0, 'sampled': len(boxes), 'refined': 0,
@@ -192,4 +216,4 @@ def detect_timeline(input_path, region, directory, *, checkpoint=DEFAULT_CHECKPO
                    'sam3_calls': len(boxes), 'sam3_prompt_calls': len(boxes) * len(prompts or ('caption',)),
                    'sam3_empty_frames': detector.empty_frames,
                    'sam3_fallback_frames': detector.fallback_frames,
-                   'sam3_recovered_frames': detector.recovered_frames}, store
+                   'sam3_recovered_frames': detector.recovered_frames, **emoji_stats}, store

@@ -586,3 +586,25 @@ def test_confirmed_gdino_masks_reach_engine_without_absence_interpolation(tmp_pa
     assert [bool(mask[40, 40]) for mask in masks_seen] == [True] * 4 + [False] * 4 + [True] * 4
     assert stats.get('residual_check_enabled') is False
     assert '残留复核 未启用' in capsys.readouterr().out
+
+
+def test_priority_crops_keep_per_frame_regions_and_full_frame_references(tmp_path):
+    from glyph_pipeline_test import write_frames
+    source = tmp_path / 'different-crops.mp4'
+    write_frames(source, [picture() for _ in range(3)])
+    regions = [(20, 80, 20, 100), (10, 90, 10, 150), (0, 100, 0, 180)]
+    seen = []
+    class Detector:
+        def detect_candidates_regions(self, crops, crop_regions, *args):
+            seen.extend(crop_regions)
+            assert [c.shape[:2] for c in crops] == [(60, 80), (80, 140)]
+            return [[candidate()] for _ in crops]
+        def detect_candidates(self, crop, region, *args):
+            seen.append(region)
+            assert crop.shape[:2] == (100, 180)
+            return [candidate()]
+    result, stats = sticker_tracking.locate_tracked_stickers(
+        source, (0, 100, 0, 180), [0, 1, 2], Detector(), [[TEXT]] * 3, 3,
+        max_calls=3, batch_size=2, detection_regions=regions)
+    assert seen == regions and stats['model_failed'] == 0
+    assert result == {n: [BOX] for n in range(3)}

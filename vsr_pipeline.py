@@ -334,7 +334,8 @@ def locate_stickers_gdino(video_path, region, sample_frames, detector,
                           prompt=None, score_threshold=None, max_area_px=None,
                           *, text_timeline=None, total_frames=None, max_calls=None,
                           scene_change_frames=(), max_gap=60, base_step=30,
-                          profile=False, batch_size=sticker_detect.DEFAULT_BATCH_SIZE):
+                          profile=False, batch_size=sticker_detect.DEFAULT_BATCH_SIZE,
+                          detection_regions=None, stats_out=None):
     """兼容采样框调用；提供时间线上下文时返回逐帧外观确认后的原始框。"""
     options = dict(
         prompt=prompt or sticker_detect.DEFAULT_PROMPT,
@@ -346,12 +347,14 @@ def locate_stickers_gdino(video_path, region, sample_frames, detector,
         return detector.locate(video_path, region, sample_frames, **options)
     from backend.sticker_tracking import locate_tracked_stickers
 
-    boxes, _ = locate_tracked_stickers(
+    boxes, tracking_stats = locate_tracked_stickers(
         video_path, region, sample_frames, detector, text_timeline, total_frames,
         max_calls=sticker_detect.DEFAULT_MAX_FRAMES if max_calls is None else max_calls,
         scene_change_frames=scene_change_frames, max_gap=max_gap, base_step=base_step,
-        profile=profile, batch_size=batch_size,
+        profile=profile, batch_size=batch_size, detection_regions=detection_regions,
         **options)
+    if stats_out is not None:
+        stats_out.update(tracking_stats)
     if profile:
         report = getattr(detector, 'profile_summary', lambda: None)()
         if report:
@@ -382,7 +385,8 @@ class Pipeline:
                  sticker_batch_size=sticker_detect.DEFAULT_BATCH_SIZE,
                  sticker_precision=sticker_detect.DEFAULT_PRECISION,
                  mask_backend='legacy', sam3_checkpoint=None, sam3_code_dir=None,
-                 sam3_prompts=None, sam3_score=0.5, sam3_dilate=0, sam3_empty_score=0):
+                 sam3_prompts=None, sam3_score=0.5, sam3_dilate=0, sam3_empty_score=0,
+                 sam3_emoji_score=0, sam3_emoji_confirm=True, sam3_emoji_max_frames=120):
         if mask_backend not in ('legacy', 'sam3'):
             raise ValueError(f'未知 mask_backend: {mask_backend}')
         if mask_backend == 'sam3' and inpaint_mode != 'sttn':
@@ -391,10 +395,15 @@ class Pipeline:
             raise ValueError('SAM3 score 必须介于 0 和 1，dilate 必须为非负整数')
         if not 0 <= sam3_empty_score <= sam3_score:
             raise ValueError('SAM3 empty_score 必须介于 0 和 score 之间（0 禁用）')
+        if not 0 <= sam3_emoji_score < 1:
+            raise ValueError('SAM3 emoji_score 必须介于0和1（0 禁用）')
+        if not isinstance(sam3_emoji_max_frames, int) or sam3_emoji_max_frames < 1:
+            raise ValueError('SAM3 emoji_max_frames 必须为正整数')
         self.mask_backend = mask_backend
         self._sam3_options = dict(code_dir=sam3_code_dir, device=device,
                                   prompts=sam3_prompts, score=sam3_score, dilate=sam3_dilate,
-                                  empty_score=sam3_empty_score)
+                                  empty_score=sam3_empty_score, emoji_score=sam3_emoji_score,
+                                  emoji_confirm=sam3_emoji_confirm, emoji_max_frames=sam3_emoji_max_frames)
         if sam3_checkpoint is not None:
             self._sam3_options['checkpoint'] = sam3_checkpoint
         if sticker_precision not in sticker_detect.PRECISIONS:
@@ -426,7 +435,7 @@ class Pipeline:
                 device='cpu', enable_hpi=False)
             cuda_memory_snapshot('after OCR init')
         else:
-            print('[init] SAM3 统一 mask；不加载 OCR 或贴纸检测器')
+            print('[init] SAM3 文字 mask；不加载 OCR，贴纸检测器按需加载')
         if inpaint_mode == 'lama':
             print(f'[init] 加载 LAMA: {lama_pt}')
             self.inpainter = LamaEngine(lama_pt, device='cpu')
@@ -1078,14 +1087,21 @@ class Pipeline:
               f'ocr_calls={detection["ocr_calls"]} tracks={detection["tracks"]} '
               f'discarded={detection["discarded"]}')
         sticker_boxes = {}
-        if locate_stickers and not sam3_enabled:
+        hybrid_gdino = (sam3_enabled and locate_stickers and self.sticker_backend == 'gdino'
+                        and not self._sam3_options.get('emoji_score', 0))
+        gdino_stats = {}
+        if locate_stickers and (not sam3_enabled or hybrid_gdino):
             detector = None
             try:
                 if self.sticker_backend == 'gdino':
                     # 先保留优先采样，剩余预算用于反馈补查；逐帧只做局部外观核验。
                     budget = max(0, int(sticker_max_frames))
-                    samples = plan_vlm_frames(total, all_boxes, budget, max(1, round(fps)),
-                                              scene_change_frames=detection['scene_change_frames'])
+                    if hybrid_gdino:
+                        from backend.sam3_stickers import DEFAULT_PROMPT, detection_regions, plan_samples
+                        samples = plan_samples(total, fps, detection['scene_change_frames'], budget)
+                    else:
+                        samples = plan_vlm_frames(total, all_boxes, budget, max(1, round(fps)),
+                                                  scene_change_frames=detection['scene_change_frames'])
                     detector = pipeline_profiler.call(
                         'sticker_init', self._ensure_sticker_detector) if samples else None
                     gdino_options = dict(
@@ -1096,6 +1112,11 @@ class Pipeline:
                         max_gap=max(1, round(fps * 2)), base_step=max(1, round(fps)),
                         batch_size=getattr(self, 'sticker_batch_size',
                                            sticker_detect.DEFAULT_BATCH_SIZE))
+                    if hybrid_gdino:
+                        gdino_options.update(
+                            detection_regions=detection_regions(all_boxes, region), stats_out=gdino_stats,
+                            prompt=sticker_prompt or DEFAULT_PROMPT,
+                            score_threshold=.22 if sticker_score is None else sticker_score)
                     if getattr(self, 'sticker_profile', False):
                         gdino_options['profile'] = True
                     associated = pipeline_profiler.call(
@@ -1110,13 +1131,25 @@ class Pipeline:
                     associated = pipeline_profiler.call(
                         'sticker_associate', associate_sticker_hits, hits, all_boxes, total,
                         max_gap=max(1, round(fps * 2)), scene_change_frames=detection['scene_change_frames'])
-                sticker_boxes = {i: [(max(ry1, y1 - STICKER_MASK_PAD), min(ry2, y2 + STICKER_MASK_PAD),
-                                      max(rx1, x1 - STICKER_MASK_PAD), min(rx2, x2 + STICKER_MASK_PAD))
-                                     for y1, y2, x1, x2 in boxes]
-                                 for i, boxes in associated.items()}
-                print(f'[sticker-{self.sticker_backend}] associated_frames={len(sticker_boxes)}')
+                if hybrid_gdino:
+                    from backend.sam3_stickers import merge_masks
+                    detection.update(merge_masks(self._sam3_masks, all_boxes, associated,
+                                                 region, STICKER_MASK_PAD))
+                    detection['gdino_emoji_calls'] = gdino_stats.get('calls', 0)
+                    detection['gdino_emoji_model_failed'] = gdino_stats.get('model_failed', 0)
+                    print(f'[sticker-gdino] added_frames={detection["gdino_emoji_frames"]} '
+                          f'added_pixels={detection["gdino_emoji_added_pixels"]}')
+                else:
+                    sticker_boxes = {
+                        i: [(max(ry1, y1 - STICKER_MASK_PAD), min(ry2, y2 + STICKER_MASK_PAD),
+                             max(rx1, x1 - STICKER_MASK_PAD), min(rx2, x2 + STICKER_MASK_PAD))
+                            for y1, y2, x1, x2 in boxes]
+                        for i, boxes in associated.items()}
+                print(f'[sticker-{self.sticker_backend}] associated_frames={len(associated)}')
                 cuda_memory_snapshot(f'after {self.sticker_backend} detection')
             except Exception as exc:
+                if hybrid_gdino:
+                    raise
                 print(f'[sticker-{self.sticker_backend}] 跳过贴纸层: {type(exc).__name__}')
             finally:
                 # 检测结果已经物化为普通 numpy 框；释放 DINO 后再加载 ProPainter。
@@ -1810,6 +1843,7 @@ class Pipeline:
                 'sam3_empty_frames': detection.get('sam3_empty_frames', 0),
                 'sam3_fallback_frames': detection.get('sam3_fallback_frames', 0),
                 'sam3_recovered_frames': detection.get('sam3_recovered_frames', 0),
+                **{key: value for key, value in detection.items() if key.startswith(('sam3_emoji_', 'gdino_emoji_'))},
                 'template_recovered': int(n_recovered), 'unresolved': n_unresolved,
                 'residual_check_failed': n_check_failed,
                 'residual_check_enabled': bool(white_glyph_check),
@@ -1858,6 +1892,12 @@ def main():
                     help='仅主阈值 mask 整帧为空时采用的当前帧候选阈值；0 禁用（默认），不得高于主阈值')
     ap.add_argument('--sam3-dilate', type=int, default=0,
                     help='SAM3 mask 统一外扩半径（原视频像素），默认0以保持实测轮廓')
+    ap.add_argument('--sam3-emoji-score', type=float, default=0,
+                    help='独立 emoji 视频检测与新目标阈值，0 禁用；启用需 CUDA，不改变文字阈值')
+    ap.add_argument('--no-sam3-emoji-confirm', dest='sam3_emoji_confirm', action='store_false',
+                    help='关闭 emoji 连续三帧检测确认，仅用于对照（默认启用确认）')
+    ap.add_argument('--sam3-emoji-max-frames', type=int, default=120,
+                    help='emoji 单次视频会话最大帧数，遇切镜提前结束，默认120')
     ap.add_argument('-c', '--region', nargs=4, type=int, metavar=('YMIN', 'YMAX', 'XMIN', 'XMAX'),
                     help='手动检测区域;不传则全屏自适应检测')
     ap.add_argument('--ocr-stride', type=int, default=OCR_STRIDE,
@@ -1935,6 +1975,8 @@ def main():
         ap.error('--sam3-score 必须介于0和1，--sam3-dilate 必须为非负整数')
     if not 0 <= args.sam3_empty_score <= args.sam3_score:
         ap.error('--sam3-empty-score 必须介于0和 --sam3-score 之间（0 禁用）')
+    if not 0 <= args.sam3_emoji_score < 1 or args.sam3_emoji_max_frames < 1:
+        ap.error('--sam3-emoji-score 必须介于0和1（0 禁用），--sam3-emoji-max-frames 必须为正整数')
     if args.sttn_skip_residual_check and args.inpaint_mode != 'sttn':
         ap.error('--sttn-skip-residual-check 仅支持 --inpaint-mode sttn')
     if args.sttn_residual_propaint_max_frames < 0 or args.sttn_residual_propaint_max_frames == 1:
@@ -1965,7 +2007,10 @@ def main():
                     mask_backend=args.mask_backend, sam3_checkpoint=args.sam3_checkpoint,
                     sam3_code_dir=args.sam3_code_dir, sam3_prompts=args.sam3_prompt,
                     sam3_score=args.sam3_score, sam3_dilate=args.sam3_dilate,
-                    sam3_empty_score=args.sam3_empty_score)
+                    sam3_empty_score=args.sam3_empty_score,
+                    sam3_emoji_score=args.sam3_emoji_score,
+                    sam3_emoji_confirm=args.sam3_emoji_confirm,
+                    sam3_emoji_max_frames=args.sam3_emoji_max_frames)
     stat = pipe.process_video(
         args.input, args.output,
         region=tuple(args.region) if args.region else None,
