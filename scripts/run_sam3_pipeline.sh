@@ -44,5 +44,5 @@ exec "$sam3_python" -u "$project_dir/vsr_pipeline.py" \
   --sticker-score "${STICKER_SCORE:-0.22}" \
   --sticker-max-area-px "${STICKER_MAX_AREA_PX:-1200}" \
   --sticker-max-frames "${STICKER_MAX_FRAMES:-200}" \
-  --sticker-batch-size "${STICKER_BATCH_SIZE:-4}" --sticker-precision fp16 --threads 1 \
+  --sticker-batch-size "${STICKER_BATCH_SIZE:-1}" --sticker-precision fp16 --threads 1 \
   "$@"

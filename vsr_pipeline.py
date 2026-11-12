@@ -1924,7 +1924,7 @@ def main():
     ap.add_argument('--sticker-profile', action='store_true',
                     help='仅 gdino:输出模型初始化、预处理/上传/推理/后处理及逐帧跟踪耗时(默认关闭)')
     ap.add_argument('--sticker-batch-size', type=int, default=sticker_detect.DEFAULT_BATCH_SIZE,
-                    help='gdino priority 帧批量推理大小,默认 4;显存不足时调为 2 或 1')
+                    help='gdino priority 帧批量推理大小,默认 1;可显式调大,混合尺寸裁剪会增加显存峰值')
     ap.add_argument('--sticker-precision', choices=sticker_detect.PRECISIONS,
                     default=sticker_detect.DEFAULT_PRECISION,
                     help='仅 gdino:推理精度,默认 fp16;可选 fp32/bf16,不兼容时回退 fp32')

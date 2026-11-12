@@ -41,7 +41,7 @@ DEFAULT_MAX_AREA_PX = 1200       # 绝对像素上限；emoji 实测最大 898px
                                   # 全屏下比例判据会漂到 2 倍以上，导致误检框漏过；
                                   # 绝对像素不随裁剪尺寸变化，判据一致性更好
 DEFAULT_MAX_FRAMES = 200          # 本地推理无 API 成本，采样密度只受算力约束
-DEFAULT_BATCH_SIZE = 4            # 已确定的优先帧批量推理，反馈补查保持单张
+DEFAULT_BATCH_SIZE = 1            # 默认逐帧，避免异形 crop 混批 padding 的显存峰值；可显式调大
 PRECISIONS = ('fp32', 'fp16', 'bf16')
 # CUDA 上优先使用 FP16；CPU 或不兼容设备会在初始化/forward 时回退到 FP32。
 DEFAULT_PRECISION = 'fp16'
